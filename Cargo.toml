@@ -11,4 +11,5 @@ pedantic = "warn"
 unwrap_used = "deny"
 
 [dependencies]
-rhai = "1.25.0"
+rhai = "1"
+regex = "1"

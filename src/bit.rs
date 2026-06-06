@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::{BitAnd, BitOr, Not, BitXor};
-use rhai::{CustomType, Engine, EvalAltResult, Scope, TypeBuilder};
+use regex::Regex;
+use rhai::{CustomType, Engine, Scope, TypeBuilder};
 
 /// Enum for the Bit type used in symbolic simulation
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -27,8 +28,6 @@ impl CustomType for Bit {
             .with_fn("Low", || Bit::Low)
             .with_fn("Variable", || Bit::Variable)
             .with_fn("Test", || Bit::Test)
-            // Register an equality operator (so scripts can use ==)
-            .with_fn("==", |a: &mut Bit, b: Bit| *a == b)
 
             // Operator overloads
             .with_fn("!", |a: &mut Bit| !*a)
@@ -132,6 +131,18 @@ impl LookupTable {
         // In order to evaluate this function, we don't want to have to manually parse it
         // What we do is we construct a LUT by using the eval_string_expr function
 
+        // First, some preprocessing on the expr string
+
+        // The liberty file expressions support * and + for the bitwise operators
+        let expr = expr.replace("*", "&");
+        let expr = expr.replace("+", "|");
+
+        // They also support 1 and 0 for hardcoded bits
+        let re_low = Regex::new(r"\b0\b").unwrap();
+        let re_high = Regex::new(r"\b1\b").unwrap();
+        let expr = re_high.replace_all(&expr, "High()").into_owned();
+        let expr = re_low.replace_all(&expr, "Low()").into_owned();
+
         let mut truth_table: Vec<Bit> = Vec::with_capacity(2 << input_names.len());
 
         // We need to permute every bit
@@ -150,7 +161,7 @@ impl LookupTable {
                 );
             }
 
-            truth_table.push(LookupTable::eval_string_expr(expr, &input_vals));
+            truth_table.push(LookupTable::eval_string_expr(&expr, &input_vals));
         }
         LookupTable { input_count: input_names.len(), truth_table, input_names: input_names }
     }
@@ -172,9 +183,7 @@ impl LookupTable {
         let mut engine = Engine::new();
 
         // In order for operator overloading to work, "fast operators" must be set to false
-        // engine.set_fast_operators(false);
-
-
+        engine.set_fast_operators(false);
 
         // Register Bit with the rhai engine
         engine.build_type::<Bit>();
@@ -529,6 +538,38 @@ mod tests {
                         let operands = vec![a, b, c];
                         assert_eq!(lookup_table.evaluate(&operands), !a | (b & c));
                     }
+                }
+            }
+        }
+
+        #[test]
+        fn lookup_table_str_hardcoded_high() {
+            let input_names = vec![
+                String::from("A"),
+                String::from("B")
+            ];
+            let lookup_table = LookupTable::new_from_string("!A | (B & 1)", input_names);
+            let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Variable];
+            for a in bits {
+                for b in bits {
+                    let operands = vec![a, b];
+                    assert_eq!(lookup_table.evaluate(&operands), !a | (b & Bit::High));
+                }
+            }
+        }
+
+        #[test]
+        fn lookup_table_str_hardcoded_low() {
+            let input_names = vec![
+                String::from("A"),
+                String::from("B")
+            ];
+            let lookup_table = LookupTable::new_from_string("!A | (B & 1) & 0", input_names);
+            let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Variable];
+            for a in bits {
+                for b in bits {
+                    let operands = vec![a, b];
+                    assert_eq!(lookup_table.evaluate(&operands), !a | (b & Bit::High) & Bit::Low);
                 }
             }
         }
