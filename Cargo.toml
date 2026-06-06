@@ -1,0 +1,13 @@
+[package]
+name = "isa_minimization"
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = "warn"
+unwrap_used = "deny"
+
+[dependencies]
