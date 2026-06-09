@@ -153,7 +153,6 @@ impl BitPattern {
 
         let mut diff_count = 0;
         for (b1, b2) in self.bits.iter().zip(&other.bits) {
-            println!("Comparing bits: {:?} and {:?}", b1, b2);
             if b1 != b2 {
                 // If the bits are different, they can only be merged if one of them is high and the other is low
                 if (b1 == &Bit::High && b2 == &Bit::Low) || (b1 == &Bit::Low && b2 == &Bit::High) {

@@ -1,8 +1,10 @@
 // Contains arm32 specification
 // Simply an example of what you can do with isa_specification
 
-use isa_minimization::isa_specification::{Instruction, InstructionField, InstructionForm, c, bit_eq, field_eq, field_in, not, and, or};
-use isa_minimization::bit::{Bit};
+use std::collections::HashMap;
+
+use isa_minimization::isa_specification::{DecodedField, DecodedInstruction, FieldUses, Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not, or};
+use isa_minimization::bit::{Bit, BitPattern};
 
 // Instruction field definitions
 
@@ -426,6 +428,11 @@ fn main() {
     let program_binary_path = "examples/binsearch.bin".to_string();
     let program_binary = std::fs::read_to_string(program_binary_path).expect("Failed to read program binary");
 
+    let mut decoded_program: Vec<DecodedInstruction> = vec![];
+
+    // Create hashmap of FieldUses
+    let mut field_values: HashMap<String, FieldUses> = std::collections::HashMap::new();
+
     for (i, line) in program_binary.lines().enumerate() {
         let bits: Vec<Bit> = line.chars().map(|c| {
             match c {
@@ -444,9 +451,82 @@ fn main() {
             }
         }
 
-        match decoded {
-            Some(decoded_instr) => println!("Instruction {}: {:?}", i, decoded_instr.name),
-            None => println!("Instruction {}: Failed to decode", i),
+        if let Some(_) = &decoded {} else {
+            panic!("Instruction {}: Failed to decode", i);
+        }
+
+        decoded_program.push(decoded.clone().unwrap());
+        
+        for DecodedField { name, value, merge_mode} in &decoded.unwrap().fields {
+            let name = match name {
+                Some(name) => name.clone(),
+                None => {
+                    // If there is no name, this is a constant field, so we can just ignore it
+                    continue;
+                }
+            };
+            println!("Instruction {}: Field {} = {:?}", i, name, value);
+            let mut default_val = match merge_mode {
+                MergeMode::Uses => FieldUses::Uses { name: name.clone(), patterns: [value.clone()].iter().cloned().collect() },
+                MergeMode::VariableBits => FieldUses::VariableBits { name: name.clone(), pattern: value.clone() },
+            };
+            match field_values.entry(name.clone()).or_insert(default_val) {
+                FieldUses::Uses { name: _, patterns } => {
+                    let new_pattern = value.clone();
+                    patterns.insert(new_pattern);
+
+                }
+                FieldUses::VariableBits { name: _, pattern } => {
+                    // Any bits which are different between the existing pattern and the new pattern should become variable bits
+                    let new_pattern = value.clone();
+                    if pattern.len() != new_pattern.len() {
+                        panic!("Pattern length mismatch for field '{}'", name);
+                    }
+                    let mut indices_to_update = Vec::new();
+                    for (i, (old_bit, new_bit)) in pattern.bits.iter().zip(new_pattern.bits.iter()).enumerate() {
+                        if old_bit != new_bit {
+                            indices_to_update.push(i);
+                        }
+                    }
+                    for i in indices_to_update {
+                        pattern.bits[i] = Bit::Var;
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge patterns for fields with merge_mode_uses, to reduce the number of encodings we need to generate
+    for (_, field_uses) in field_values.iter_mut() {
+        if let FieldUses::Uses { name: _, patterns } = field_uses {
+            // Merge the patterns to reduce the number of encodings we need to generate
+            let merged = FieldUses::Uses { name: "__".to_string(), patterns: patterns.clone() }.merge();
+            *field_uses = merged;
+        }
+    }
+    // for each instruction, print all valid encodings
+    for instr in &arm32 {
+        println!("Instruction: {}", instr.name);
+        for form in &instr.forms {
+            // We only want to get the encodings for the form if this form actually is used in the program
+            if !decoded_program.iter().any(|decoded| decoded.form_name.as_ref().unwrap() == &form.name) {
+                continue;
+            }
+            let encodings = form.fields_to_encodings(&field_values);
+            println!("  Form: {}", form.name);
+            for encoding in encodings {
+                // println!("    Encoding: {:?}", encoding);
+                // print as string, 0s and 1s for High and Low, and Xs for Var
+                let encoding_str: String = encoding.bits.iter().map(|b| {
+                    match b {
+                        Bit::Low => '0',
+                        Bit::High => '1',
+                        Bit::Var => 'x',
+                        Bit::Test => panic!("Test bits should not be present in final encodings"),
+                    }
+                }).collect();
+                println!("    Encoding: {}", encoding_str);
+            }
         }
     }
 }
