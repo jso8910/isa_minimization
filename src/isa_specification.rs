@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::bit::{BitPattern, Bit};
 
@@ -154,7 +154,7 @@ impl InstructionForm {
     /// Given a vector of field uses, produce all the possible encodings of this instruction form that would match those field uses.
     /// Things like variable bits are NOT expanded.
     /// This is the raw output, so certain inefficiencies may exist (eg this may output [0, 1] when [x] is more efficient)
-    fn fields_to_encodings_raw(&self, field_values: &[FieldUses]) -> Vec<BitPattern> {
+    fn fields_to_encodings_raw(&self, field_values: &HashMap<String, FieldUses>) -> Vec<BitPattern> {
         let mut encodings = Vec::new();
 
         // We approach this problem by walking through each field in in the instruction form
@@ -164,7 +164,7 @@ impl InstructionForm {
         // We can do this with a recursive helper function that takes the current index of the field we are processing, and the current encoding we have generated so far
         fn helper(
             form: &InstructionForm,
-            field_values: &[FieldUses],
+            field_values: &HashMap<String, FieldUses>,
             current_encoding: BitPattern,
             encodings: &mut Vec<BitPattern>,
             field_index: usize,
@@ -174,7 +174,16 @@ impl InstructionForm {
                 return;
             }
             let field = &form.fields[field_index];
-            let field_use = &field_values[field_index];
+            let field_use = match &field.name {
+                Some(name) => field_values.get(name).unwrap_or_else(|| panic!("Field value for '{}' not found", name)),
+                None => {
+                    if field.pattern.bits.iter().any(|b| *b == Bit::Var) {
+                        panic!("Unnamed fields cannot have variable bits");
+                    }
+                    // If there is no name, this is a constant field, so we can just use the pattern directly
+                    &FieldUses::VariableBits { name: "__const__".to_string(), pattern: field.pattern.clone() }
+                }
+            };
             match (field.merge_mode, field_use) {
                 (MergeMode::VariableBits, FieldUses::VariableBits { name: _, pattern }) => {
                     // Just append the pattern to the current encoding and move on
@@ -203,7 +212,7 @@ impl InstructionForm {
     /// Given a vector of field uses, produce all the possible encodings of this instruction form that would match those field uses.
     /// Things like variable bits are NOT expanded.
     /// This function returns merged encodings where encodings that differ by only 1 bit flip are merged to an x (eg [00, 01] -> [0x])
-    pub fn fields_to_encodings(&self, field_values: &[FieldUses]) -> Vec<BitPattern> {
+    pub fn fields_to_encodings(&self, field_values: &HashMap<String, FieldUses>) -> Vec<BitPattern> {
         let encodings_raw = self.fields_to_encodings_raw(field_values);
 
         let mut encodings = encodings_raw.clone();
@@ -219,7 +228,7 @@ impl InstructionForm {
 
                 // The only comparisons we want to make are to encodings which have exactly one more one than the current encoding
                 for enc_cmp in encodings_copy.iter().filter(|enc| enc.num_high() == num_ones + 1) {
-                    // Now check using only existing methods whether the single extra 1 is in a place where the current `encoding` has a 0
+                    // Now check whether the single extra 1 is in a place where the current `encoding` has a 0
                     println!("Comparing {:?} and {:?}", encoding, enc_cmp);
                     if encoding.can_merge_with(enc_cmp) {
                         // If so, merge them and add the merged encoding to the list of encodings (if it doesn't already exist)
@@ -514,9 +523,8 @@ mod tests {
         fn test_variable_bits() {
             let form = InstructionForm::new("form1")
                 .field(InstructionField::variable("field1", 2));
-            let field_values = vec![
-                FieldUses::VariableBits { name: "field1".to_string(), pattern: BitPattern::parse("x1") },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::VariableBits { name: "field1".to_string(), pattern: BitPattern::parse("x1") });
             let encodings = form.fields_to_encodings_raw(&field_values);
             assert_eq!(encodings.len(), 1);
             assert_eq!(encodings[0], BitPattern::parse("x1"));
@@ -526,9 +534,8 @@ mod tests {
         fn test_uses() {
             let form = InstructionForm::new("form1")
                 .field(InstructionField::variable("field1", 2).merge_mode_uses());
-            let field_values = vec![
-                FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01"), BitPattern::parse("11")].iter().cloned().collect() },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01"), BitPattern::parse("11")].iter().cloned().collect() });
             let encodings = form.fields_to_encodings_raw(&field_values);
             assert_eq!(encodings.len(), 3);
             assert!(encodings.contains(&BitPattern::parse("00")));
@@ -541,10 +548,9 @@ mod tests {
             let form = InstructionForm::new("form1")
                 .field(InstructionField::variable("field1", 2).merge_mode_uses())
                 .field(InstructionField::variable("field2", 1));
-            let field_values = vec![
-                FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() },
-                FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("x") },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() });
+            field_values.insert("field2".to_string(), FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("x") });
             let encodings = form.fields_to_encodings_raw(&field_values);
             assert_eq!(encodings.len(), 2);
             assert!(encodings.contains(&BitPattern::parse("00x")));
@@ -557,17 +563,29 @@ mod tests {
                 .field(InstructionField::variable("field1", 2).merge_mode_uses())
                 .field(InstructionField::variable("field2", 2))
                 .field(InstructionField::variable("field3", 3).merge_mode_uses());
-            let field_values = vec![
-                FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() },
-                FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("xx") },
-                FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111")].iter().cloned().collect() },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() });
+            field_values.insert("field2".to_string(), FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("xx") });
+            field_values.insert("field3".to_string(), FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111")].iter().cloned().collect() });
             let encodings = form.fields_to_encodings_raw(&field_values);
             assert_eq!(encodings.len(), 4);
             assert!(encodings.contains(&BitPattern::parse("00xx000")));
             assert!(encodings.contains(&BitPattern::parse("00xx111")));
             assert!(encodings.contains(&BitPattern::parse("01xx000")));
             assert!(encodings.contains(&BitPattern::parse("01xx111")));
+        }
+
+        #[test]
+        fn test_consts() {
+            let form = InstructionForm::new("form1")
+                .field(c("10"))
+                .field(InstructionField::variable("field1", 2).merge_mode_uses());
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() });
+            let encodings = form.fields_to_encodings_raw(&field_values);
+            assert_eq!(encodings.len(), 2);
+            assert!(encodings.contains(&BitPattern::parse("1000")));
+            assert!(encodings.contains(&BitPattern::parse("1001")));
         }
     }
 
@@ -599,11 +617,10 @@ mod tests {
                 .field(InstructionField::variable("field1", 2).merge_mode_uses())
                 .field(InstructionField::variable("field2", 2))
                 .field(InstructionField::variable("field3", 3).merge_mode_uses());
-            let field_values = vec![
-                FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() },
-                FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("xx") },
-                FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111")].iter().cloned().collect() },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() });
+            field_values.insert("field2".to_string(), FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("xx") });
+            field_values.insert("field3".to_string(), FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111")].iter().cloned().collect() });
             let raw = form.fields_to_encodings_raw(&field_values);
             let merged = form.fields_to_encodings(&field_values);
 
@@ -621,11 +638,10 @@ mod tests {
                 .field(InstructionField::variable("field1", 2).merge_mode_uses())
                 .field(InstructionField::variable("field2", 2))
                 .field(InstructionField::variable("field3", 3).merge_mode_uses());
-            let field_values = vec![
-                FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() },
-                FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("x1") },
-                FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111"), BitPattern::parse("101")].iter().cloned().collect() },
-            ];
+            let mut field_values = HashMap::new();
+            field_values.insert("field1".to_string(), FieldUses::Uses { name: "field1".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("01")].iter().cloned().collect() });
+            field_values.insert("field2".to_string(), FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("x1") });
+            field_values.insert("field3".to_string(), FieldUses::Uses { name: "field3".to_string(), patterns: [BitPattern::parse("000"), BitPattern::parse("111"), BitPattern::parse("101")].iter().cloned().collect() });
             let raw = form.fields_to_encodings_raw(&field_values);
             let merged = form.fields_to_encodings(&field_values);
 
