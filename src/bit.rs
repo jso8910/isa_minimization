@@ -4,7 +4,7 @@ use regex::Regex;
 use rhai::{CustomType, Engine, Scope, TypeBuilder};
 
 /// Enum for the Bit type used in symbolic simulation
-#[derive(PartialEq, Eq, Debug, Copy, Clone)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone, Hash)]
 pub enum Bit {
     /// Logical 1
     High,
@@ -93,9 +93,9 @@ impl BitXor for Bit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BitPattern {
-    bits: Vec<Bit>
+    pub bits: Vec<Bit>
 }
 
 impl BitPattern {
@@ -140,6 +140,51 @@ impl BitPattern {
             }
         }
         true
+    }
+
+    pub fn num_high(&self) -> usize {
+        return self.bits.iter().filter(|b| **b == Bit::High).count()
+    }
+
+    pub fn can_merge_with(&self, other: &BitPattern) -> bool {
+        if self.bits.len() != other.bits.len() {
+            return false;
+        }
+
+        let mut diff_count = 0;
+        for (b1, b2) in self.bits.iter().zip(&other.bits) {
+            println!("Comparing bits: {:?} and {:?}", b1, b2);
+            if b1 != b2 {
+                // If the bits are different, they can only be merged if one of them is high and the other is low
+                if (b1 == &Bit::High && b2 == &Bit::Low) || (b1 == &Bit::Low && b2 == &Bit::High) {
+                    // This is fine, we can merge these two bits into a variable bit
+                } else {
+                    // If the bits are different but cannot be merged, then these two patterns cannot be merged
+                    return false;
+                }
+                diff_count += 1;
+            }
+        }
+        diff_count == 1
+    }
+
+    pub fn merge_with(&self, other: &BitPattern) -> Self {
+        assert!(self.can_merge_with(other), "Cannot merge these two BitPatterns");
+
+        let merged_bits = self.bits.iter().zip(&other.bits).map(|(b1, b2)| {
+            if b1 == b2 {
+                *b1
+            } else {
+                // If the bits are different, they can only be merged if one of them is high and the other is low, in which case we merge them into a variable bit
+                if b1 == &Bit::High && b2 == &Bit::Low || b1 == &Bit::Low && b2 == &Bit::High {
+                    Bit::Var
+                } else {
+                    panic!("This should never happen since we check can_merge_with before calling this function");
+                }
+            }
+        }).collect();
+
+        Self { bits: merged_bits }
     }
 }
 
@@ -424,6 +469,12 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn bit_pattern_num_high() {
+            let bp = BitPattern::parse("1011xxx1000x");
+            assert_eq!(bp.num_high(), 4);
         }
     }
 
