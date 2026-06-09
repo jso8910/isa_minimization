@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::error::Error;
 
-mod bit;
+pub mod bit;
+pub mod isa_specification;
 
 /// Configuration for the whole program
 #[derive(Debug, Clone, PartialEq, Eq)]
