@@ -152,25 +152,40 @@ impl InstructionForm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeMode {
+    /// Merge by bit positions. If observed values differ in a bit, that bit becomes variable.
+    ///
+    /// Good for immediates, offsets, literal bitfields, etc.
+    VariableBits,
+
+    /// Merge by distinct used values.
+    ///
+    /// Good for register addresses, small selectors, opcodes, condition codes, etc.
+    Uses,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionField {
-    name: Option<String>,
-    pattern: BitPattern
+    pub name: Option<String>,
+    pub pattern: BitPattern,
+    pub merge_mode: MergeMode,
 }
 
 impl InstructionField {
     pub fn named(name: impl Into<String>, pattern: BitPattern) -> Self {
         Self {
             name: Some(name.into()),
-            pattern
+            pattern,
+            merge_mode: MergeMode::VariableBits,
         }
     }
 
     pub fn constant(bits: &str) -> Self {
         Self {
             name: None,
-            pattern: BitPattern::parse(bits)
+            pattern: BitPattern::parse(bits),
+            merge_mode: MergeMode::VariableBits,
         }
     }
 
@@ -178,7 +193,18 @@ impl InstructionField {
         Self {
             name: Some(name.into()),
             pattern: BitPattern::variable(width),
+            merge_mode: MergeMode::VariableBits,
         }
+    }
+
+    pub fn merge_mode_uses(mut self) -> Self {
+        self.merge_mode = MergeMode::Uses;
+        self
+    }
+
+    pub fn merge_mode_variable_bits(mut self) -> Self {
+        self.merge_mode = MergeMode::VariableBits;
+        self
     }
 
     pub fn width(&self) -> usize {

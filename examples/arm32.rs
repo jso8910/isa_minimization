@@ -8,6 +8,7 @@ use isa_minimization::bit::{Bit};
 
 pub fn cond() -> InstructionField {
     InstructionField::variable("cond", 4)
+        .merge_mode_uses()
 }
 
 pub fn set_flags() -> InstructionField {
@@ -16,22 +17,27 @@ pub fn set_flags() -> InstructionField {
 
 pub fn rn_addr() -> InstructionField {
     InstructionField::variable("rn_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn rd_addr() -> InstructionField {
     InstructionField::variable("rd_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn rm_addr() -> InstructionField {
     InstructionField::variable("rm_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn rs_addr() -> InstructionField {
     InstructionField::variable("rs_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn data_proc_opcode() -> InstructionField {
     InstructionField::variable("data_proc_opcode", 4)
+            .merge_mode_uses()
 }
 
 pub fn has_imm() -> InstructionField {
@@ -44,6 +50,7 @@ pub fn op2_imm_shift_amt() -> InstructionField {
 
 pub fn op2_shift_type() -> InstructionField {
     InstructionField::variable("op2_shift_type", 2)
+            .merge_mode_uses()
 }
 
 pub fn imm_ror_amt() -> InstructionField {
@@ -64,10 +71,12 @@ pub fn is_unsigned_mul() -> InstructionField {
 
 pub fn rdhi_addr() -> InstructionField {
     InstructionField::variable("rdhi_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn rdlo_addr() -> InstructionField {
     InstructionField::variable("rdlo_addr", 4)
+            .merge_mode_uses()
 }
 
 pub fn is_pre_idx() -> InstructionField {
@@ -93,6 +102,7 @@ pub fn has_imm_offset() -> InstructionField {
 pub fn sh_bits() -> InstructionField {
     // Cannot have value 00
     InstructionField::variable("sh_bits", 2)
+            .merge_mode_uses()
 }
 
 pub fn imm8_high() -> InstructionField {
