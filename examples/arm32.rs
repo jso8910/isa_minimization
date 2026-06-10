@@ -2,11 +2,12 @@
 // Simply an example of what you can do with isa_specification
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::fs;
 
+use isa_minimization::parser::parse_netlist;
 use isa_minimization::stdcell_library::StandardCellLibrary;
 use isa_minimization::isa_specification::{DecodedField, DecodedInstruction, FieldUses, Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not, or};
-use isa_minimization::bit::{Bit, BitPattern};
+use isa_minimization::bit::Bit;
 
 // Instruction field definitions
 
@@ -563,4 +564,16 @@ fn main() {
     }
 
     StandardCellLibrary::new("examples/NangateOpenCellLibrary_typical.lib");
+
+    let verilog = fs::read_to_string("examples/arm32_core_syn.v").unwrap();
+    let netlist = parse_netlist(&verilog).unwrap();
+
+    println!("{:?}", netlist.name);
+    println!("{:?}", netlist.instances);
+    println!();
+
+    println!("{:?}", netlist.wires);
+
+    // println!("{:?}", netlist.name);
+
 }

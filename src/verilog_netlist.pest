@@ -1,0 +1,215 @@
+file = {
+    SOI ~ top_item* ~ EOI
+}
+
+top_item = _{
+    directive
+  | module_decl
+}
+
+module_decl = {
+    attribute*
+    ~ "module" ~ ident ~ "(" ~ port_header? ~ ")" ~ ";"
+    ~ module_item*
+    ~ "endmodule"
+}
+
+port_header = {
+    port_header_item ~ ("," ~ port_header_item)*
+}
+
+port_header_item = {
+    port_decl_inline
+  | ident
+}
+
+port_decl_inline = {
+    port_dir ~ net_kind? ~ range? ~ ident
+}
+
+module_item = {
+    attribute*
+    ~ (
+        declaration
+      | assign_stmt
+      | instance
+      | directive
+    )
+}
+
+declaration = {
+    port_decl
+  | net_decl
+}
+
+port_decl = {
+    port_dir ~ net_kind? ~ range? ~ ident_list ~ ";"
+}
+
+net_decl = {
+    net_kind ~ range? ~ ident_list ~ ";"
+}
+
+port_dir = {
+    "input"
+  | "output"
+  | "inout"
+}
+
+net_kind = {
+    "wire"
+  | "tri"
+  | "supply0"
+  | "supply1"
+}
+
+range = {
+    "[" ~ number ~ ":" ~ number ~ "]"
+}
+
+ident_list = {
+    ident ~ ("," ~ ident)*
+}
+
+assign_stmt = {
+    "assign" ~ expr ~ "=" ~ expr ~ ";"
+}
+
+instance = {
+    ident ~ param_override? ~ ident ~ "(" ~ connection_list? ~ ")" ~ ";"
+}
+
+param_override = {
+    "#" ~ "(" ~ param_connection_list? ~ ")"
+}
+
+param_connection_list = {
+    param_connection ~ ("," ~ param_connection)*
+}
+
+param_connection = {
+    named_connection
+}
+
+connection_list = {
+    connection ~ ("," ~ connection)*
+}
+
+connection = {
+    named_connection
+  | positional_connection
+}
+
+named_connection = {
+    "." ~ ident ~ "(" ~ expr? ~ ")"
+}
+
+positional_connection = {
+    expr?
+}
+
+expr = {
+    reject_concat
+  | logic_expr
+}
+
+logic_expr = {
+    term ~ (binop ~ term)*
+}
+
+term = {
+    reject_concat
+  | reject_part_select
+  | bit_select
+  | constant
+  | ident
+  | unaryop ~ term
+  | "(" ~ logic_expr ~ ")"
+}
+
+bit_select = {
+    ident ~ "[" ~ number ~ "]"
+}
+
+reject_part_select = {
+    ident ~ "[" ~ number ~ ":" ~ number ~ "]"
+}
+
+reject_concat = {
+    "{" ~ (!"}" ~ ANY)* ~ "}"
+}
+
+unaryop = {
+    "~"
+  | "!"
+}
+
+binop = {
+    "~^"
+  | "^~"
+  | "&"
+  | "|"
+  | "^"
+}
+
+ident = @{
+    escaped_ident
+  | normal_ident
+}
+
+normal_ident = @{
+    (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "$")*
+}
+
+escaped_ident = @{
+    "\\" ~ (!(" " | "\t" | "\r" | "\n") ~ ANY)+
+}
+
+constant = @{
+    sized_const
+  | unsized_based_const
+  | decimal_const
+}
+
+sized_const = @{
+    ASCII_DIGIT+ ~ "'" ~ ASCII_ALPHA ~ const_digit+
+}
+
+unsized_based_const = @{
+    "'" ~ ASCII_ALPHA? ~ const_digit+
+}
+
+decimal_const = @{
+    ASCII_DIGIT+
+}
+
+const_digit = _{
+    ASCII_ALPHANUMERIC
+  | "_"
+  | "?"
+}
+
+number = @{
+    ASCII_DIGIT+
+}
+
+directive = {
+    "`" ~ (!NEWLINE ~ ANY)* ~ NEWLINE?
+}
+
+attribute = {
+    "(*" ~ (!"*)" ~ ANY)* ~ "*)"
+}
+
+COMMENT = _{
+    "//" ~ (!NEWLINE ~ ANY)*
+  | "/*" ~ (!"*/" ~ ANY)* ~ "*/"
+}
+
+WHITESPACE = _{
+    " "
+  | "\t"
+  | "\r"
+  | "\n"
+  | COMMENT
+}
