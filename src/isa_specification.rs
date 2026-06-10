@@ -277,12 +277,12 @@ impl InstructionForm {
                     }
                 }
                 Predicate::BitEq { index, value } => {
-                    if *index < pattern.bits.len() + pattern_idx && pattern_idx >= *index && *value != Bit::Var && pattern.bits[*index - pattern_idx] == Bit::Var {
+                    if *index < pattern.bits.len() + pattern_idx && pattern_idx <= *index && *value != Bit::Var && pattern.bits[*index - pattern_idx] == Bit::Var {
                         pattern.bits[*index - pattern_idx] = *value;
                     }
 
                     // If the predicate applies to this pattern, and the value is not variable, and the pattern bit does not match the value, then this means the constraints are unsatisfiable, since the bit must be equal to value, but pattern cannot be made equal to value
-                    if (*index < pattern.bits.len() + pattern_idx && pattern_idx >= *index) && (*value != Bit::Var && pattern.bits.get(*index - pattern_idx) != Some(value)) {
+                    if (*index < pattern.bits.len() + pattern_idx && pattern_idx <= *index) && (*value != Bit::Var && pattern.bits.get(*index - pattern_idx) != Some(value)) {
                         // This means the constraints are unsatisfiable
                         // This does not return false if index is out of bounds, since that just means this predicate is not actually constraining any bits in this pattern
                         return false;
