@@ -3,6 +3,7 @@ use std::error::Error;
 
 pub mod bit;
 pub mod isa_specification;
+pub mod stdcell_library;
 
 /// Configuration for the whole program
 #[derive(Debug, Clone, PartialEq, Eq)]

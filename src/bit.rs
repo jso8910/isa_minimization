@@ -188,6 +188,7 @@ impl BitPattern {
 }
 
 /// Lookup table implementation for boolean functions involving the Bit enum
+#[derive(Debug)]
 pub struct LookupTable {
     /// Number of inputs in the boolean function
     input_count: usize,
@@ -200,15 +201,17 @@ pub struct LookupTable {
     /// For a 3 input function where the inputs are aa, bb, cc, the index in this vector is 0bccbbaa (c goes in MSB, etc)
     truth_table: Vec<Bit>,
     /// Function inputs
-    input_names: Vec<String>
+    input_names: Vec<String>,
+    /// Optional: original function value
+    function: Option<String>
 }
 
 impl LookupTable {
-    pub fn new(input_count: usize, truth_table: Vec<Bit>, input_names: Vec<String>) -> Self {
+    pub fn new(input_count: usize, truth_table: Vec<Bit>, input_names: Vec<String>, function: Option<String>) -> Self {
         // Truth table length should be equal to 4**input_count
         assert_eq!(truth_table.len(), 1 << 2*input_count, "Invalid truth table size");
 
-        Self { input_count, truth_table, input_names }
+        Self { input_count, truth_table, input_names, function }
     }
 
     /// Defines a new LookupTable from a boolean function string.
@@ -221,7 +224,7 @@ impl LookupTable {
     /// # Arguments
     /// * `expr` - the boolean function expression as a string
     /// * `inputs` - a vector of the names of all inputs in the expression, in the order they will be included in the LUT
-    pub fn new_from_string(expr: &str, input_names: Vec<String>) -> Self {
+    pub fn new_from_string(expr: &str, input_names: Vec<&str>) -> Self {
         // In order to evaluate this function, we don't want to have to manually parse it
         // What we do is we construct a LUT by using the eval_string_expr function
 
@@ -239,25 +242,48 @@ impl LookupTable {
 
         let mut truth_table: Vec<Bit> = Vec::with_capacity(2 << input_names.len());
 
+        // Create rhai engine
+        let mut engine = Engine::new();
+
+        // Needed for overloaded operators on Bit
+        engine.set_fast_operators(false);
+
+        // Register Bit
+        engine.build_type::<Bit>();
+
+        // Compile/parse the expression
+        let ast = engine.compile_expression(&expr).unwrap();
+
+        // Create scope once
+        let mut scope = Scope::new();
+        for name in input_names.iter() {
+            scope.push(*name, Bit::Low);
+        }
+
         // We need to permute every bit
-        let mut input_vals: HashMap<String, Bit> = HashMap::new();
+        // let mut input_vals: HashMap<String, Bit> = HashMap::new();
         for i in 0..(1 << 2*input_names.len()) {
             for (idx, input) in input_names.iter().enumerate() {
-                input_vals.insert(
-                    input.to_string(),
-                    match (i >> (2*idx)) & 0b11 {
-                        0 => Bit::Low,
-                        1 => Bit::High,
-                        2 => Bit::Var,
-                        3 => Bit::Test,
-                        _ => panic!("This can't happen. Value cannot be greater than 3")
-                    }
-                );
+                let val = match (i >> (2*idx)) & 0b11 {
+                    0 => Bit::Low,
+                    1 => Bit::High,
+                    2 => Bit::Var,
+                    3 => Bit::Test,
+                    _ => panic!("This can't happen. Value cannot be greater than 3")
+                };
+                scope.set_value(*input, val);
             }
 
-            truth_table.push(LookupTable::eval_string_expr(&expr, &input_vals));
+            let result = engine.eval_ast_with_scope::<Bit>(&mut scope, &ast).unwrap();
+            truth_table.push(result);
+            // truth_table.push(LookupTable::eval_string_expr(&expr, &input_vals));
         }
-        LookupTable { input_count: input_names.len(), truth_table, input_names: input_names }
+        LookupTable {
+            input_count: input_names.len(),
+            truth_table,
+            input_names: input_names.into_iter().map(|v| v.to_string()).collect(),
+            function: Some(expr.to_string())
+        }
     }
 
     /// Evaluates the expression in the LUT
@@ -493,7 +519,7 @@ mod tests {
                 // b = test
                 Bit::Low, Bit::Test, Bit::Test, Bit::Test
             ];
-            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")]);
+            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -520,7 +546,7 @@ mod tests {
                 // b = test
                 Bit::High, Bit::Test, Bit::Test, Bit::Test
             ];
-            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")]);
+            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -571,7 +597,7 @@ mod tests {
                 // b = t, c = t
                 Bit::Low, Bit::Test, Bit::Test, Bit::Test,
             ];
-            let lookup_table = LookupTable::new(3, table, vec![String::from("A"), String::from("B"), String::from("C")]);
+            let lookup_table = LookupTable::new(3, table, vec![String::from("A"), String::from("B"), String::from("C")], None);
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -591,8 +617,8 @@ mod tests {
         #[test]
         fn lookup_table_str_and() {
             let input_names = vec![
-                String::from("A"),
-                String::from("B")
+                "A",
+                "B"
             ];
             let lookup_table = LookupTable::new_from_string("A & B", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
@@ -607,9 +633,9 @@ mod tests {
         #[test]
         fn lookup_table_str_and3() {
             let input_names = vec![
-                String::from("A"),
-                String::from("B"),
-                String::from("C")
+                "A",
+                "B",
+                "C"
             ];
             let lookup_table = LookupTable::new_from_string("A & B & C", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
@@ -626,9 +652,9 @@ mod tests {
         #[test]
         fn lookup_table_str_3_inp_noncommutative() {
             let input_names = vec![
-                String::from("A"),
-                String::from("B"),
-                String::from("C")
+                "A",
+                "B",
+                "C"
             ];
             let lookup_table = LookupTable::new_from_string("!A | (B & C)", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
@@ -645,8 +671,8 @@ mod tests {
         #[test]
         fn lookup_table_str_hardcoded_high() {
             let input_names = vec![
-                String::from("A"),
-                String::from("B")
+                "A",
+                "B",
             ];
             let lookup_table = LookupTable::new_from_string("!A | (B & 1)", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
@@ -661,8 +687,8 @@ mod tests {
         #[test]
         fn lookup_table_str_hardcoded_low() {
             let input_names = vec![
-                String::from("A"),
-                String::from("B")
+                "A",
+                "B",
             ];
             let lookup_table = LookupTable::new_from_string("!A | (B & 1) & 0", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];

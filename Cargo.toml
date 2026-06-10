@@ -13,3 +13,4 @@ unwrap_used = "deny"
 [dependencies]
 rhai = "1"
 regex = "1"
+liberty-db = "0.17"

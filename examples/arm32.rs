@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use isa_minimization::stdcell_library::StandardCellLibrary;
 use isa_minimization::isa_specification::{DecodedField, DecodedInstruction, FieldUses, Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not, or};
 use isa_minimization::bit::{Bit, BitPattern};
 
@@ -560,4 +561,6 @@ fn main() {
             }
         }
     }
+
+    StandardCellLibrary::new("examples/NangateOpenCellLibrary_typical.lib");
 }
