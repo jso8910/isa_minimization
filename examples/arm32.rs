@@ -2,6 +2,7 @@
 // Simply an example of what you can do with isa_specification
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use isa_minimization::isa_specification::{DecodedField, DecodedInstruction, FieldUses, Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not, or};
 use isa_minimization::bit::{Bit, BitPattern};
@@ -465,8 +466,7 @@ fn main() {
                     continue;
                 }
             };
-            println!("Instruction {}: Field {} = {:?}", i, name, value);
-            let mut default_val = match merge_mode {
+            let default_val = match merge_mode {
                 MergeMode::Uses => FieldUses::Uses { name: name.clone(), patterns: [value.clone()].iter().cloned().collect() },
                 MergeMode::VariableBits => FieldUses::VariableBits { name: name.clone(), pattern: value.clone() },
             };
@@ -515,7 +515,6 @@ fn main() {
             let encodings = form.fields_to_encodings(&field_values);
             println!("  Form: {}", form.name);
             for encoding in encodings {
-                // println!("    Encoding: {:?}", encoding);
                 // print as string, 0s and 1s for High and Low, and Xs for Var
                 let encoding_str: String = encoding.bits.iter().map(|b| {
                     match b {
@@ -526,6 +525,38 @@ fn main() {
                     }
                 }).collect();
                 println!("    Encoding: {}", encoding_str);
+            }
+        }
+    }
+
+    // Print each field and its possible values
+    println!("Fields and their possible values:");
+    for (field_name, field_uses) in &field_values {
+        println!("  Field: {}", field_name);
+        match field_uses {
+            FieldUses::Uses { name: _, patterns } => {
+                for pattern in patterns {
+                    let pattern_str: String = pattern.bits.iter().map(|b| {
+                        match b {
+                            Bit::Low => '0',
+                            Bit::High => '1',
+                            Bit::Var => 'x',
+                            Bit::Test => panic!("Test bits should not be present in final field patterns"),
+                        }
+                    }).collect();
+                    println!("    Pattern: {}", pattern_str);
+                }
+            },
+            FieldUses::VariableBits { name: _, pattern } => {
+                let pattern_str: String = pattern.bits.iter().map(|b| {
+                    match b {
+                        Bit::Low => '0',
+                        Bit::High => '1',
+                        Bit::Var => 'x',
+                        Bit::Test => panic!("Test bits should not be present in final field patterns"),
+                    }
+                }).collect();
+                println!("    Pattern: {}", pattern_str);
             }
         }
     }

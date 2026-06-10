@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::isa_specification::FieldUses::VariableBits;
-
 use super::bit::{BitPattern, Bit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +124,9 @@ pub struct InstructionForm {
     pub fields: Vec<InstructionField>,
 
     /// Condition (on the instruction) for when the field is applicable (eg requiring a certain bit to be set to 1)
+    /// For these predicates, it is recommended to only use And, FieldEq, and BitEq
+    /// If you use Not, Or, or FieldIn, fields_to_encodings may generate some encodings which don't fully satisfy the predicate
+    /// (ie generating an instruction which may actually belong to another form) because of the current implementation
     pub when: Predicate
 }
 
@@ -196,19 +197,29 @@ impl InstructionForm {
             };
             match (field.merge_mode, field_use) {
                 (MergeMode::VariableBits, FieldUses::VariableBits { name: _, pattern }) => {
-                    // Just append the pattern to the current encoding and move on
-                    let new_encoding = BitPattern {
-                        bits: [current_encoding.bits.clone(), pattern.bits.clone()].concat(),
-                    };
-                    helper(form, field_values, new_encoding, encodings, field_index + 1);
+                    // If the field or a bit in the field necessarily must have a certain value for a predicate in the form
+                    // and it is currently unknown, we must fix that bit to the required value, since otherwise we would generate an encoding that doesn't satisfy the form's predicate
+                    if let Some(constrained_pattern) = form.constrain_variable_bits(pattern, current_encoding.bits.len(), field.name.as_ref().unwrap_or(&"__const__".to_string()).as_str()) {
+                        // Just append the pattern to the current encoding and move on
+                        let new_encoding = BitPattern {
+                            bits: [current_encoding.bits.clone(), constrained_pattern.bits.clone()].concat(),
+                        };
+                        helper(form, field_values, new_encoding, encodings, field_index + 1);
+                    } else {
+                        // If the field cannot satisfy the predicate, we should abandon this specific encoding, since it is not valid
+                    }
                 }
                 (MergeMode::Uses, FieldUses::Uses { name: _, patterns }) => {
                     // For each pattern, append it to the current encoding and recurse
                     for pattern in patterns {
-                        let new_encoding = BitPattern {
-                            bits: [current_encoding.bits.clone(), pattern.bits.clone()].concat(),
-                        };
-                        helper(form, field_values, new_encoding, encodings, field_index + 1);
+                        if let Some(constrained_pattern) = form.constrain_variable_bits(pattern, current_encoding.bits.len(), field.name.as_ref().unwrap_or(&"__const__".to_string()).as_str()) {
+                            let new_encoding = BitPattern {
+                                bits: [current_encoding.bits.clone(), constrained_pattern.bits.clone()].concat(),
+                            };
+                            helper(form, field_values, new_encoding, encodings, field_index + 1);
+                        } else {
+                            // If the field cannot satisfy the predicate, we should abandon this specific encoding, since it is not valid
+                        }
                     }
                 }
                 _ => panic!("Field use does not match field merge mode"),
@@ -216,7 +227,80 @@ impl InstructionForm {
         }
 
         helper(self, field_values, BitPattern { bits: Vec::new() }, &mut encodings, 0);
+
+        // Remove any direct duplicates (created by constrain_variable_bits)
+        encodings.sort_by(|a, b| {
+            let a_key: Vec<String> = a.bits.iter().map(|bit| format!("{:?}", bit)).collect();
+            let b_key: Vec<String> = b.bits.iter().map(|bit| format!("{:?}", bit)).collect();
+            a_key.cmp(&b_key)
+        });
+        encodings.dedup();
         encodings
+    }
+
+    /// Elaborates variable bits in a BitPattern to satisfy the predicate of InstructionForm::when
+    /// Arguments:
+    /// * `pattern` - the BitPattern to elaborate.
+    /// * `pattern_idx` - the starting index of the pattern in the overall instruction encoding (used for checking BitEq predicates)
+    /// * `field_name` - the name of the field corresponding to this pattern (used for checking FieldEq and FieldIn predicates)
+    fn constrain_variable_bits(&self, pattern: &BitPattern, pattern_idx: usize, field_name: &str) -> Option<BitPattern> {
+        let mut pattern = pattern.clone();
+        
+        fn apply_constraints(form: &InstructionForm, predicate: &Predicate, pattern: &mut BitPattern, pattern_idx: usize, field_name: &str) -> bool {
+            match predicate {
+                Predicate::Always | Predicate::Never => {},
+                Predicate::Not(_) => {
+                    // For simplicity, we won't handle Not predicates, since they can be complex to handle (eg Not(And(...)) or Not(Or(...)))
+                    // Instead, we will just ignore them, which means we won't be able to constrain bits based on Not predicates. This is a limitation of the current implementation.
+                },
+                Predicate::Or(_) => {
+                    // For simplicity, we won't handle Or predicates, since they can also be complex to handle (eg Or(And(...), And(...)))
+                    // Instead, we will just ignore them, which means we won't be able to constrain bits based on Or predicates. This is a limitation of the current implementation.
+                },
+                Predicate::And(predicates) => {
+                    for p in predicates {
+                        if !apply_constraints(form, p, pattern, pattern_idx, field_name) {
+                            return false;
+                        }
+                    }
+                }
+                Predicate::FieldEq { field_name: pred_field_name, value } => {
+                    if pred_field_name == field_name {
+                        for (i, bit) in value.bits.iter().enumerate() {
+                            if i < pattern.bits.len() && *bit != Bit::Var && pattern.bits[i] == Bit::Var {
+                                pattern.bits[i] = *bit;
+                            } else if i >= pattern.bits.len() || (*bit != Bit::Var && pattern.bits[i] != *bit) {
+                                // This means the constraints are unsatisfiable, since the field must be equal to value, but pattern cannot be made equal to value
+                                return false;
+                            }
+                        }
+                    }
+                }
+                Predicate::BitEq { index, value } => {
+                    if *index < pattern.bits.len() + pattern_idx && pattern_idx >= *index && *value != Bit::Var && pattern.bits[*index - pattern_idx] == Bit::Var {
+                        pattern.bits[*index - pattern_idx] = *value;
+                    }
+
+                    // If the predicate applies to this pattern, and the value is not variable, and the pattern bit does not match the value, then this means the constraints are unsatisfiable, since the bit must be equal to value, but pattern cannot be made equal to value
+                    if (*index < pattern.bits.len() + pattern_idx && pattern_idx >= *index) && (*value != Bit::Var && pattern.bits.get(*index - pattern_idx) != Some(value)) {
+                        // This means the constraints are unsatisfiable
+                        // This does not return false if index is out of bounds, since that just means this predicate is not actually constraining any bits in this pattern
+                        return false;
+                    }
+                }
+                Predicate::FieldIn { .. } => {
+                    // For simplicity, we don't handle FieldIn
+                    // These can be tricky
+                }
+            };
+            true
+        }
+        
+        if !apply_constraints(self, &self.when, &mut pattern, pattern_idx, field_name) {
+            None
+        } else {
+            Some(pattern)
+        }
     }
 }
 
@@ -601,6 +685,63 @@ mod tests {
             assert!(encodings.contains(&BitPattern::parse("1000")));
             assert!(encodings.contains(&BitPattern::parse("1001")));
         }
+
+        #[test]
+        fn test_field_predicate_constraint_variable() {
+            let form = InstructionForm::new("form1")
+                .field(c("100101"))
+                .field(InstructionField::variable("field2", 2))
+                .field(c("10010"))
+                .when(field_eq("field2", "00"));
+            let mut field_values = HashMap::new();
+            field_values.insert("field2".to_string(), FieldUses::VariableBits { name: "field2".to_string(), pattern: BitPattern::parse("xx") });
+            let encodings = form.fields_to_encodings(&field_values);
+            assert_eq!(encodings.len(), 1);
+            assert!(encodings.contains(&BitPattern::parse("1001010010010")));
+        }
+
+        #[test]
+        fn test_field_predicate_constraint_uses() {
+            let form = InstructionForm::new("form1")
+                .field(c("100101"))
+                .field(InstructionField::variable("field2", 2).merge_mode_uses())
+                .field(c("10010"))
+                .when(field_eq("field2", "00"));
+            let mut field_values = HashMap::new();
+            field_values.insert("field2".to_string(), FieldUses::Uses { name: "field2".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("0x"), BitPattern::parse("01")].iter().cloned().collect() });
+            let encodings = form.fields_to_encodings(&field_values);
+            assert_eq!(encodings.len(), 1);
+            assert!(encodings.contains(&BitPattern::parse("1001010010010")));
+        }
+
+        #[test]
+        fn test_field_predicate_constraint_unsatisfiable() {
+            let form = InstructionForm::new("form1")
+                .field(c("100101"))
+                .field(InstructionField::variable("field2", 2).merge_mode_uses())
+                .field(c("10010"))
+                .when(field_eq("field2", "00"));
+            let mut field_values = HashMap::new();
+            field_values.insert("field2".to_string(), FieldUses::Uses { name: "field2".to_string(), patterns: [BitPattern::parse("01"), BitPattern::parse("10")].iter().cloned().collect() });
+            let encodings = form.fields_to_encodings(&field_values);
+            assert_eq!(encodings.len(), 0);
+        }
+
+        #[test]
+        fn test_field_predicate_constraint_multiple() {
+            let form = InstructionForm::new("form1")
+                .field(c("100101"))
+                .field(InstructionField::variable("field2", 2).merge_mode_uses())
+                .field(c("10010"))
+                .field(InstructionField::variable("field3", 1))
+                .when(and([field_eq("field2", "00"), bit_eq(13, Bit::High)]));
+            let mut field_values = HashMap::new();
+            field_values.insert("field2".to_string(), FieldUses::Uses { name: "field2".to_string(), patterns: [BitPattern::parse("00"), BitPattern::parse("0x"), BitPattern::parse("01")].iter().cloned().collect() });
+            field_values.insert("field3".to_string(), FieldUses::VariableBits { name: "field3".to_string(), pattern: BitPattern::parse("x") });
+            let encodings = form.fields_to_encodings(&field_values);
+            assert_eq!(encodings.len(), 1);
+            assert!(encodings.contains(&BitPattern::parse("10010100100101")));
+        }
     }
 
     mod merge_uses {
@@ -647,7 +788,6 @@ mod tests {
             let FieldUses::Uses { name, patterns } = merged else {
                 panic!("Merged FieldUses should be MergeMode::Uses");
             };
-            println!("Merged patterns: {:?}", patterns);
             assert_eq!(name, "field1".to_string());
             assert_eq!(patterns.len(), 1);
             assert!(patterns.contains(&BitPattern::parse("xxx")));
