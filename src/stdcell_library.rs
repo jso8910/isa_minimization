@@ -1,4 +1,4 @@
-use std::{error::Error, fs};
+use std::{collections::HashMap, error::Error, fs};
 
 use liberty_db::{DefaultCtx, Library, pin::Direction};
 
@@ -6,14 +6,14 @@ use crate::bit::LookupTable;
 
 #[derive(Debug)]
 pub struct StandardCellLibrary {
-    pub cells: Vec<StandardCell>
+    pub cells: HashMap<String, StandardCell>
 }
 
 impl StandardCellLibrary {
     pub fn new(filename: &str) -> Result<Self, Box<dyn Error>> {
         let lib_text = fs::read_to_string(filename)?;
         let library = Library::<DefaultCtx>::parse_lib(&lib_text, None)?;
-        let mut cells = vec![];
+        let mut cells = HashMap::new();
 
         for cell in library.cell.iter() {
             let mut inputs = vec![];
@@ -48,7 +48,7 @@ impl StandardCellLibrary {
             }
 
             let pins = inputs.into_iter().chain(outs).collect();
-            cells.push(StandardCell::new(cell.name.clone(), pins, is_sequential));
+            cells.insert(cell.name.clone(), StandardCell::new(cell.name.clone(), pins, is_sequential));
         }
         Ok(Self { cells })
     }
@@ -58,22 +58,76 @@ impl StandardCellLibrary {
 pub struct StandardCell {
     pub name: String,
     pub pins: Vec<Pin>,
+
+    // New cached views
+    pub input_pins: Vec<String>,
+    pub output_pins: Vec<OutputPin>,
+    pub sequential_output_pins: Vec<String>,
+
     pub is_sequential: bool,
 }
 
 impl StandardCell {
     pub fn new(name: String, pins: Vec<Pin>, is_sequential: bool) -> Self {
-        let has_seq_pins = pins.iter().any(|p| matches!(p, Pin::SequentialOutput { .. }));
-        assert_eq!(has_seq_pins, is_sequential, "Iff `is_sequential`, `pins` should have at least one SequentialOutput pin");
+        let input_pins = pins
+            .iter()
+            .filter_map(|p| match p {
+                Pin::Input { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let output_pins = pins
+            .iter()
+            .filter_map(|p| match p {
+                Pin::Output { name, function } => Some(OutputPin {
+                    name: name.clone(),
+                    function: function.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let sequential_output_pins = pins
+            .iter()
+            .filter_map(|p| match p {
+                Pin::SequentialOutput { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let has_seq_pins = !sequential_output_pins.is_empty();
+
+        assert_eq!(
+            has_seq_pins,
+            is_sequential,
+            "Iff `is_sequential`, `pins` should have at least one SequentialOutput pin"
+        );
+
         Self {
             name,
             pins,
-            is_sequential
+            input_pins,
+            output_pins,
+            sequential_output_pins,
+            is_sequential,
         }
+    }
+
+    pub fn has_pin(&self, name: &str) -> bool {
+        self.input_pins.iter().any(|p| p == name)
+            || self.output_pins.iter().any(|p| p.name == name)
+            || self.sequential_output_pins.iter().any(|p| p == name)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct OutputPin {
+    pub name: String,
+    pub function: LookupTable,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Pin {
     Input { name: String },
     Output { name: String, function: LookupTable },
@@ -97,6 +151,14 @@ impl Pin {
 
     pub fn new_in(name: String) -> Self {
         Self::Input { name }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Pin::Input { name } => name,
+            Pin::Output {name , function: _} => name,
+            Pin::SequentialOutput { name } => name
+        }
     }
 }
 

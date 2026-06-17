@@ -188,7 +188,7 @@ impl BitPattern {
 }
 
 /// Lookup table implementation for boolean functions involving the Bit enum
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct LookupTable {
     /// Number of inputs in the boolean function
     input_count: usize,
@@ -318,7 +318,7 @@ impl LookupTable {
     }
 
     /// Takes a list of operands, in the same order as `self.input_names`, and returns the result in the LUT
-    fn evaluate(&self, operands: &[Bit]) -> Bit {
+    pub fn evaluate(&self, operands: &[Bit]) -> Bit {
         assert_eq!(operands.len(), self.input_count, "Invalid number of operands");
 
         // Find the correct index in the LUT

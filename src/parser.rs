@@ -2,6 +2,7 @@ use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser;
 use thiserror::Error;
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[grammar = "verilog_netlist.pest"]
@@ -34,22 +35,25 @@ pub struct ModuleNetlist {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub wires: Vec<String>,
-    pub instances: Vec<Instance>,
+    pub instances: HashMap<String, Instance>,
     pub assignments: Vec<Assign>,
+}
+
+impl ModuleNetlist {
+    pub fn all_declared_nets(&self) -> impl Iterator<Item = &String> {
+        self.inputs
+            .iter()
+            .chain(self.outputs.iter())
+            .chain(self.wires.iter())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
     pub cell_type: String,
     pub name: String,
-    pub connections: Vec<PortConn>,
-    pub parameters: Vec<PortConn>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortConn {
-    pub port: String,
-    pub expr: Option<Expr>,
+    pub connections: HashMap<String, Option<Expr>>,
+    pub parameters: HashMap<String, Option<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +62,7 @@ pub struct Assign {
     pub rhs: Expr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     /// A scalar net reference.
     ///
@@ -128,7 +132,7 @@ fn visit_module_declaration(pair: Pair<Rule>) -> Result<ModuleNetlist, NetlistEr
         inputs: Vec::new(),
         outputs: Vec::new(),
         wires: Vec::new(),
-        instances: Vec::new(),
+        instances: HashMap::new(),
         assignments: Vec::new(),
     };
 
@@ -228,7 +232,8 @@ fn visit_module_item(
                 module.assignments.push(visit_assign(child)?);
             }
             Rule::instance => {
-                module.instances.push(visit_instance(child)?);
+                let instance = visit_instance(child)?;
+                module.instances.insert(instance.name.clone(), instance);
             }
             Rule::attribute | Rule::directive => {
                 // Ignore.
@@ -421,7 +426,7 @@ fn visit_instance(pair: Pair<Rule>) -> Result<Instance, NetlistError> {
         .as_str()
         .to_string();
 
-    let mut parameters = Vec::new();
+    let mut parameters = HashMap::new();
 
     let next = children
         .next()
@@ -443,7 +448,7 @@ fn visit_instance(pair: Pair<Rule>) -> Result<Instance, NetlistError> {
 
     let name = name_pair.as_str().to_string();
 
-    let mut connections = Vec::new();
+    let mut connections = HashMap::new();
 
     for child in children {
         if child.as_rule() == Rule::connection_list {
@@ -459,10 +464,10 @@ fn visit_instance(pair: Pair<Rule>) -> Result<Instance, NetlistError> {
     })
 }
 
-fn visit_param_override(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError> {
+fn visit_param_override(pair: Pair<Rule>) -> Result<HashMap<String, Option<Expr>>, NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::param_override);
 
-    let mut params = Vec::new();
+    let mut params = HashMap::new();
 
     for child in pair.into_inner() {
         if child.as_rule() == Rule::param_connection_list {
@@ -476,7 +481,8 @@ fn visit_param_override(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError>
                     return Err(NetlistError::Internal("bad param connection"));
                 }
 
-                params.push(visit_named_connection(named)?);
+                let (port, expr) = visit_named_connection(named)?;
+                params.insert(port, expr);
             }
         }
     }
@@ -484,10 +490,12 @@ fn visit_param_override(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError>
     Ok(params)
 }
 
-fn visit_connection_list(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError> {
+fn visit_connection_list(
+    pair: Pair<Rule>,
+) -> Result<HashMap<String, Option<Expr>>, NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::connection_list);
 
-    let mut conns = Vec::new();
+    let mut conns = HashMap::new();
 
     for conn in pair.into_inner() {
         if conn.as_rule() != Rule::connection {
@@ -501,7 +509,8 @@ fn visit_connection_list(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError
 
         match inner.as_rule() {
             Rule::named_connection => {
-                conns.push(visit_named_connection(inner)?);
+                let (port, expr) = visit_named_connection(inner)?;
+                conns.insert(port, expr);
             }
             Rule::positional_connection => {
                 return Err(NetlistError::UnsupportedPositionalConnection {
@@ -515,7 +524,7 @@ fn visit_connection_list(pair: Pair<Rule>) -> Result<Vec<PortConn>, NetlistError
     Ok(conns)
 }
 
-fn visit_named_connection(pair: Pair<Rule>) -> Result<PortConn, NetlistError> {
+fn visit_named_connection(pair: Pair<Rule>) -> Result<(String, Option<Expr>), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::named_connection);
 
     let mut inner = pair.into_inner();
@@ -531,7 +540,7 @@ fn visit_named_connection(pair: Pair<Rule>) -> Result<PortConn, NetlistError> {
         None => None,
     };
 
-    Ok(PortConn { port, expr })
+    Ok((port, expr))
 }
 
 fn visit_expr(pair: Pair<Rule>) -> Result<Expr, NetlistError> {
@@ -705,8 +714,9 @@ mod tests {
         );
 
         assert_eq!(netlist.instances.len(), 1);
-        assert_eq!(netlist.instances[0].cell_type, "NAND2_X1");
-        assert_eq!(netlist.instances[0].name, "u1");
+        let instance = netlist.instances.get("u1").unwrap();
+        assert_eq!(instance.cell_type, "NAND2_X1");
+        assert_eq!(instance.name, "u1");
     }
 
     #[test]

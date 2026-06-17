@@ -570,9 +570,9 @@ fn main() {
 
     println!("{:?}", netlist.name);
     println!("{:?}", netlist.instances);
-    println!();
+    println!("{:?}", netlist.outputs);
 
-    println!("{:?}", netlist.wires);
+    // println!("{:?}", netlist.wires);
 
     // println!("{:?}", netlist.name);
 

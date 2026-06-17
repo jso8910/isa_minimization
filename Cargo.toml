@@ -17,3 +17,11 @@ liberty-db = "0.17"
 pest = "2.8"
 pest_derive = "2.8"
 thiserror = "2"
+petgraph = "0.8.3"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "simulate"
+harness = false
