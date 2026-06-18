@@ -9,7 +9,7 @@ pub struct Instruction {
 
     /// An instruction can have multiple forms (eg immediate-shifted-registers vs register-shifted-register)
     pub forms: Vec<InstructionForm>,
-    pub constraints: Vec<Predicate>
+    pub constraints: Vec<Predicate>,
 }
 
 impl Instruction {

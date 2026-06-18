@@ -6,6 +6,7 @@ pub mod isa_specification;
 pub mod stdcell_library;
 pub mod parser;
 pub mod simulator;
+pub mod instruction_semantics;
 
 /// Configuration for the whole program
 #[derive(Debug, Clone, PartialEq, Eq)]
