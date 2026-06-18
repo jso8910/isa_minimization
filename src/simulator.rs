@@ -66,6 +66,7 @@ pub struct GateUsageOptimization {
     pub gates_to_comment: Vec<String>,
     pub assignments: Vec<GateOutputAssignment>,
     pub static_gates: Vec<String>,
+    pub observably_static_gates: Vec<String>,
     pub arbitrary_gates: Vec<String>,
 }
 
@@ -107,6 +108,18 @@ pub struct OptimizationWorkspace {
     // For each gate output, true until we observe either Bit::Var/Bit::Test or a concrete value
     // different from `static_output_values`.
     output_is_static: Vec<Vec<bool>>,
+
+    // For each gate output, whether that output was needed by the reverse sensitivity walk for at
+    // least one input pattern. Outputs that are never needed can be assigned arbitrary constants.
+    output_was_needed: Vec<Vec<bool>>,
+
+    // Like `static_output_values`, but only across patterns where the output was observable. This
+    // lets us replace gates whose output may vary globally but is constant whenever downstream
+    // logic can actually see it.
+    needed_static_output_values: Vec<Vec<Option<Bit>>>,
+
+    // Like `output_is_static`, but only invalidated by patterns where the output was observable.
+    needed_output_is_static: Vec<Vec<bool>>,
 }
 
 impl OptimizationWorkspace {
@@ -125,6 +138,18 @@ impl OptimizationWorkspace {
                 .iter()
                 .map(|gate| vec![true; gate.outputs.len()])
                 .collect(),
+            output_was_needed: gates
+                .iter()
+                .map(|gate| vec![false; gate.outputs.len()])
+                .collect(),
+            needed_static_output_values: gates
+                .iter()
+                .map(|gate| vec![None; gate.outputs.len()])
+                .collect(),
+            needed_output_is_static: gates
+                .iter()
+                .map(|gate| vec![true; gate.outputs.len()])
+                .collect(),
         }
     }
 
@@ -140,6 +165,9 @@ impl OptimizationWorkspace {
 
         resize_gate_output_bits(&mut self.static_output_values, gates, None);
         resize_gate_output_bits(&mut self.output_is_static, gates, true);
+        resize_gate_output_bits(&mut self.output_was_needed, gates, false);
+        resize_gate_output_bits(&mut self.needed_static_output_values, gates, None);
+        resize_gate_output_bits(&mut self.needed_output_is_static, gates, true);
     }
 
     fn reset_wires(&mut self, wire_count: usize) {
@@ -408,21 +436,21 @@ impl Simulator {
                     }
                 }
             }
+
+            // Now that the reverse pass has converged for this pattern, the needed set precisely
+            // describes which gate outputs are observable by effective outputs. Track constants
+            // over only those observable patterns; values on unneeded patterns can be ignored
+            // because downstream logic cannot see them for this input.
+            self.track_observable_static_outputs(workspace);
             // self.export_wires(&wires);
         }
-
-        let used_gates = self
-            .compiled_gates
-            .iter()
-            .enumerate()
-            .filter(|(idx, _it)| workspace.gates_impact_output[*idx])
-            .map(|(_idx, it)| it.instance_name.clone())
-            .collect();
 
         let mut gates_to_comment = Vec::new();
         let mut assignments = Vec::new();
         let mut static_gates = Vec::new();
+        let mut observably_static_gates = Vec::new();
         let mut arbitrary_gates = Vec::new();
+        let mut used_gates = Vec::new();
 
         for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
             let gate_is_used = workspace.gates_impact_output[gate_idx];
@@ -437,17 +465,24 @@ impl Simulator {
                 })
                 .collect();
 
-            if let Some(values) = static_values {
-                static_gates.push(gate.instance_name.clone());
-                gates_to_comment.push(gate.instance_name.clone());
+            let output_was_needed = &workspace.output_was_needed[gate_idx];
+            let no_outputs_needed = output_was_needed.iter().all(|&needed| !needed);
+            let needed_static_values: Option<Vec<Bit>> = gate
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(output_idx, _)| {
+                    if output_was_needed[output_idx] {
+                        workspace.needed_output_is_static[gate_idx][output_idx]
+                            .then_some(workspace.needed_static_output_values[gate_idx][output_idx])
+                            .flatten()
+                    } else {
+                        Some(Bit::Low)
+                    }
+                })
+                .collect();
 
-                for (output, value) in gate.outputs.iter().zip(values) {
-                    assignments.push(GateOutputAssignment {
-                        wire_name: output.wire_name.clone(),
-                        value,
-                    });
-                }
-            } else if !gate_is_used {
+            if no_outputs_needed {
                 arbitrary_gates.push(gate.instance_name.clone());
                 gates_to_comment.push(gate.instance_name.clone());
 
@@ -457,6 +492,28 @@ impl Simulator {
                         value: Bit::Low,
                     });
                 }
+            } else if let Some(values) = static_values {
+                static_gates.push(gate.instance_name.clone());
+                gates_to_comment.push(gate.instance_name.clone());
+
+                for (output, value) in gate.outputs.iter().zip(values) {
+                    assignments.push(GateOutputAssignment {
+                        wire_name: output.wire_name.clone(),
+                        value,
+                    });
+                }
+            } else if let Some(values) = needed_static_values {
+                observably_static_gates.push(gate.instance_name.clone());
+                gates_to_comment.push(gate.instance_name.clone());
+
+                for (output, value) in gate.outputs.iter().zip(values) {
+                    assignments.push(GateOutputAssignment {
+                        wire_name: output.wire_name.clone(),
+                        value,
+                    });
+                }
+            } else if gate_is_used {
+                used_gates.push(gate.instance_name.clone());
             }
         }
 
@@ -465,7 +522,47 @@ impl Simulator {
             gates_to_comment,
             assignments,
             static_gates,
+            observably_static_gates,
             arbitrary_gates,
+        }
+    }
+
+    fn track_observable_static_outputs(&self, workspace: &mut OptimizationWorkspace) {
+        for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
+            for (output_idx, output) in gate.outputs.iter().enumerate() {
+                let output_needed = output
+                    .alias_wires
+                    .iter()
+                    .any(|&wire_id| self.wire_is_needed(wire_id, workspace));
+
+                if !output_needed {
+                    continue;
+                }
+
+                workspace.output_was_needed[gate_idx][output_idx] = true;
+
+                if !workspace.needed_output_is_static[gate_idx][output_idx] {
+                    continue;
+                }
+
+                let wire_id = output.alias_wires[0];
+                let value = workspace.wires[wire_id].unwrap();
+
+                if !matches!(value, Bit::Low | Bit::High) {
+                    workspace.needed_output_is_static[gate_idx][output_idx] = false;
+                    continue;
+                }
+
+                match workspace.needed_static_output_values[gate_idx][output_idx] {
+                    Some(prev) if prev != value => {
+                        workspace.needed_output_is_static[gate_idx][output_idx] = false;
+                    }
+                    Some(_) => {}
+                    None => {
+                        workspace.needed_static_output_values[gate_idx][output_idx] = Some(value);
+                    }
+                }
+            }
         }
     }
 
@@ -1171,8 +1268,176 @@ fn parse_one_bit_const(s: &str) -> Option<Bit> {
 #[cfg(test)]
 mod tests {
     use core::panic;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_temp_file(prefix: &str, contents: &str) -> String {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path: PathBuf = std::env::temp_dir();
+        path.push(format!(
+            "isa_minimization_{}_{}_{}.v",
+            prefix,
+            std::process::id(),
+            id
+        ));
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn optimize_test_netlist(
+        verilog: &str,
+        bit_inputs: Vec<HashMap<String, Bit>>,
+    ) -> GateUsageOptimization {
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+        simulator.optimize_gate_usage_details(&bit_inputs)
+    }
+
+    fn test_input(values: &[(&str, Bit)]) -> HashMap<String, Bit> {
+        values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn optimize_marks_observably_static_output() {
+        let verilog = r#"
+module obs_static(a, b, sel, out);
+  input a, b, sel;
+  output out;
+  wire a, b, sel, out, n0;
+  AND2_X1 g_and(.A1 (a), .A2 (sel), .ZN (n0));
+  MUX2_X1 g_mux(.A (n0), .B (b), .S (sel), .Z (out));
+endmodule
+"#;
+        let bit_inputs = vec![
+            test_input(&[("a", Bit::Low), ("b", Bit::Var), ("sel", Bit::Low)]),
+            test_input(&[("a", Bit::High), ("b", Bit::Var), ("sel", Bit::Low)]),
+            test_input(&[("a", Bit::Low), ("b", Bit::Var), ("sel", Bit::High)]),
+            test_input(&[("a", Bit::High), ("b", Bit::Var), ("sel", Bit::High)]),
+        ];
+
+        let optimization = optimize_test_netlist(verilog, bit_inputs);
+
+        assert_eq!(optimization.static_gates, Vec::<String>::new());
+        assert!(optimization
+            .observably_static_gates
+            .contains(&"g_and".to_string()));
+        assert!(optimization.gates_to_comment.contains(&"g_and".to_string()));
+        assert!(optimization.assignments.contains(&GateOutputAssignment {
+            wire_name: "n0".to_string(),
+            value: Bit::Low,
+        }));
+    }
+
+    #[test]
+    fn optimize_assigns_arbitrary_low_to_never_needed_output() {
+        let verilog = r#"
+module never_needed(a, out);
+  input a;
+  output out;
+  wire a, out, unused;
+  BUF_X1 g_unused(.A (a), .Z (unused));
+  BUF_X1 g_out(.A (a), .Z (out));
+endmodule
+"#;
+        let bit_inputs = vec![test_input(&[("a", Bit::Var)])];
+
+        let optimization = optimize_test_netlist(verilog, bit_inputs);
+
+        assert!(optimization
+            .arbitrary_gates
+            .contains(&"g_unused".to_string()));
+        assert!(optimization
+            .gates_to_comment
+            .contains(&"g_unused".to_string()));
+        assert!(optimization.assignments.contains(&GateOutputAssignment {
+            wire_name: "unused".to_string(),
+            value: Bit::Low,
+        }));
+        assert!(optimization.used_gates.contains(&"g_out".to_string()));
+    }
+
+    #[test]
+    fn optimize_does_not_assign_needed_variable_output() {
+        let verilog = r#"
+module needed_var(a, out);
+  input a;
+  output out;
+  wire a, out;
+  BUF_X1 g_buf(.A (a), .Z (out));
+endmodule
+"#;
+        let bit_inputs = vec![test_input(&[("a", Bit::Var)])];
+
+        let optimization = optimize_test_netlist(verilog, bit_inputs);
+
+        assert_eq!(optimization.gates_to_comment, Vec::<String>::new());
+        assert_eq!(optimization.assignments, Vec::<GateOutputAssignment>::new());
+        assert!(optimization.used_gates.contains(&"g_buf".to_string()));
+    }
+
+    #[test]
+    fn optimize_assigns_constants_for_mixed_needed_and_unneeded_outputs() {
+        let liberty = r#"
+library(test) {
+  cell (DUAL_X1) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (S) { direction : input; }
+    pin (Z0) { direction : output; function : "(A & S)"; }
+    pin (Z1) { direction : output; function : "B"; }
+  }
+  cell (MUX2_X1) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (S) { direction : input; }
+    pin (Z) { direction : output; function : "((S & B) | (A & !S))"; }
+  }
+}
+"#;
+        let verilog = r#"
+module mixed_output(a, b, sel, out);
+  input a, b, sel;
+  output out;
+  wire a, b, sel, out, n0, n1;
+  DUAL_X1 g_dual(.A (a), .B (b), .S (sel), .Z0 (n0), .Z1 (n1));
+  MUX2_X1 g_mux(.A (n0), .B (b), .S (sel), .Z (out));
+endmodule
+"#;
+        let liberty_path = write_temp_file("lib", liberty);
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator = Simulator::from_file(&netlist_path, &liberty_path);
+        let bit_inputs = vec![
+            test_input(&[("a", Bit::Low), ("b", Bit::Var), ("sel", Bit::Low)]),
+            test_input(&[("a", Bit::High), ("b", Bit::Var), ("sel", Bit::Low)]),
+            test_input(&[("a", Bit::Low), ("b", Bit::Var), ("sel", Bit::High)]),
+            test_input(&[("a", Bit::High), ("b", Bit::Var), ("sel", Bit::High)]),
+        ];
+
+        let optimization = simulator.optimize_gate_usage_details(&bit_inputs);
+
+        assert!(optimization
+            .observably_static_gates
+            .contains(&"g_dual".to_string()));
+        assert!(optimization.assignments.contains(&GateOutputAssignment {
+            wire_name: "n0".to_string(),
+            value: Bit::Low,
+        }));
+        assert!(optimization.assignments.contains(&GateOutputAssignment {
+            wire_name: "n1".to_string(),
+            value: Bit::Low,
+        }));
+    }
+
     #[test]
     fn alu_sim_test() {
         let simulator = Simulator::from_file(

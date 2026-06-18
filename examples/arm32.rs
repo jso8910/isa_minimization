@@ -662,17 +662,11 @@ fn main() {
     let simulator = Simulator::from_file(NETLIST_PATH, STDCELL_PATH);
     let compiled_sim_inputs = simulator.compile_optimization_inputs(&sim_inputs);
     let mut optimization_workspace = simulator.optimization_workspace();
-    let mut optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
-            &compiled_sim_inputs,
-            &mut optimization_workspace,
-        );
-    for _ in 0..100 {
-        optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
-            &compiled_sim_inputs,
-            &mut optimization_workspace,
-        );
-    }
-    
+    let optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
+        &compiled_sim_inputs,
+        &mut optimization_workspace,
+    );
+
     let gates_to_comment: HashSet<String> = optimization.gates_to_comment.iter().cloned().collect();
 
     let commented_gate_count = write_optimized_verilog(
@@ -684,10 +678,11 @@ fn main() {
     .unwrap();
 
     println!(
-        "Kept {} combinational gates, commented out {} gates ({} static, {} arbitrary), added {} assigns, and wrote {}",
+        "Kept {} combinational gates, commented out {} gates ({} globally static, {} observably static, {} arbitrary), added {} assigns, and wrote {}",
         optimization.used_gates.len(),
         commented_gate_count,
         optimization.static_gates.len(),
+        optimization.observably_static_gates.len(),
         optimization.arbitrary_gates.len(),
         optimization.assignments.len(),
         OPTIMIZED_NETLIST_PATH
