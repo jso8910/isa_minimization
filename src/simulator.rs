@@ -1,8 +1,18 @@
-use std::{collections::{HashMap, HashSet}, fs};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
 
-use petgraph::{algo::toposort, graph::{DiGraph, NodeIndex}};
+use petgraph::{
+    algo::toposort,
+    graph::{DiGraph, NodeIndex},
+};
 
-use crate::{bit::{Bit, BitPattern}, parser::{Expr, ModuleNetlist, parse_netlist}, stdcell_library::{OutputPin, Pin, StandardCellLibrary}};
+use crate::{
+    bit::Bit,
+    parser::{parse_netlist, Expr, ModuleNetlist},
+    stdcell_library::StandardCellLibrary,
+};
 
 type WireId = usize;
 
@@ -14,19 +24,23 @@ enum SimInput {
 
 #[derive(Debug, Clone)]
 struct CompiledOutput {
+    wire_name: String,
     function: crate::bit::LookupTable,
     alias_wires: Vec<WireId>,
 }
 
 #[derive(Debug, Clone)]
 struct CompiledGate {
+    instance_name: String,
     inputs: Vec<SimInput>,
 
     outputs: Vec<CompiledOutput>,
+    output_alias_wires: Vec<WireId>,
 }
 
 #[derive(Debug)]
 pub struct Simulator {
+    top_mod_output_wire_ids: Vec<WireId>,
 
     // Compiled simulation fields using node indices
     // compiled_gates is sorted by the topological sort order of the digraph
@@ -40,6 +54,126 @@ pub struct Simulator {
     constant_writes: Vec<(WireId, Bit)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateOutputAssignment {
+    pub wire_name: String,
+    pub value: Bit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateUsageOptimization {
+    pub used_gates: Vec<String>,
+    pub gates_to_comment: Vec<String>,
+    pub assignments: Vec<GateOutputAssignment>,
+    pub static_gates: Vec<String>,
+    pub arbitrary_gates: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledOptimizationInputs {
+    // Each optimization input pattern after translating net names to dense wire ids. This avoids
+    // doing string/hash lookups every time we simulate the same pattern set.
+    inputs: Vec<Vec<(WireId, Bit)>>,
+}
+
+#[derive(Debug)]
+pub struct OptimizationWorkspace {
+    // Reused full-circuit wire values for one simulated input pattern. This is cleared between
+    // patterns, but the allocation is kept.
+    wires: Vec<Option<Bit>>,
+
+    // Marks wires that are currently needed by the reverse sensitivity walk. Instead of clearing a
+    // Vec<bool> for every input pattern, each marked wire stores `current_generation`. A wire is
+    // currently needed iff needed_generation[wire_id] == current_generation.
+    needed_generation: Vec<u32>,
+
+    // Monotonic marker id for `needed_generation`. Incrementing this logically clears the whole
+    // needed set in O(1). If it wraps, we physically clear the vector and restart at 1.
+    current_generation: u32,
+
+    // Reused scratch vector holding the input values for the gate currently being sensitivity
+    // checked.
+    input_values: Vec<Bit>,
+
+    // Accumulated across all input patterns. gates_impact_output[i] is true if gate i affects an
+    // effective output for at least one input pattern.
+    gates_impact_output: Vec<bool>,
+
+    // For each gate output, the concrete value seen so far if that output is still possibly
+    // static. `None` means either no pattern has been processed yet for that output, or the shape
+    // has just been reset.
+    static_output_values: Vec<Vec<Option<Bit>>>,
+
+    // For each gate output, true until we observe either Bit::Var/Bit::Test or a concrete value
+    // different from `static_output_values`.
+    output_is_static: Vec<Vec<bool>>,
+}
+
+impl OptimizationWorkspace {
+    fn new(wire_count: usize, gates: &[CompiledGate]) -> Self {
+        Self {
+            wires: vec![None; wire_count],
+            needed_generation: vec![0; wire_count],
+            current_generation: 0,
+            input_values: Vec::new(),
+            gates_impact_output: vec![false; gates.len()],
+            static_output_values: gates
+                .iter()
+                .map(|gate| vec![None; gate.outputs.len()])
+                .collect(),
+            output_is_static: gates
+                .iter()
+                .map(|gate| vec![true; gate.outputs.len()])
+                .collect(),
+        }
+    }
+
+    fn reset_for(&mut self, wire_count: usize, gates: &[CompiledGate]) {
+        // Called once at the start of a complete optimization run. It clears all results that must
+        // be accumulated over the whole input-pattern set while retaining allocations.
+        self.reset_wires(wire_count);
+
+        self.needed_generation.resize(wire_count, 0);
+
+        self.gates_impact_output.clear();
+        self.gates_impact_output.resize(gates.len(), false);
+
+        resize_gate_output_bits(&mut self.static_output_values, gates, None);
+        resize_gate_output_bits(&mut self.output_is_static, gates, true);
+    }
+
+    fn reset_wires(&mut self, wire_count: usize) {
+        // Called for each input pattern. Wire values are pattern-specific, so these cannot be
+        // preserved across simulations.
+        self.wires.clear();
+        self.wires.resize(wire_count, None);
+    }
+
+    fn next_needed_generation(&mut self) {
+        // Called for each input pattern before the reverse walk. Advancing the generation makes all
+        // previous needed-wire markings invisible without clearing the vector.
+        self.current_generation = self.current_generation.wrapping_add(1);
+
+        if self.current_generation == 0 {
+            self.needed_generation.fill(0);
+            self.current_generation = 1;
+        }
+    }
+}
+
+fn resize_gate_output_bits<T: Copy>(
+    values: &mut Vec<Vec<T>>,
+    gates: &[CompiledGate],
+    default_value: T,
+) {
+    values.resize_with(gates.len(), Vec::new);
+
+    for (gate_idx, gate) in gates.iter().enumerate() {
+        values[gate_idx].clear();
+        values[gate_idx].resize(gate.outputs.len(), default_value);
+    }
+}
+
 impl Simulator {
     pub fn from_file(netlist_file: &str, standard_cell_file: &str) -> Self {
         let verilog = fs::read_to_string(netlist_file).unwrap();
@@ -47,15 +181,19 @@ impl Simulator {
         let cell_library = StandardCellLibrary::new(standard_cell_file).unwrap();
 
         let alias_map = build_alias_map(&netlist);
-        let top_mod_outputs = compute_top_mod_outputs(&netlist, &alias_map);
+        let top_mod_outputs = compute_top_mod_outputs(&netlist, &cell_library, &alias_map);
 
         validate_instances(&netlist, &cell_library);
 
-        let (graph, nodes) = build_dependency_graph(&netlist, &cell_library, &alias_map);
+        let graph = build_dependency_graph(&netlist, &cell_library, &alias_map);
         let gate_sorted_order = sorted_gate_order(&graph);
 
         let (wire_ids, wire_names) = compile_wire_ids(&netlist);
         let alias_wire_ids = compile_alias_wire_ids(&alias_map, &wire_ids, wire_names.len());
+        let top_mod_output_wire_ids = top_mod_outputs
+            .iter()
+            .filter_map(|wire_name| wire_ids.get(wire_name).copied())
+            .collect();
 
         let (sequential_output_wires, sequential_input_wires) =
             compile_sequential_io(&netlist, &cell_library, &wire_ids);
@@ -72,6 +210,7 @@ impl Simulator {
         );
 
         Self {
+            top_mod_output_wire_ids,
             wire_ids,
             wire_names,
             alias_wire_ids,
@@ -79,7 +218,285 @@ impl Simulator {
 
             sequential_output_wires,
             sequential_input_wires,
-            constant_writes
+            constant_writes,
+        }
+    }
+
+    pub fn optimization_workspace(&self) -> OptimizationWorkspace {
+        OptimizationWorkspace::new(self.wire_names.len(), &self.compiled_gates)
+    }
+
+    /// Computes, for a given set of valid inputs to the module, which gates are necessary to
+    /// produce all effective outputs. Effective outputs include both module-level outputs and
+    /// inputs to sequential gates, since sequential inputs carry information into future cycles.
+    ///
+    /// This uses a reverse sensitivity pass. For each input pattern, we first simulate the whole
+    /// circuit once. Then we walk gates backward from the effective outputs, marking each gate that
+    /// drives a needed wire and recursively marking only the input wires that can affect those
+    /// needed outputs.
+    /// # Arguments
+    /// * `bit_inputs` - A list of inputs to the module to test
+    ///
+    /// # Returns
+    /// * `Vec<String>` - A list of all the instance names in the module which aren't redundant for this set of inputs (ie which affect the output)
+    pub fn optimize_gate_usage(&self, bit_inputs: &Vec<HashMap<String, Bit>>) -> Vec<String> {
+        self.optimize_gate_usage_details(bit_inputs).used_gates
+    }
+
+    pub fn optimize_gate_usage_details(
+        &self,
+        bit_inputs: &Vec<HashMap<String, Bit>>,
+    ) -> GateUsageOptimization {
+        // Convenience path for one-off calls. Repeated callers should keep this workspace around
+        // and call `optimize_gate_usage_details_with_workspace` to avoid reallocating buffers.
+        let mut workspace = self.optimization_workspace();
+        self.optimize_gate_usage_details_with_workspace(bit_inputs, &mut workspace)
+    }
+
+    pub fn optimize_gate_usage_details_batch(
+        &self,
+        bit_input_sets: &[Vec<HashMap<String, Bit>>],
+    ) -> Vec<GateUsageOptimization> {
+        // One workspace is reused for the whole batch. Each individual optimization run still
+        // clears its accumulated results via `reset_for`.
+        let mut workspace = self.optimization_workspace();
+
+        bit_input_sets
+            .iter()
+            .map(|bit_inputs| {
+                self.optimize_gate_usage_details_with_workspace(bit_inputs, &mut workspace)
+            })
+            .collect()
+    }
+
+    pub fn optimize_gate_usage_details_with_workspace(
+        &self,
+        bit_inputs: &Vec<HashMap<String, Bit>>,
+        workspace: &mut OptimizationWorkspace,
+    ) -> GateUsageOptimization {
+        // Translate input net names to wire ids once for this call. If the same bit_inputs are
+        // reused across many calls, use `compile_optimization_inputs` directly and pass the result
+        // to `optimize_compiled_gate_usage_details_with_workspace`.
+        let compiled_bit_inputs = self.compile_optimization_inputs(bit_inputs);
+        self.optimize_compiled_gate_usage_details_with_workspace(&compiled_bit_inputs, workspace)
+    }
+
+    pub fn optimize_compiled_gate_usage_details_with_workspace(
+        &self,
+        bit_inputs: &CompiledOptimizationInputs,
+        workspace: &mut OptimizationWorkspace,
+    ) -> GateUsageOptimization {
+        // Clear all state that is accumulated over an entire optimization run: used gates,
+        // static-output tracking, and the current pattern's wire values. The vectors keep their
+        // allocations so repeated runs stay cheap.
+        workspace.reset_for(self.wire_names.len(), &self.compiled_gates);
+
+        for bit_input in &bit_inputs.inputs {
+            // Each input pattern needs a fresh simulated wire state. Other workspace fields, such
+            // as gates_impact_output and static-output tracking, intentionally persist across all
+            // patterns in this optimization run.
+            workspace.reset_wires(self.wire_names.len());
+            self.apply_primary_wire_inputs(bit_input, &mut workspace.wires);
+            self.apply_sequential_outputs(&mut workspace.wires);
+            self.apply_constant_assigns(&mut workspace.wires);
+            self.simulate_compiled_gates_range(&mut workspace.wires, 0, self.compiled_gates.len());
+
+            // DEBUG: every wire produced by a compiled gate, plus every effective output, should
+            // have a value after a full simulation. If this fails, the netlist was not fully
+            // simulated for this input pattern.
+            assert!(self
+                .compiled_gates
+                .iter()
+                .flat_map(|gate| gate.output_alias_wires.iter())
+                .chain(self.top_mod_output_wire_ids.iter())
+                .all(|wire_id| workspace.wires[*wire_id].is_some()));
+
+            // Track outputs that are constant over every supplied input pattern. Only concrete
+            // low/high values count as static; Bit::Var means the value still depends on an
+            // unconstrained input, so assigning a constant would be unsound.
+            for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
+                for (output_idx, output) in gate.outputs.iter().enumerate() {
+                    if !workspace.output_is_static[gate_idx][output_idx] {
+                        continue;
+                    }
+
+                    let wire_id = output.alias_wires[0];
+                    let value = workspace.wires[wire_id].unwrap();
+
+                    if !matches!(value, Bit::Low | Bit::High) {
+                        workspace.output_is_static[gate_idx][output_idx] = false;
+                        continue;
+                    }
+
+                    match workspace.static_output_values[gate_idx][output_idx] {
+                        Some(prev) if prev != value => {
+                            workspace.output_is_static[gate_idx][output_idx] = false;
+                        }
+                        Some(_) => {}
+                        None => workspace.static_output_values[gate_idx][output_idx] = Some(value),
+                    }
+                }
+            }
+
+            // Start from the effective outputs. As we walk backward, this set grows to include
+            // upstream wires whose values can influence those outputs for this input pattern.
+            //
+            // `needed_generation` is the per-pattern needed set. Advancing the generation is the
+            // equivalent of clearing that set, but avoids touching every wire for every pattern.
+            workspace.next_needed_generation();
+            for &wire_id in &self.top_mod_output_wire_ids {
+                self.mark_wire_and_aliases_needed(wire_id, workspace);
+            }
+
+            // Traverse netlist in reverse topological order
+            for gate_idx in (0..self.compiled_gates.len()).rev() {
+                let gate = &self.compiled_gates[gate_idx];
+
+                // If none of this gate's outputs feed a currently-needed wire, this gate cannot
+                // affect any effective output discovered so far.
+                // Since we are going in reverse order, all outputs which come downstream of this gate
+                // should have already been discovered
+                let gate_output_needed = gate
+                    .output_alias_wires
+                    .iter()
+                    .any(|&wire_id| self.wire_is_needed(wire_id, workspace));
+
+                if !gate_output_needed {
+                    continue;
+                }
+
+                workspace.gates_impact_output[gate_idx] = true;
+
+                // Reconstruct this gate's simulated input vector from the full-circuit simulation.
+                // We use these concrete/symbolic values for local sensitivity checks below.
+                // The vector allocation is reused for every gate.
+                workspace.input_values.clear();
+                for input in &gate.inputs {
+                    let value = read_sim_input(&workspace.wires, input)
+                        .unwrap_or_else(|| panic!("No simulated value for input {:?}", input));
+
+                    workspace.input_values.push(value);
+                }
+
+                for input_idx in 0..gate.inputs.len() {
+                    let SimInput::Wire(wire_id) = gate.inputs[input_idx] else {
+                        continue;
+                    };
+
+                    if self.wire_or_alias_is_needed(wire_id, workspace) {
+                        continue;
+                    }
+
+                    // Locally perturb one gate input to Bit::Test. If any needed output of this
+                    // gate becomes Bit::Test, that input wire is necessary and must be followed
+                    // farther backward.
+                    let old_value =
+                        std::mem::replace(&mut workspace.input_values[input_idx], Bit::Test);
+
+                    let is_sensitive = gate.outputs.iter().any(|output| {
+                        output
+                            .alias_wires
+                            .iter()
+                            .any(|&wire_id| self.wire_is_needed(wire_id, workspace))
+                            && output.function.evaluate(&workspace.input_values) == Bit::Test
+                    });
+
+                    workspace.input_values[input_idx] = old_value;
+
+                    if is_sensitive {
+                        self.mark_wire_and_aliases_needed(wire_id, workspace);
+                    }
+                }
+            }
+            // self.export_wires(&wires);
+        }
+
+        let used_gates = self
+            .compiled_gates
+            .iter()
+            .enumerate()
+            .filter(|(idx, _it)| workspace.gates_impact_output[*idx])
+            .map(|(_idx, it)| it.instance_name.clone())
+            .collect();
+
+        let mut gates_to_comment = Vec::new();
+        let mut assignments = Vec::new();
+        let mut static_gates = Vec::new();
+        let mut arbitrary_gates = Vec::new();
+
+        for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
+            let gate_is_used = workspace.gates_impact_output[gate_idx];
+            let static_values: Option<Vec<Bit>> = gate
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(output_idx, _)| {
+                    workspace.output_is_static[gate_idx][output_idx]
+                        .then_some(workspace.static_output_values[gate_idx][output_idx])
+                        .flatten()
+                })
+                .collect();
+
+            if let Some(values) = static_values {
+                static_gates.push(gate.instance_name.clone());
+                gates_to_comment.push(gate.instance_name.clone());
+
+                for (output, value) in gate.outputs.iter().zip(values) {
+                    assignments.push(GateOutputAssignment {
+                        wire_name: output.wire_name.clone(),
+                        value,
+                    });
+                }
+            } else if !gate_is_used {
+                arbitrary_gates.push(gate.instance_name.clone());
+                gates_to_comment.push(gate.instance_name.clone());
+
+                for output in &gate.outputs {
+                    assignments.push(GateOutputAssignment {
+                        wire_name: output.wire_name.clone(),
+                        value: Bit::Low,
+                    });
+                }
+            }
+        }
+
+        GateUsageOptimization {
+            used_gates,
+            gates_to_comment,
+            assignments,
+            static_gates,
+            arbitrary_gates,
+        }
+    }
+
+    /// Simulates the module from a certain `start_idx` in `compiled_gates` to an `end_idx` (exclusive)
+    /// All `wires` before `start_idx` must be Some(Bit).
+    fn simulate_compiled_gates_range(
+        &self,
+        wires: &mut Vec<Option<Bit>>,
+        start_idx: usize,
+        end_idx: usize,
+    ) {
+        let mut input_values = Vec::new();
+
+        for idx in start_idx..end_idx {
+            let gate = &self.compiled_gates[idx];
+            input_values.clear();
+
+            for input in &gate.inputs {
+                let value = read_sim_input(wires, input)
+                    .unwrap_or_else(|| panic!("No simulated value for input {:?}", input));
+
+                input_values.push(value);
+            }
+
+            for output in &gate.outputs {
+                let value = output.function.evaluate(&input_values);
+
+                for &wire_id in &output.alias_wires {
+                    wires[wire_id] = Some(value);
+                }
+            }
         }
     }
 
@@ -114,9 +531,8 @@ impl Simulator {
             input_values.clear();
 
             for input in &gate.inputs {
-                let value = read_sim_input(wires, input).unwrap_or_else(|| {
-                    panic!("No simulated value for input {:?}", input)
-                });
+                let value = read_sim_input(wires, input)
+                    .unwrap_or_else(|| panic!("No simulated value for input {:?}", input));
 
                 input_values.push(value);
             }
@@ -133,42 +549,54 @@ impl Simulator {
         }
     }
 
-    fn apply_primary_inputs(
-        &self,
-        bit_input: &HashMap<String, Bit>,
-        wires: &mut [Option<Bit>],
-    ) {
+    fn apply_primary_inputs(&self, bit_input: &HashMap<String, Bit>, wires: &mut [Option<Bit>]) {
         for (net_name, value) in bit_input {
-
             let wire_id = *self
                 .wire_ids
                 .get(net_name)
                 .unwrap_or_else(|| panic!("Unknown primary input net {}", net_name));
 
-            write_wire_id_with_aliases(
-                wires,
-                &self.alias_wire_ids,
-                wire_id,
-                *value,
-            );
+            write_wire_id_with_aliases(wires, &self.alias_wire_ids, wire_id, *value);
+        }
+    }
+
+    pub fn compile_optimization_inputs(
+        &self,
+        bit_inputs: &Vec<HashMap<String, Bit>>,
+    ) -> CompiledOptimizationInputs {
+        let inputs = bit_inputs
+            .iter()
+            .map(|bit_input| {
+                bit_input
+                    .iter()
+                    .map(|(net_name, value)| {
+                        let wire_id = *self
+                            .wire_ids
+                            .get(net_name)
+                            .unwrap_or_else(|| panic!("Unknown primary input net {}", net_name));
+
+                        (wire_id, *value)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        CompiledOptimizationInputs { inputs }
+    }
+
+    fn apply_primary_wire_inputs(&self, bit_input: &[(WireId, Bit)], wires: &mut [Option<Bit>]) {
+        for &(wire_id, value) in bit_input {
+            write_wire_id_with_aliases(wires, &self.alias_wire_ids, wire_id, value);
         }
     }
 
     fn apply_sequential_outputs(&self, wires: &mut [Option<Bit>]) {
         for &wire_id in &self.sequential_output_wires {
-            write_wire_id_with_aliases(
-                wires,
-                &self.alias_wire_ids,
-                wire_id,
-                Bit::Var,
-            );
+            write_wire_id_with_aliases(wires, &self.alias_wire_ids, wire_id, Bit::Var);
         }
     }
 
-    fn mark_sequential_inputs_nonarbitrary(
-        &self,
-        wires_nonarbitrary: &mut HashSet<WireId>,
-    ) {
+    fn mark_sequential_inputs_nonarbitrary(&self, wires_nonarbitrary: &mut HashSet<WireId>) {
         for &wire_id in &self.sequential_input_wires {
             self.mark_wire_and_aliases_nonarbitrary(wire_id, wires_nonarbitrary);
         }
@@ -176,12 +604,7 @@ impl Simulator {
 
     fn apply_constant_assigns(&self, wires: &mut [Option<Bit>]) {
         for &(wire_id, value) in &self.constant_writes {
-            write_wire_id_with_aliases(
-                wires,
-                &self.alias_wire_ids,
-                wire_id,
-                value,
-            );
+            write_wire_id_with_aliases(wires, &self.alias_wire_ids, wire_id, value);
         }
     }
 
@@ -238,6 +661,31 @@ impl Simulator {
         }
     }
 
+    fn wire_is_needed(&self, wire_id: WireId, workspace: &OptimizationWorkspace) -> bool {
+        // Membership test for the current reverse-walk needed set. Old pattern markings have a
+        // different generation number and therefore read as false.
+        workspace.needed_generation[wire_id] == workspace.current_generation
+    }
+
+    fn wire_or_alias_is_needed(&self, wire_id: WireId, workspace: &OptimizationWorkspace) -> bool {
+        // Aliased wires represent the same Verilog signal through continuous assigns, so any alias
+        // being needed means this wire must also be treated as needed.
+        self.wire_is_needed(wire_id, workspace)
+            || self.alias_wire_ids[wire_id]
+                .iter()
+                .any(|&alias_id| self.wire_is_needed(alias_id, workspace))
+    }
+
+    fn mark_wire_and_aliases_needed(&self, wire_id: WireId, workspace: &mut OptimizationWorkspace) {
+        // Mark by writing the current generation instead of inserting into a HashSet. This keeps
+        // the inner reverse pass dense and lets `next_needed_generation` clear the set in O(1).
+        workspace.needed_generation[wire_id] = workspace.current_generation;
+
+        for &alias_id in &self.alias_wire_ids[wire_id] {
+            workspace.needed_generation[alias_id] = workspace.current_generation;
+        }
+    }
+
     pub fn export_nonarbitrary_wires(&self, wires_nonarbitrary: &HashSet<WireId>) -> HashSet<Expr> {
         wires_nonarbitrary
             .iter()
@@ -250,10 +698,7 @@ impl Simulator {
 
         for (wire_id, maybe_value) in wires.iter().enumerate() {
             if let Some(value) = maybe_value {
-                result.insert(
-                    self.wire_names[wire_id].clone(),
-                    *value,
-                );
+                result.insert(self.wire_names[wire_id].clone(), *value);
             }
         }
 
@@ -334,16 +779,56 @@ fn build_alias_map(netlist: &ModuleNetlist) -> HashMap<Expr, HashSet<String>> {
 
 fn compute_top_mod_outputs(
     netlist: &ModuleNetlist,
+    cell_library: &StandardCellLibrary,
     alias_map: &HashMap<Expr, HashSet<String>>,
 ) -> Vec<String> {
-    let mut top_mod_outputs_set: HashSet<String> =
-        netlist.outputs.iter().cloned().collect();
+    let mut top_mod_outputs_set: HashSet<String> = netlist.outputs.iter().cloned().collect();
+
+    // We also want all inputs to sequential cells to be considered as outputs of the module
+    // This is because an "output" is actually just any information which may be carried forward in time by some memory
+    for instance in netlist.instances.values() {
+        let cell = cell_library
+            .cells
+            .get(&instance.cell_type)
+            .unwrap_or_else(|| panic!("Unknown standard cell type {}", instance.cell_type));
+
+        if !cell.is_sequential {
+            continue;
+        }
+
+        for input_pin in &cell.input_pins {
+            let Some(Some(connection)) = instance.connections.get(input_pin) else {
+                panic!(
+                    "Sequential input pin {} on instance {} is not connected",
+                    input_pin, instance.name,
+                );
+            };
+
+            match connection {
+                Expr::Net(net_name) => {
+                    top_mod_outputs_set.insert(net_name.clone());
+                }
+
+                // Constants do not correspond to a wire that needs to be
+                // tracked as an effective output.
+                Expr::Const(_) => {}
+
+                other => {
+                    panic!(
+                        "Unsupported expression {:?} connected to sequential input {} on instance {}",
+                        other, input_pin, instance.name,
+                    );
+                }
+            }
+        }
+    }
 
     for (source, dests) in alias_map {
         let Expr::Net(source_name) = source else {
             continue;
         };
 
+        // If any destination is a top_mod_output (ie is the LHS of assign LHS = source), the source is also effectively an output
         if dests.iter().any(|dest| top_mod_outputs_set.contains(dest)) {
             top_mod_outputs_set.insert(source_name.clone());
         }
@@ -379,13 +864,17 @@ fn validate_instances(netlist: &ModuleNetlist, cell_library: &StandardCellLibrar
     }
 }
 
-fn build_dependency_graph(netlist: &ModuleNetlist, cell_library: &StandardCellLibrary, alias_map: &HashMap<Expr, HashSet<String>>) -> (DiGraph<String, ()>, HashMap<String, NodeIndex>) {
+fn build_dependency_graph(
+    netlist: &ModuleNetlist,
+    cell_library: &StandardCellLibrary,
+    alias_map: &HashMap<Expr, HashSet<String>>,
+) -> DiGraph<String, ()> {
     // create graph
     let mut graph = DiGraph::new();
     let mut nodes = HashMap::new();
 
     // Iterate through to create nodes
-    for (instance_name, inst) in netlist.instances.iter() {
+    for (instance_name, _) in netlist.instances.iter() {
         nodes.insert(instance_name.clone(), graph.add_node(instance_name.clone()));
     }
 
@@ -441,7 +930,7 @@ fn build_dependency_graph(netlist: &ModuleNetlist, cell_library: &StandardCellLi
             }
         }
     }
-    (graph, nodes)
+    graph
 }
 
 fn sorted_gate_order(graph: &DiGraph<String, ()>) -> Vec<NodeIndex> {
@@ -453,7 +942,10 @@ fn sorted_gate_order(graph: &DiGraph<String, ()>) -> Vec<NodeIndex> {
             }
         }
         Err(cycle) => {
-            panic!("Graph has a cycle! Cannot sort! Cycle starts at {:?}", cycle.node_id());
+            panic!(
+                "Graph has a cycle! Cannot sort! Cycle starts at {:?}",
+                cycle.node_id()
+            );
         }
     }
     gate_sorted_order
@@ -477,7 +969,11 @@ fn compile_wire_ids(netlist: &ModuleNetlist) -> (HashMap<String, WireId>, Vec<St
     (wire_ids, wire_names)
 }
 
-fn compile_alias_wire_ids (alias_map: &HashMap<Expr, HashSet<String>>, wire_ids: &HashMap<String, usize>, num_wires: usize) -> Vec<Vec<usize>> {
+fn compile_alias_wire_ids(
+    alias_map: &HashMap<Expr, HashSet<String>>,
+    wire_ids: &HashMap<String, usize>,
+    num_wires: usize,
+) -> Vec<Vec<usize>> {
     let mut alias_wire_ids = vec![Vec::new(); num_wires];
 
     for (source, dests) in alias_map.iter() {
@@ -570,8 +1066,8 @@ fn compile_constant_writes(
             continue;
         };
 
-        let value = parse_one_bit_const(c)
-            .unwrap_or_else(|| panic!("Unsupported assigned constant {}", c));
+        let value =
+            parse_one_bit_const(c).unwrap_or_else(|| panic!("Unsupported assigned constant {}", c));
 
         for dest in dests {
             let wire_id = *wire_ids
@@ -591,7 +1087,7 @@ fn compile_gates(
     graph: &DiGraph<String, ()>,
     gate_sorted_order: &Vec<NodeIndex>,
     wire_ids: &HashMap<String, usize>,
-    alias_wire_ids: &Vec<Vec<usize>>
+    alias_wire_ids: &Vec<Vec<usize>>,
 ) -> Vec<CompiledGate> {
     let mut compiled_gates = Vec::new();
 
@@ -640,15 +1136,23 @@ fn compile_gates(
                     .unwrap_or_else(|| panic!("Unknown output net {}", out_net));
 
                 outputs.push(CompiledOutput {
+                    wire_name: out_net.clone(),
                     function: out_pin.function.clone(),
                     alias_wires: alias_wire_ids[out_id].clone(),
                 });
             }
         }
 
+        let output_alias_wires = outputs
+            .iter()
+            .flat_map(|output| output.alias_wires.iter().copied())
+            .collect();
+
         compiled_gates.push(CompiledGate {
+            instance_name: inst_name.clone(),
             inputs,
             outputs,
+            output_alias_wires,
         });
     }
     compiled_gates
@@ -668,10 +1172,13 @@ fn parse_one_bit_const(s: &str) -> Option<Bit> {
 mod tests {
     use core::panic;
 
-use super::*;
+    use super::*;
     #[test]
     fn alu_sim_test() {
-        let simulator = Simulator::from_file("examples/alu_syn.v", "examples/NangateOpenCellLibrary_typical.lib");
+        let simulator = Simulator::from_file(
+            "examples/alu_syn.v",
+            "examples/NangateOpenCellLibrary_typical.lib",
+        );
         let mut wires_nonarbitrary = HashSet::new();
         // Checks addition on an example ALU
         let mut bit_input = HashMap::from([
@@ -695,7 +1202,7 @@ use super::*;
                 let bit = match bit_val {
                     0 => Bit::Low,
                     1 => Bit::High,
-                    _ => panic!("How?")
+                    _ => panic!("How?"),
                 };
                 bit_input.insert(format!("a0_mux[{}]", bit_idx), bit);
                 bit_input.insert(format!("a1_mux[{}]", bit_idx), bit);
@@ -707,18 +1214,16 @@ use super::*;
                     let bit = match bit_val {
                         0 => Bit::Low,
                         1 => Bit::High,
-                        _ => panic!("How?")
+                        _ => panic!("How?"),
                     };
                     bit_input.insert(format!("b[{}]", bit_idx), bit);
                 }
                 let wires = simulator.simulate(&bit_input, &mut wires_nonarbitrary);
                 let output_val: u8 = (0..=7)
-                    .map(|i| {
-                        match wires.get(&format!("out[{i}]")).unwrap() {
-                            Bit::High => 1 << i,
-                            Bit::Low => 0,
-                            _ => panic!("Output should not have any variable or test bits!")
-                        }
+                    .map(|i| match wires.get(&format!("out[{i}]")).unwrap() {
+                        Bit::High => 1 << i,
+                        Bit::Low => 0,
+                        _ => panic!("Output should not have any variable or test bits!"),
                     })
                     .sum();
                 assert_eq!(output_val, a.overflowing_add(b).0, "Result should match!");
