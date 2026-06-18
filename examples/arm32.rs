@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use isa_minimization::bit::{Bit, BitPattern};
+use isa_minimization::instruction_semantics::{Register, and_expr, bool_const, equal, field_is, not_expr, or_expr, read_fixed_register, select};
 use isa_minimization::isa_specification::{
     and, bit_eq, c, field_eq, field_in, not, DecodedField, DecodedInstruction, FieldUses,
     Instruction, InstructionField, InstructionForm, MergeMode,
@@ -15,6 +16,91 @@ use isa_minimization::simulator::{GateOutputAssignment, Simulator};
 const NETLIST_PATH: &str = "examples/arm32_core_syn.v";
 const STDCELL_PATH: &str = "examples/NangateOpenCellLibrary_typical.lib";
 const OPTIMIZED_NETLIST_PATH: &str = "outputs/optimized.v";
+
+pub const REG_N: Register = Register(16);
+pub const REG_Z: Register = Register(17);
+pub const REG_C: Register = Register(18);
+pub const REG_V: Register = Register(19);
+
+fn arm_condition_holds() -> Expr {
+    let n = read_fixed_register(REG_N, 1);
+    let z = read_fixed_register(REG_Z, 1);
+    let c = read_fixed_register(REG_C, 1);
+    let v = read_fixed_register(REG_V, 1);
+
+    let n_equals_v = equal(n.clone(), v.clone());
+
+    let conditions = [
+        // EQ: Z
+        (0b0000, z.clone()),
+
+        // NE: !Z
+        (0b0001, not_expr(z.clone())),
+
+        // CS/HS: C
+        (0b0010, c.clone()),
+
+        // CC/LO: !C
+        (0b0011, not_expr(c.clone())),
+
+        // MI: N
+        (0b0100, n.clone()),
+
+        // PL: !N
+        (0b0101, not_expr(n.clone())),
+
+        // VS: V
+        (0b0110, v.clone()),
+
+        // VC: !V
+        (0b0111, not_expr(v.clone())),
+
+        // HI: C && !Z
+        (
+            0b1000,
+            and_expr(c.clone(), not_expr(z.clone())),
+        ),
+
+        // LS: !C || Z
+        (
+            0b1001,
+            or_expr(not_expr(c.clone()), z.clone()),
+        ),
+
+        // GE: N == V
+        (0b1010, n_equals_v.clone()),
+
+        // LT: N != V
+        (0b1011, not_expr(n_equals_v.clone())),
+
+        // GT: !Z && N == V
+        (
+            0b1100,
+            and_expr(not_expr(z.clone()), n_equals_v.clone()),
+        ),
+
+        // LE: Z || N != V
+        (
+            0b1101,
+            or_expr(z.clone(), not_expr(n_equals_v)),
+        ),
+
+        // AL: always
+        (0b1110, bool_const(true)),
+    ];
+
+    // cond=1111 is reserved, so the default result is false.
+    conditions
+        .into_iter()
+        .rev()
+        .fold(bool_const(false), |otherwise, (encoding, result)| {
+            select(
+                field_is("cond", encoding, 4),
+                result,
+                otherwise,
+            )
+        })
+}
 
 // Instruction field definitions
 

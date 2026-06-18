@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::instruction_semantics::{Effect, Expr, ValueName};
+
 use super::bit::{BitPattern, Bit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +12,8 @@ pub struct Instruction {
     /// An instruction can have multiple forms (eg immediate-shifted-registers vs register-shifted-register)
     pub forms: Vec<InstructionForm>,
     pub constraints: Vec<Predicate>,
+
+    pub effects: Vec<Effect>
 }
 
 impl Instruction {
@@ -19,6 +23,7 @@ impl Instruction {
             width,
             forms: Vec::new(),
             constraints: Vec::new(),
+            effects: Vec::new()
         }
     }
 
@@ -38,6 +43,11 @@ impl Instruction {
 
     pub fn constraint(mut self, predicate: Predicate) -> Self {
         self.constraints.push(predicate);
+        self
+    }
+
+    pub fn effect(mut self, effect: Effect) -> Self {
+        self.effects.push(effect);
         self
     }
 
@@ -118,6 +128,12 @@ impl DecodedInstruction {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedValue {
+    pub name: ValueName,
+    pub value: Expr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionForm {
     pub name: String,
@@ -127,7 +143,11 @@ pub struct InstructionForm {
     /// For these predicates, it is recommended to only use And, FieldEq, and BitEq
     /// If you use Not, Or, or FieldIn, fields_to_encodings may generate some encodings which don't fully satisfy the predicate
     /// (ie generating an instruction which may actually belong to another form) because of the current implementation
-    pub when: Predicate
+    pub when: Predicate,
+
+    /// Derived values for this instruction form for semantics (eg defining a certain "operand2 = Rm << Rs")
+    pub derived_values: Vec<DerivedValue>,
+
 }
 
 impl InstructionForm {
@@ -135,7 +155,8 @@ impl InstructionForm {
         Self {
             name: name.into(),
             fields: Vec::new(),
-            when: Predicate::Always
+            when: Predicate::Always,
+            derived_values: Vec::new()
         }
     }
 
@@ -151,6 +172,11 @@ impl InstructionForm {
 
     pub fn when(mut self, predicate: Predicate) -> Self {
         self.when = predicate;
+        self
+    }
+
+    pub fn derived_value(mut self, derived_value: DerivedValue) -> Self {
+        self.derived_values.push(derived_value);
         self
     }
 
