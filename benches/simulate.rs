@@ -1,11 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::{HashMap, HashSet};
 
-use isa_minimization::{
-    bit::Bit,
-    parser::Expr,
-    simulator::Simulator,
-};
+use isa_minimization::{bit::Bit, parser::Expr, simulator::Simulator};
 
 fn make_input() -> HashMap<String, Bit> {
     let mut bit_input = HashMap::new();
@@ -37,10 +33,9 @@ fn bench_simulate(c: &mut Criterion) {
         b.iter(|| {
             let mut wires_nonarbitrary = HashSet::new();
 
-            black_box(simulator.simulate(
-                black_box(&bit_input),
-                black_box(&mut wires_nonarbitrary),
-            ));
+            black_box(
+                simulator.simulate(black_box(&bit_input), black_box(&mut wires_nonarbitrary)),
+            );
         });
     });
 }

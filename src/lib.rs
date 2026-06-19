@@ -1,12 +1,12 @@
-use std::path::PathBuf;
 use std::error::Error;
+use std::path::PathBuf;
 
 pub mod bit;
+pub mod instruction_semantics;
 pub mod isa_specification;
-pub mod stdcell_library;
 pub mod parser;
 pub mod simulator;
-pub mod instruction_semantics;
+pub mod stdcell_library;
 
 /// Configuration for the whole program
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,11 +18,15 @@ pub struct Config {
     pub program_binary_path: PathBuf,
 
     /// Gate library liberty file path
-    pub gate_library_path: PathBuf
+    pub gate_library_path: PathBuf,
 }
 
 impl Config {
-    pub fn new(hdl_path_str: String, program_binary_path_str: String, gate_library_path_str: String) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        hdl_path_str: String,
+        program_binary_path_str: String,
+        gate_library_path_str: String,
+    ) -> Result<Self, Box<dyn Error>> {
         let hdl_path = PathBuf::from(hdl_path_str);
         let program_binary_path = PathBuf::from(program_binary_path_str);
         let gate_library_path = PathBuf::from(gate_library_path_str);
@@ -36,7 +40,7 @@ impl Config {
         Ok(Self {
             hdl_path,
             program_binary_path,
-            gate_library_path
+            gate_library_path,
         })
     }
 }
@@ -46,7 +50,5 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config() {
-
-    }
+    fn test_config() {}
 }

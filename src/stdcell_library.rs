@@ -6,7 +6,7 @@ use crate::bit::LookupTable;
 
 #[derive(Debug)]
 pub struct StandardCellLibrary {
-    pub cells: HashMap<String, StandardCell>
+    pub cells: HashMap<String, StandardCell>,
 }
 
 impl StandardCellLibrary {
@@ -19,17 +19,19 @@ impl StandardCellLibrary {
             let mut inputs = vec![];
             let mut outs = vec![];
             let mut outs_raw = vec![];
-            let is_sequential = !cell.ff.is_empty() || !cell.ff_bank.is_empty() ||
-                                            !cell.latch.is_empty() || !cell.latch_bank.is_empty() ||
-                                            cell.statetable.is_some() || cell.memory.is_some();
-
+            let is_sequential = !cell.ff.is_empty()
+                || !cell.ff_bank.is_empty()
+                || !cell.latch.is_empty()
+                || !cell.latch_bank.is_empty()
+                || cell.statetable.is_some()
+                || cell.memory.is_some();
 
             for pin in cell.pin.iter() {
                 match pin.direction {
                     Some(Direction::Input) => inputs.push(Pin::new_in(pin.name.clone())),
                     Some(Direction::Output) => outs_raw.push(pin),
-                    Some(Direction::Internal) => continue,    // ignore internal pins
-                    d => panic!("Unsupported pin direction {:?}", d)
+                    Some(Direction::Internal) => continue, // ignore internal pins
+                    d => panic!("Unsupported pin direction {:?}", d),
                 }
             }
 
@@ -37,18 +39,19 @@ impl StandardCellLibrary {
                 if is_sequential {
                     outs.push(Pin::new_seq(out_pin.name.clone()));
                 } else {
-                    outs.push(
-                        Pin::new_out(
-                            out_pin.name.clone(),
-                            out_pin.function.as_ref().unwrap().to_string().as_str(),
-                            &inputs
-                        )
-                    );
+                    outs.push(Pin::new_out(
+                        out_pin.name.clone(),
+                        out_pin.function.as_ref().unwrap().to_string().as_str(),
+                        &inputs,
+                    ));
                 }
             }
 
             let pins = inputs.into_iter().chain(outs).collect();
-            cells.insert(cell.name.clone(), StandardCell::new(cell.name.clone(), pins, is_sequential));
+            cells.insert(
+                cell.name.clone(),
+                StandardCell::new(cell.name.clone(), pins, is_sequential),
+            );
         }
         Ok(Self { cells })
     }
@@ -99,8 +102,7 @@ impl StandardCell {
         let has_seq_pins = !sequential_output_pins.is_empty();
 
         assert_eq!(
-            has_seq_pins,
-            is_sequential,
+            has_seq_pins, is_sequential,
             "Iff `is_sequential`, `pins` should have at least one SequentialOutput pin"
         );
 
@@ -131,17 +133,25 @@ pub struct OutputPin {
 pub enum Pin {
     Input { name: String },
     Output { name: String, function: LookupTable },
-    SequentialOutput { name: String }
+    SequentialOutput { name: String },
 }
 
 impl Pin {
     pub fn new_out(name: String, func_str: &str, inputs: &Vec<Pin>) -> Self {
         Self::Output {
             name,
-            function: LookupTable::new_from_string(func_str, inputs.iter().map(|i| {
-                let Pin::Input { name } = i else { panic!("Inputs to Pin::Output must be of type Pin::Input") };
-                name.as_str()
-            }).collect())
+            function: LookupTable::new_from_string(
+                func_str,
+                inputs
+                    .iter()
+                    .map(|i| {
+                        let Pin::Input { name } = i else {
+                            panic!("Inputs to Pin::Output must be of type Pin::Input")
+                        };
+                        name.as_str()
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -156,8 +166,8 @@ impl Pin {
     pub fn name(&self) -> &str {
         match self {
             Pin::Input { name } => name,
-            Pin::Output {name , function: _} => name,
-            Pin::SequentialOutput { name } => name
+            Pin::Output { name, function: _ } => name,
+            Pin::SequentialOutput { name } => name,
         }
     }
 }

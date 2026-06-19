@@ -1,8 +1,8 @@
-use pest::iterators::Pair;
 use pest::Parser;
+use pest::iterators::Pair;
 use pest_derive::Parser;
-use thiserror::Error;
 use std::collections::HashMap;
+use thiserror::Error;
 
 #[derive(Parser)]
 #[grammar = "verilog_netlist.pest"]
@@ -154,10 +154,7 @@ fn visit_module_declaration(pair: Pair<Rule>) -> Result<ModuleNetlist, NetlistEr
     Ok(module)
 }
 
-fn visit_port_header(
-    pair: Pair<Rule>,
-    module: &mut ModuleNetlist,
-) -> Result<(), NetlistError> {
+fn visit_port_header(pair: Pair<Rule>, module: &mut ModuleNetlist) -> Result<(), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::port_header);
 
     for item in pair.into_inner() {
@@ -217,10 +214,7 @@ fn visit_inline_port_decl(
     Ok(())
 }
 
-fn visit_module_item(
-    pair: Pair<Rule>,
-    module: &mut ModuleNetlist,
-) -> Result<(), NetlistError> {
+fn visit_module_item(pair: Pair<Rule>, module: &mut ModuleNetlist) -> Result<(), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::module_item);
 
     for child in pair.into_inner() {
@@ -245,10 +239,7 @@ fn visit_module_item(
     Ok(())
 }
 
-fn visit_declaration(
-    pair: Pair<Rule>,
-    module: &mut ModuleNetlist,
-) -> Result<(), NetlistError> {
+fn visit_declaration(pair: Pair<Rule>, module: &mut ModuleNetlist) -> Result<(), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::declaration);
 
     let decl = pair
@@ -263,10 +254,7 @@ fn visit_declaration(
     }
 }
 
-fn visit_port_decl(
-    pair: Pair<Rule>,
-    module: &mut ModuleNetlist,
-) -> Result<(), NetlistError> {
+fn visit_port_decl(pair: Pair<Rule>, module: &mut ModuleNetlist) -> Result<(), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::port_decl);
 
     let mut dir: Option<String> = None;
@@ -310,10 +298,7 @@ fn visit_port_decl(
     Ok(())
 }
 
-fn visit_net_decl(
-    pair: Pair<Rule>,
-    module: &mut ModuleNetlist,
-) -> Result<(), NetlistError> {
+fn visit_net_decl(pair: Pair<Rule>, module: &mut ModuleNetlist) -> Result<(), NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::net_decl);
 
     let mut kind: Option<String> = None;
@@ -435,9 +420,9 @@ fn visit_instance(pair: Pair<Rule>) -> Result<Instance, NetlistError> {
     let name_pair = if next.as_rule() == Rule::param_override {
         parameters = visit_param_override(next)?;
 
-        children
-            .next()
-            .ok_or(NetlistError::Internal("instance missing name after parameters"))?
+        children.next().ok_or(NetlistError::Internal(
+            "instance missing name after parameters",
+        ))?
     } else {
         next
     };
@@ -490,9 +475,7 @@ fn visit_param_override(pair: Pair<Rule>) -> Result<HashMap<String, Option<Expr>
     Ok(params)
 }
 
-fn visit_connection_list(
-    pair: Pair<Rule>,
-) -> Result<HashMap<String, Option<Expr>>, NetlistError> {
+fn visit_connection_list(pair: Pair<Rule>) -> Result<HashMap<String, Option<Expr>>, NetlistError> {
     debug_assert_eq!(pair.as_rule(), Rule::connection_list);
 
     let mut conns = HashMap::new();
@@ -559,9 +542,7 @@ fn visit_expr(pair: Pair<Rule>) -> Result<Expr, NetlistError> {
         Rule::term => {
             let mut inner = pair.into_inner();
 
-            let first = inner
-                .next()
-                .ok_or(NetlistError::Internal("empty term"))?;
+            let first = inner.next().ok_or(NetlistError::Internal("empty term"))?;
 
             match first.as_rule() {
                 Rule::reject_concat => Err(NetlistError::UnsupportedConcat {
@@ -692,10 +673,7 @@ mod tests {
 
         assert_eq!(netlist.name, "top");
 
-        assert_eq!(
-            netlist.inputs,
-            vec!["a[0]", "a[1]", "a[2]", "a[3]", "b"]
-        );
+        assert_eq!(netlist.inputs, vec!["a[0]", "a[1]", "a[2]", "a[3]", "b"]);
 
         assert_eq!(netlist.outputs, vec!["y[0]", "y[1]"]);
 

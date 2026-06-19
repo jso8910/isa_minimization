@@ -10,7 +10,7 @@ use petgraph::{
 
 use crate::{
     bit::Bit,
-    parser::{parse_netlist, Expr, ModuleNetlist},
+    parser::{Expr, ModuleNetlist, parse_netlist},
     stdcell_library::StandardCellLibrary,
 };
 
@@ -332,12 +332,13 @@ impl Simulator {
             // DEBUG: every wire produced by a compiled gate, plus every effective output, should
             // have a value after a full simulation. If this fails, the netlist was not fully
             // simulated for this input pattern.
-            assert!(self
-                .compiled_gates
-                .iter()
-                .flat_map(|gate| gate.output_alias_wires.iter())
-                .chain(self.top_mod_output_wire_ids.iter())
-                .all(|wire_id| workspace.wires[*wire_id].is_some()));
+            assert!(
+                self.compiled_gates
+                    .iter()
+                    .flat_map(|gate| gate.output_alias_wires.iter())
+                    .chain(self.top_mod_output_wire_ids.iter())
+                    .all(|wire_id| workspace.wires[*wire_id].is_some())
+            );
 
             // Track outputs that are constant over every supplied input pattern. Only concrete
             // low/high values count as static; Bit::Var means the value still depends on an
@@ -1328,9 +1329,11 @@ endmodule
         let optimization = optimize_test_netlist(verilog, bit_inputs);
 
         assert_eq!(optimization.static_gates, Vec::<String>::new());
-        assert!(optimization
-            .observably_static_gates
-            .contains(&"g_and".to_string()));
+        assert!(
+            optimization
+                .observably_static_gates
+                .contains(&"g_and".to_string())
+        );
         assert!(optimization.gates_to_comment.contains(&"g_and".to_string()));
         assert!(optimization.assignments.contains(&GateOutputAssignment {
             wire_name: "n0".to_string(),
@@ -1353,12 +1356,16 @@ endmodule
 
         let optimization = optimize_test_netlist(verilog, bit_inputs);
 
-        assert!(optimization
-            .arbitrary_gates
-            .contains(&"g_unused".to_string()));
-        assert!(optimization
-            .gates_to_comment
-            .contains(&"g_unused".to_string()));
+        assert!(
+            optimization
+                .arbitrary_gates
+                .contains(&"g_unused".to_string())
+        );
+        assert!(
+            optimization
+                .gates_to_comment
+                .contains(&"g_unused".to_string())
+        );
         assert!(optimization.assignments.contains(&GateOutputAssignment {
             wire_name: "unused".to_string(),
             value: Bit::Low,
@@ -1425,9 +1432,11 @@ endmodule
 
         let optimization = simulator.optimize_gate_usage_details(&bit_inputs);
 
-        assert!(optimization
-            .observably_static_gates
-            .contains(&"g_dual".to_string()));
+        assert!(
+            optimization
+                .observably_static_gates
+                .contains(&"g_dual".to_string())
+        );
         assert!(optimization.assignments.contains(&GateOutputAssignment {
             wire_name: "n0".to_string(),
             value: Bit::Low,
