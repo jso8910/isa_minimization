@@ -48,10 +48,12 @@ pub enum Expr {
 
     /// Read the current value of a register.
     ///
-    /// The inner expression evaluates to a register identifier, commonly an
-    /// `Operand(RegisterField(_))` or a fixed virtual register. Register reads
-    /// are part of the pre-instruction state; effects describe writes separately.
-    ReadRegister(Box<Expr>),
+    /// `register` evaluates to a register identifier, commonly an
+    /// `Operand(RegisterField(_))` or a fixed virtual register. `width` is the
+    /// width of the value read from that register, not the width of the register
+    /// identifier expression. Register reads are part of the pre-instruction
+    /// state; effects describe writes separately.
+    ReadRegister { register: Box<Expr>, width: u16 },
 
     /// Read a bit-vector from memory.
     ///
@@ -596,8 +598,8 @@ impl Expr {
             Expr::Operand(RegisterField(RegisterRef::Fixed { width, .. })) => Some(*width),
             Expr::Operand(ImmediateField(_))
             | Expr::Operand(RegisterField(RegisterRef::FromField(_)))
-            | Expr::DerivedValue(_)
-            | Expr::ReadRegister(_) => None,
+            | Expr::DerivedValue(_) => None,
+            Expr::ReadRegister { width, .. } => Some(*width),
             Expr::ReadMemory { width, .. } => Some(*width),
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
@@ -813,7 +815,10 @@ impl Expr {
         match self {
             Expr::Const { value, width } => Self::const_bits(*value, *width),
             Expr::Operand(_) | Expr::DerivedValue(_) => self.clone(),
-            Expr::ReadRegister(register) => Expr::ReadRegister(Box::new(register.canonicalize())),
+            Expr::ReadRegister { register, width } => Expr::ReadRegister {
+                register: Box::new(register.canonicalize()),
+                width: *width,
+            },
             Expr::ReadMemory { address, width } => Expr::ReadMemory {
                 address: Box::new(address.canonicalize()),
                 width: *width,
@@ -1100,9 +1105,10 @@ impl Expr {
                 .unwrap_or_else(|| panic!("Derived value {} does not exist!", name.0))
                 .value
                 .collapse(instruction),
-            Expr::ReadRegister(inner_expr) => {
-                Expr::ReadRegister(Box::new(inner_expr.collapse(instruction)))
-            }
+            Expr::ReadRegister { register, width } => Expr::ReadRegister {
+                register: Box::new(register.collapse(instruction)),
+                width,
+            },
             Expr::ReadMemory { address, width } => Expr::ReadMemory {
                 address: Box::new(address.collapse(instruction)),
                 width,
@@ -1626,8 +1632,11 @@ pub fn fixed_register(register: Register, width: u16) -> Expr {
     }))
 }
 
-pub fn read_register(register: Expr) -> Expr {
-    Expr::ReadRegister(Box::new(register))
+pub fn read_register(register: Expr, width: u16) -> Expr {
+    Expr::ReadRegister {
+        register: Box::new(register),
+        width,
+    }
 }
 
 pub fn read_memory(address: Expr, width: u16) -> Expr {
@@ -1637,12 +1646,12 @@ pub fn read_memory(address: Expr, width: u16) -> Expr {
     }
 }
 
-pub fn read_register_field(name: &str) -> Expr {
-    read_register(register_field(name))
+pub fn read_register_field(name: &str, width: u16) -> Expr {
+    read_register(register_field(name), width)
 }
 
 pub fn read_fixed_register(register: Register, width: u16) -> Expr {
-    read_register(fixed_register(register, width))
+    read_register(fixed_register(register, width), width)
 }
 
 pub fn equal(lhs: Expr, rhs: Expr) -> Expr {
@@ -1925,8 +1934,8 @@ mod tests {
         let instruction = decoded_fixture_instruction();
 
         assert_eq!(
-            read_register(register_field("rd")).collapse(&instruction),
-            read_register(fixed_register(Register(3), 2))
+            read_register(register_field("rd"), 8).collapse(&instruction),
+            read_register(fixed_register(Register(3), 2), 8)
         );
         assert_eq!(
             read_memory(
@@ -1939,32 +1948,68 @@ mod tests {
     }
 
     #[test]
+    fn expr_width_tracks_register_reads_and_unresolved_instruction_values() {
+        let instruction = decoded_fixture_instruction();
+
+        assert_eq!(read_fixed_register(Register(1), 32).expr_width(), Some(32));
+        assert_eq!(
+            read_register(fixed_register(Register(1), 4), 32).expr_width(),
+            Some(32)
+        );
+        assert_eq!(
+            read_register(register_field("rd"), 32)
+                .collapse(&instruction)
+                .expr_width(),
+            Some(32)
+        );
+
+        assert_eq!(immediate_field("imm").expr_width(), None);
+        assert_eq!(register_field("rd").expr_width(), None);
+        assert_eq!(derived_value("expanded").expr_width(), None);
+        assert_eq!(
+            add(immediate_field("imm"), constant(1, 4)).expr_width(),
+            None
+        );
+
+        assert_eq!(
+            immediate_field("imm").collapse(&instruction).expr_width(),
+            Some(4)
+        );
+        assert_eq!(
+            derived_value("expanded")
+                .collapse(&instruction)
+                .expr_width(),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn collapse_preserves_nonconstant_structure_with_collapsed_children() {
         let instruction = decoded_fixture_instruction();
 
         assert_eq!(
             concat([
                 constant(0xa, 4),
-                read_register(register_field("rd")),
+                read_register(register_field("rd"), 8),
                 constant(0x3, 2),
                 constant(0x2, 2),
             ])
             .collapse(&instruction),
             concat([
                 constant(0xa, 4),
-                read_register(fixed_register(Register(3), 2)),
+                read_register(fixed_register(Register(3), 2), 8),
                 constant(0xe, 4),
             ])
         );
         assert_eq!(
             select(
-                read_register(register_field("rd")),
+                read_register(register_field("rd"), 1),
                 derived_value("expanded"),
                 sub(constant(0, 8), constant(1, 8)),
             )
             .collapse(&instruction),
             select(
-                read_register(fixed_register(Register(3), 2)),
+                read_register(fixed_register(Register(3), 2), 1),
                 constant(6, 8),
                 constant(0xff, 8),
             )
@@ -2094,8 +2139,8 @@ mod tests {
     #[test]
     fn collapse_assoc_comm_add_folds_nested_constants_preserving_term_order() {
         let instruction = empty_instruction();
-        let x = read_register(fixed_register(Register(1), 4));
-        let y = read_register(fixed_register(Register(2), 4));
+        let x = read_register(fixed_register(Register(1), 4), 8);
+        let y = read_register(fixed_register(Register(2), 4), 8);
 
         assert_eq!(
             add(
@@ -2108,17 +2153,17 @@ mod tests {
         assert_eq!(
             add(
                 add(constant(250, 8), constant(10, 8)),
-                read_fixed_register(Register(3), 4)
+                read_fixed_register(Register(3), 8)
             )
             .collapse(&instruction),
-            add(read_fixed_register(Register(3), 4), constant(4, 8))
+            add(read_fixed_register(Register(3), 8), constant(4, 8))
         );
     }
 
     #[test]
     fn collapse_assoc_comm_multiplication_folds_identities_and_annihilators() {
         let instruction = empty_instruction();
-        let x = read_register(fixed_register(Register(1), 4));
+        let x = read_register(fixed_register(Register(1), 4), 8);
 
         assert_eq!(
             mul(mul(x.clone(), constant(3, 8)), constant(5, 8)).collapse(&instruction),
@@ -2137,8 +2182,8 @@ mod tests {
     #[test]
     fn collapse_assoc_comm_bitwise_ops_fold_identities_and_annihilators() {
         let instruction = empty_instruction();
-        let x = read_register(fixed_register(Register(1), 4));
-        let y = read_register(fixed_register(Register(2), 4));
+        let x = read_register(fixed_register(Register(1), 4), 8);
+        let y = read_register(fixed_register(Register(2), 4), 8);
 
         assert_eq!(
             and_expr(and_expr(x.clone(), constant(0xff, 8)), y.clone()).collapse(&instruction),
@@ -2162,7 +2207,7 @@ mod tests {
         );
         assert_eq!(
             xor_expr(xor_expr(x, constant(0b1010, 8)), constant(0b1010, 8)).collapse(&instruction),
-            read_register(fixed_register(Register(1), 4))
+            read_register(fixed_register(Register(1), 4), 8)
         );
     }
 
@@ -2174,13 +2219,13 @@ mod tests {
             add(
                 add(
                     zero_extend(immediate_field("imm"), 8),
-                    read_register(register_field("rd"))
+                    read_register(register_field("rd"), 8)
                 ),
                 add(constant(9, 8), constant(1, 8)),
             )
             .collapse(&instruction),
             add(
-                read_register(fixed_register(Register(3), 2)),
+                read_register(fixed_register(Register(3), 2), 8),
                 constant(15, 8)
             )
         );
@@ -2188,19 +2233,19 @@ mod tests {
             xor_expr(
                 xor_expr(
                     derived_value("expanded"),
-                    read_register(register_field("rd"))
+                    read_register(register_field("rd"), 8)
                 ),
                 constant(6, 8),
             )
             .collapse(&instruction),
-            read_register(fixed_register(Register(3), 2))
+            read_register(fixed_register(Register(3), 2), 8)
         );
     }
 
     #[test]
     fn collapse_assoc_comm_does_not_rewrite_non_commutative_ops() {
         let instruction = empty_instruction();
-        let x = read_register(fixed_register(Register(1), 4));
+        let x = read_register(fixed_register(Register(1), 4), 8);
 
         assert_eq!(
             sub(add(x.clone(), constant(2, 8)), constant(1, 8)).collapse(&instruction),
@@ -2218,7 +2263,7 @@ mod tests {
         let instruction = empty_instruction();
 
         add(
-            add(read_fixed_register(Register(1), 4), constant(1, 8)),
+            add(read_fixed_register(Register(1), 8), constant(1, 8)),
             constant(1, 16),
         )
         .collapse(&instruction);
@@ -2226,8 +2271,8 @@ mod tests {
 
     #[test]
     fn canonicalize_sorts_and_folds_associative_commutative_terms() {
-        let x = read_fixed_register(Register(1), 4);
-        let y = read_fixed_register(Register(2), 4);
+        let x = read_fixed_register(Register(1), 8);
+        let y = read_fixed_register(Register(2), 8);
 
         let expr_1 = add(y.clone(), add(constant(2, 8), x.clone())).canonicalize();
         let expr_2 = add(add(x.clone(), y.clone()), constant(2, 8)).canonicalize();
@@ -2237,10 +2282,10 @@ mod tests {
         assert_eq!(
             add(
                 add(constant(250, 8), constant(10, 8)),
-                read_fixed_register(Register(3), 4)
+                read_fixed_register(Register(3), 8)
             )
             .canonicalize(),
-            add(read_fixed_register(Register(3), 4), constant(4, 8))
+            add(read_fixed_register(Register(3), 8), constant(4, 8))
         );
     }
 
@@ -2250,7 +2295,7 @@ mod tests {
 
         assert_eq!(
             add(
-                read_register(register_field("rd")),
+                read_register(register_field("rd"), 8),
                 add(
                     add(constant(4, 8), zero_extend(immediate_field("imm"), 8)),
                     constant(6, 8),
@@ -2258,7 +2303,7 @@ mod tests {
             )
             .collapse_and_canonicalize(&instruction),
             add(
-                read_register(fixed_register(Register(3), 2)),
+                read_register(fixed_register(Register(3), 2), 8),
                 constant(15, 8)
             )
         );
@@ -2288,18 +2333,18 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_keeps_uncertain_width_xor_cancellation_safe() {
+    fn canonicalize_cancels_known_width_register_xor() {
         let x = read_fixed_register(Register(1), 4);
 
         assert_eq!(
             xor_expr(x.clone(), x.clone()).canonicalize(),
-            xor_expr(x.clone(), x)
+            constant(0, 4)
         );
     }
 
     #[test]
     fn canonicalize_identities_annihilators_and_local_rules() {
-        let x = read_fixed_register(Register(1), 4);
+        let x = read_fixed_register(Register(1), 8);
 
         assert_eq!(add(x.clone(), constant(0, 8)).canonicalize(), x.clone());
         assert_eq!(mul(x.clone(), constant(1, 8)).canonicalize(), x.clone());
@@ -2396,7 +2441,7 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_through_effect_helper_expressions() {
-        let x = read_fixed_register(Register(1), 4);
+        let x = read_fixed_register(Register(1), 8);
 
         assert_eq!(
             add_carry_out(

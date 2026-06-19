@@ -124,7 +124,7 @@ fn reg(register: u8) -> Expr {
 }
 
 fn read_reg(register: u8) -> Expr {
-    read_register(reg(register))
+    read_register(reg(register), 32)
 }
 
 fn true_pc() -> Expr {
@@ -135,7 +135,7 @@ fn read_register_field_with_pc_delta(field: &str, pc_delta: u128) -> Expr {
     select(
         field_is(field, 15, 4),
         add(true_pc(), constant(pc_delta, 32)),
-        read_register_field(field),
+        read_register_field(field, 32),
     )
 }
 
@@ -595,15 +595,15 @@ fn dproc_effects() -> Vec<Effect> {
 fn mul_result() -> Expr {
     let product = extract(
         mul_expr(
-            read_register_field("rm_addr"),
-            read_register_field("rs_addr"),
+            read_register_field("rm_addr", 32),
+            read_register_field("rs_addr", 32),
         ),
         31,
         0,
     );
     select(
         if_field("do_mul_accum", 1),
-        add(product.clone(), read_register_field("rn_addr")),
+        add(product.clone(), read_register_field("rn_addr", 32)),
         product,
     )
 }
@@ -625,10 +625,10 @@ fn mul_effects() -> Vec<Effect> {
 }
 
 fn mull_product() -> Expr {
-    let rm_unsigned = zero_extend(read_register_field("rm_addr"), 64);
-    let rs_unsigned = zero_extend(read_register_field("rn_addr"), 64);
-    let rm_signed = sign_extend(read_register_field("rm_addr"), 64);
-    let rs_signed = sign_extend(read_register_field("rn_addr"), 64);
+    let rm_unsigned = zero_extend(read_register_field("rm_addr", 32), 64);
+    let rs_unsigned = zero_extend(read_register_field("rn_addr", 32), 64);
+    let rm_signed = sign_extend(read_register_field("rm_addr", 32), 64);
+    let rs_signed = sign_extend(read_register_field("rn_addr", 32), 64);
 
     select(
         field_is("is_unsigned_mul", 0, 1),
@@ -640,8 +640,8 @@ fn mull_product() -> Expr {
 fn mull_result() -> Expr {
     let product = mull_product();
     let accumulator = concat([
-        read_register_field("rdhi_addr"),
-        read_register_field("rdlo_addr"),
+        read_register_field("rdhi_addr", 32),
+        read_register_field("rdlo_addr", 32),
     ]);
 
     select(
@@ -813,7 +813,7 @@ fn block_transfer_byte_count() -> Expr {
 }
 
 fn block_start_address() -> Expr {
-    let base = read_register_field("rn_addr");
+    let base = read_register_field("rn_addr", 32);
     let byte_count = block_transfer_byte_count();
     select(
         if_field("is_up_offset_block", 1),
@@ -831,7 +831,7 @@ fn block_start_address() -> Expr {
 }
 
 fn block_writeback_address() -> Expr {
-    let base = read_register_field("rn_addr");
+    let base = read_register_field("rn_addr", 32);
     select(
         if_field("is_up_offset_block", 1),
         add(base.clone(), block_transfer_byte_count()),
@@ -937,13 +937,13 @@ fn swp_effects() -> Vec<Effect> {
         Effect::write_memory_if(
             guard_all([guard.clone(), if_field("is_byte_tfr", 1)]),
             address.clone(),
-            extract(read_register_field("rm_addr"), 7, 0),
+            extract(read_register_field("rm_addr", 32), 7, 0),
             8,
         ),
         Effect::write_memory_if(
             guard_all([guard, if_field("is_byte_tfr", 0)]),
             address,
-            read_register_field("rm_addr"),
+            read_register_field("rm_addr", 32),
             32,
         ),
     ]
@@ -1188,7 +1188,7 @@ pub fn dproc() -> Instruction {
                         arm_shift(
                             read_register_field_with_pc_delta("rm_addr", 4),
                             immediate_field("op2_shift_type"),
-                            extract(read_register_field("rs_addr"), 7, 0),
+                            extract(read_register_field("rs_addr", 32), 7, 0),
                             true,
                         ),
                     ))
@@ -1197,7 +1197,7 @@ pub fn dproc() -> Instruction {
                         arm_shift_carry_out(
                             read_register_field_with_pc_delta("rm_addr", 4),
                             immediate_field("op2_shift_type"),
-                            extract(read_register_field("rs_addr"), 7, 0),
+                            extract(read_register_field("rs_addr", 32), 7, 0),
                             true,
                         ),
                     ))
@@ -1212,11 +1212,11 @@ pub fn dproc() -> Instruction {
                         c(ENC_BIT_LOW),
                         rm_addr(),
                     ])
-                    .derived_value(dv("operand1", read_register_field("rn_addr")))
+                    .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
                     .derived_value(dv(
                         "operand2",
                         arm_shift(
-                            read_register_field("rm_addr"),
+                            read_register_field("rm_addr", 32),
                             immediate_field("op2_shift_type"),
                             immediate_field("op2_imm_shift_amt"),
                             false,
@@ -1225,7 +1225,7 @@ pub fn dproc() -> Instruction {
                     .derived_value(dv(
                         "shifter_carry_out",
                         arm_shift_carry_out(
-                            read_register_field("rm_addr"),
+                            read_register_field("rm_addr", 32),
                             immediate_field("op2_shift_type"),
                             immediate_field("op2_imm_shift_amt"),
                             false,
@@ -1237,7 +1237,7 @@ pub fn dproc() -> Instruction {
                 InstructionForm::new("immediate")
                     .fields(dproc_prefix())
                     .fields([imm_ror_amt(), imm8()])
-                    .derived_value(dv("operand1", read_register_field("rn_addr")))
+                    .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
                     .derived_value(dv(
                         "operand2",
                         rotate_right(
@@ -1346,7 +1346,7 @@ pub fn swp() -> Instruction {
                     c(ENC_SWP_FIXED_SUFFIX),
                     rm_addr(),
                 ])
-                .derived_value(dv("address", read_register_field("rn_addr")))
+                .derived_value(dv("address", read_register_field("rn_addr", 32)))
                 .derived_value(dv(
                     "load_value",
                     select(
@@ -1365,7 +1365,7 @@ pub fn bx() -> Instruction {
         Instruction::new("bx", 32).form(
             InstructionForm::new("base")
                 .fields([cond(), c(ENC_BX_FIXED), rn_addr()])
-                .derived_value(dv("target", read_register_field("rn_addr"))),
+                .derived_value(dv("target", read_register_field("rn_addr", 32))),
         ),
         bx_effects(),
     )
@@ -1391,11 +1391,11 @@ pub fn hwtfr_reg_offset() -> Instruction {
                         c(ENC_BIT_HIGH),
                         rm_addr(),
                     ])
-                    .derived_value(dv("offset", read_register_field("rm_addr")))
+                    .derived_value(dv("offset", read_register_field("rm_addr", 32)))
                     .derived_value(dv(
                         "address",
                         transfer_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_pre_idx",
                             "is_up_offset",
@@ -1404,7 +1404,7 @@ pub fn hwtfr_reg_offset() -> Instruction {
                     .derived_value(dv(
                         "writeback_address",
                         transfer_writeback_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_up_offset",
                         ),
@@ -1454,7 +1454,7 @@ pub fn hwtfr_imm_offset() -> Instruction {
                     .derived_value(dv(
                         "address",
                         transfer_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_pre_idx",
                             "is_up_offset",
@@ -1463,7 +1463,7 @@ pub fn hwtfr_imm_offset() -> Instruction {
                     .derived_value(dv(
                         "writeback_address",
                         transfer_writeback_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_up_offset",
                         ),
@@ -1497,7 +1497,7 @@ pub fn data_tfr() -> Instruction {
                     .derived_value(dv(
                         "offset",
                         arm_shift(
-                            read_register_field("rm_addr"),
+                            read_register_field("rm_addr", 32),
                             immediate_field("op2_shift_type"),
                             immediate_field("op2_imm_shift_amt"),
                             false,
@@ -1506,7 +1506,7 @@ pub fn data_tfr() -> Instruction {
                     .derived_value(dv(
                         "address",
                         transfer_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_pre_idx",
                             "is_up_offset",
@@ -1515,7 +1515,7 @@ pub fn data_tfr() -> Instruction {
                     .derived_value(dv(
                         "writeback_address",
                         transfer_writeback_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_up_offset",
                         ),
@@ -1530,7 +1530,7 @@ pub fn data_tfr() -> Instruction {
                     .derived_value(dv(
                         "address",
                         transfer_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_pre_idx",
                             "is_up_offset",
@@ -1539,7 +1539,7 @@ pub fn data_tfr() -> Instruction {
                     .derived_value(dv(
                         "writeback_address",
                         transfer_writeback_address(
-                            read_register_field("rn_addr"),
+                            read_register_field("rn_addr", 32),
                             derived("offset"),
                             "is_up_offset",
                         ),
