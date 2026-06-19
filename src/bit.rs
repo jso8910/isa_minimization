@@ -185,6 +185,19 @@ impl BitPattern {
 
         Self { bits: merged_bits }
     }
+
+    pub fn to_int(&self) -> u128 {
+        self.bits
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(idx, b)| match b {
+                Bit::High => 1 << idx,
+                Bit::Low => 0,
+                _ => panic!("BitPattern must have no Var or Test")
+            })
+            .sum()
+    }
 }
 
 /// Lookup table implementation for boolean functions involving the Bit enum
@@ -346,6 +359,19 @@ impl LookupTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_pattern_to_int() {
+        assert_eq!(BitPattern::parse("1001").to_int(), 9);
+        assert_eq!(BitPattern::parse("101000010010001111").to_int(), 165007);
+        assert_eq!(BitPattern::parse("1000001001011111111110011010110").to_int(), 1093663958);
+    }
+
+    #[test]
+    #[should_panic]
+    fn fail_if_variable_bit() {
+        BitPattern::parse("100x0").to_int();
+    }
 
     mod bit {
         use super::*;

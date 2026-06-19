@@ -68,7 +68,7 @@ impl Instruction {
 
             let mut decoded_fields = DecodedInstruction {
                 name: Some(self.name.clone()),
-                form_name: Some(form.name.clone()),
+                form: Some(form.clone()),
                 bits: bits.to_vec(),
                 fields: Vec::new(),
             };
@@ -107,7 +107,7 @@ impl Instruction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedInstruction {
     pub name: Option<String>,
-    pub form_name: Option<String>,
+    pub form: Option<InstructionForm>,
     pub bits: Vec<Bit>,
     pub fields: Vec<DecodedField>,
 }
