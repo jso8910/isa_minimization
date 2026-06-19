@@ -8,16 +8,16 @@ use std::fs;
 
 use isa_minimization::bit::{Bit, BitPattern};
 use isa_minimization::instruction_semantics::{
-    add, add_carry_out, add_overflow, and_expr, arithmetic_shift_right, bool_const, concat,
-    constant, count_ones, derived_value, equal, extract, field_is, fixed_register, immediate_field,
-    logical_shift_right, mul as mul_expr, not_expr, or_expr, read_fixed_register, read_memory,
-    read_register, read_register_field, register_field, rotate_right, select, shift_left,
-    sign_extend, sub, sub_carry_out, sub_overflow, unsigned_less_than, xor_expr, zero_extend,
-    Effect, Expr, Register, ValueName,
+    Effect, Expr, Register, ValueName, add, add_carry_out, add_overflow, and_expr,
+    arithmetic_shift_right, bool_const, concat, constant, count_ones, derived_value, equal,
+    extract, field_is, fixed_register, immediate_field, logical_shift_right, mul as mul_expr,
+    not_expr, or_expr, read_fixed_register, read_memory, read_register, read_register_field,
+    register_field, rotate_right, select, shift_left, sign_extend, sub, sub_carry_out,
+    sub_overflow, unsigned_less_than, xor_expr, zero_extend,
 };
 use isa_minimization::isa_specification::{
-    and, bit_eq, c, field_eq, field_in, not, DecodedField, DecodedInstruction, DerivedValue,
-    FieldUses, Instruction, InstructionField, InstructionForm, MergeMode,
+    DecodedField, DecodedInstruction, DerivedValue, FieldUses, Instruction, InstructionField,
+    InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not,
 };
 use isa_minimization::parser::parse_netlist;
 use isa_minimization::simulator::{GateOutputAssignment, Simulator};
@@ -190,7 +190,11 @@ fn field_bit_is_set(field: &str, bit: u16) -> Expr {
 }
 
 fn sign_fill(value: Expr) -> Expr {
-    select(bit31(value), constant(u32::MAX as u128, 32), constant(0, 32))
+    select(
+        bit31(value),
+        constant(u32::MAX as u128, 32),
+        constant(0, 32),
+    )
 }
 
 fn rrx(value: Expr) -> Expr {

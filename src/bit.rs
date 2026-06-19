@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::ops::{BitAnd, BitOr, Not, BitXor};
 use regex::Regex;
 use rhai::{CustomType, Engine, Scope, TypeBuilder};
+use std::collections::HashMap;
+use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 /// Enum for the Bit type used in symbolic simulation
 #[derive(PartialEq, Eq, Debug, Copy, Clone, Hash)]
@@ -14,9 +14,8 @@ pub enum Bit {
     Var,
     /// Test value to test whether an operand affects the output of an expression
     /// Behaves the same as Variable but with higher precedence
-    Test
+    Test,
 }
-
 
 // rhai custom type implementation
 impl CustomType for Bit {
@@ -28,13 +27,11 @@ impl CustomType for Bit {
             .with_fn("Low", || Bit::Low)
             .with_fn("Variable", || Bit::Var)
             .with_fn("Test", || Bit::Test)
-
             // Operator overloads
             .with_fn("!", |a: &mut Bit| !*a)
-            .with_fn("&",|a: &mut Bit, b: Bit| *a & b)
-            .with_fn("|",|a: &mut Bit, b: Bit| *a | b)
-            .with_fn("^",|a: &mut Bit, b: Bit| *a ^ b)
-
+            .with_fn("&", |a: &mut Bit, b: Bit| *a & b)
+            .with_fn("|", |a: &mut Bit, b: Bit| *a | b)
+            .with_fn("^", |a: &mut Bit, b: Bit| *a ^ b)
             // Optional: Register a printer for debugging/printing inside scripts
             .on_print(|b| format!("{b:?}"))
             .on_debug(|b| format!("{b:?}"));
@@ -49,7 +46,7 @@ impl Not for Bit {
             Bit::Low => Bit::High,
             Bit::High => Bit::Low,
             Bit::Test => Bit::Test,
-            Bit::Var => Bit::Var
+            Bit::Var => Bit::Var,
         }
     }
 }
@@ -75,7 +72,7 @@ impl BitOr for Bit {
             (Bit::High, _) | (_, Bit::High) => Bit::High,
             (Bit::Test, _) | (_, Bit::Test) => Bit::Test,
             (Bit::Var, _) | (_, Bit::Var) => Bit::Var,
-            (Bit::Low, Bit::Low) => Bit::Low
+            (Bit::Low, Bit::Low) => Bit::Low,
         }
     }
 }
@@ -88,14 +85,14 @@ impl BitXor for Bit {
             (Bit::Test, _) | (_, Bit::Test) => Bit::Test,
             (Bit::Var, _) | (_, Bit::Var) => Bit::Var,
             (Bit::High, Bit::Low) | (Bit::Low, Bit::High) => Bit::High,
-            (Bit::High, Bit::High) | (Bit::Low, Bit::Low) => Bit::Low
+            (Bit::High, Bit::High) | (Bit::Low, Bit::Low) => Bit::Low,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BitPattern {
-    pub bits: Vec<Bit>
+    pub bits: Vec<Bit>,
 }
 
 impl BitPattern {
@@ -114,7 +111,7 @@ impl BitPattern {
                 '0' => Bit::Low,
                 '1' => Bit::High,
                 'x' => Bit::Var,
-                _ => panic!("Invalid bit pattern character: {c}")
+                _ => panic!("Invalid bit pattern character: {c}"),
             })
             .collect();
         Self { bits }
@@ -133,9 +130,17 @@ impl BitPattern {
 
         for (pattern_bit, bit) in self.bits.iter().zip(bits) {
             match pattern_bit {
-                Bit::Low => if *bit != Bit::Low { return false; },
-                Bit::High => if *bit != Bit::High { return false; },
-                Bit::Var => {},
+                Bit::Low => {
+                    if *bit != Bit::Low {
+                        return false;
+                    }
+                }
+                Bit::High => {
+                    if *bit != Bit::High {
+                        return false;
+                    }
+                }
+                Bit::Var => {}
                 Bit::Test => {}
             }
         }
@@ -143,7 +148,7 @@ impl BitPattern {
     }
 
     pub fn num_high(&self) -> usize {
-        return self.bits.iter().filter(|b| **b == Bit::High).count()
+        return self.bits.iter().filter(|b| **b == Bit::High).count();
     }
 
     pub fn can_merge_with(&self, other: &BitPattern) -> bool {
@@ -168,7 +173,10 @@ impl BitPattern {
     }
 
     pub fn merge_with(&self, other: &BitPattern) -> Self {
-        assert!(self.can_merge_with(other), "Cannot merge these two BitPatterns");
+        assert!(
+            self.can_merge_with(other),
+            "Cannot merge these two BitPatterns"
+        );
 
         let merged_bits = self.bits.iter().zip(&other.bits).map(|(b1, b2)| {
             if b1 == b2 {
@@ -194,7 +202,7 @@ impl BitPattern {
             .map(|(idx, b)| match b {
                 Bit::High => 1 << idx,
                 Bit::Low => 0,
-                _ => panic!("BitPattern must have no Var or Test")
+                _ => panic!("BitPattern must have no Var or Test"),
             })
             .sum()
     }
@@ -216,24 +224,38 @@ pub struct LookupTable {
     /// Function inputs
     input_names: Vec<String>,
     /// Optional: original function value
-    function: Option<String>
+    function: Option<String>,
 }
 
 impl LookupTable {
-    pub fn new(input_count: usize, truth_table: Vec<Bit>, input_names: Vec<String>, function: Option<String>) -> Self {
+    pub fn new(
+        input_count: usize,
+        truth_table: Vec<Bit>,
+        input_names: Vec<String>,
+        function: Option<String>,
+    ) -> Self {
         // Truth table length should be equal to 4**input_count
-        assert_eq!(truth_table.len(), 1 << 2*input_count, "Invalid truth table size");
+        assert_eq!(
+            truth_table.len(),
+            1 << 2 * input_count,
+            "Invalid truth table size"
+        );
 
-        Self { input_count, truth_table, input_names, function }
+        Self {
+            input_count,
+            truth_table,
+            input_names,
+            function,
+        }
     }
 
     /// Defines a new LookupTable from a boolean function string.
     /// The syntax used is the same as that defined in the Liberty file format
     /// For the specification, see page 156 in the following document
     /// https://people.eecs.berkeley.edu/~alanmi/publications/other/liberty07_03.pdf
-    /// 
+    ///
     /// Does not support certain constructs (e.g. postfix invert, space for and)
-    /// 
+    ///
     /// # Arguments
     /// * `expr` - the boolean function expression as a string
     /// * `inputs` - a vector of the names of all inputs in the expression, in the order they will be included in the LUT
@@ -275,14 +297,14 @@ impl LookupTable {
 
         // We need to permute every bit
         // let mut input_vals: HashMap<String, Bit> = HashMap::new();
-        for i in 0..(1 << 2*input_names.len()) {
+        for i in 0..(1 << 2 * input_names.len()) {
             for (idx, input) in input_names.iter().enumerate() {
-                let val = match (i >> (2*idx)) & 0b11 {
+                let val = match (i >> (2 * idx)) & 0b11 {
                     0 => Bit::Low,
                     1 => Bit::High,
                     2 => Bit::Var,
                     3 => Bit::Test,
-                    _ => panic!("This can't happen. Value cannot be greater than 3")
+                    _ => panic!("This can't happen. Value cannot be greater than 3"),
                 };
                 scope.set_value(*input, val);
             }
@@ -295,7 +317,7 @@ impl LookupTable {
             input_count: input_names.len(),
             truth_table,
             input_names: input_names.into_iter().map(|v| v.to_string()).collect(),
-            function: Some(expr.to_string())
+            function: Some(expr.to_string()),
         }
     }
 
@@ -305,7 +327,11 @@ impl LookupTable {
     pub fn evaluate_named(&self, operands: &HashMap<String, Bit>) -> Bit {
         let mut operands_unnamed: Vec<Bit> = Vec::with_capacity(self.input_count);
         for key in &self.input_names {
-            operands_unnamed.push(*operands.get(key).expect("Must include all inputs in `operands`"));
+            operands_unnamed.push(
+                *operands
+                    .get(key)
+                    .expect("Must include all inputs in `operands`"),
+            );
         }
         self.evaluate(&operands_unnamed)
     }
@@ -321,7 +347,6 @@ impl LookupTable {
         // Register Bit with the rhai engine
         engine.build_type::<Bit>();
 
-
         let mut scope = Scope::new();
         for (name, val) in inputs {
             scope.push(name.to_string(), *val);
@@ -332,7 +357,11 @@ impl LookupTable {
 
     /// Takes a list of operands, in the same order as `self.input_names`, and returns the result in the LUT
     pub fn evaluate(&self, operands: &[Bit]) -> Bit {
-        assert_eq!(operands.len(), self.input_count, "Invalid number of operands");
+        assert_eq!(
+            operands.len(),
+            self.input_count,
+            "Invalid number of operands"
+        );
 
         // Find the correct index in the LUT
         let index = self.get_index(operands);
@@ -348,7 +377,7 @@ impl LookupTable {
                 Bit::Low => 0,
                 Bit::High => 1,
                 Bit::Var => 2,
-                Bit::Test => 3
+                Bit::Test => 3,
             };
             index |= enc << (2 * i);
         }
@@ -364,7 +393,10 @@ mod tests {
     fn bit_pattern_to_int() {
         assert_eq!(BitPattern::parse("1001").to_int(), 9);
         assert_eq!(BitPattern::parse("101000010010001111").to_int(), 165007);
-        assert_eq!(BitPattern::parse("1000001001011111111110011010110").to_int(), 1093663958);
+        assert_eq!(
+            BitPattern::parse("1000001001011111111110011010110").to_int(),
+            1093663958
+        );
     }
 
     #[test]
@@ -537,23 +569,33 @@ mod tests {
             // Simple test of a truth table for an and function
             let table = vec![
                 // b = 0
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 1
-                Bit::Low, Bit::High, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::High,
+                Bit::Var,
+                Bit::Test,
                 // b = variable
-                Bit::Low, Bit::Var, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::Var,
+                Bit::Var,
+                Bit::Test,
                 // b = test
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
             ];
-            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
+            let lookup_table =
+                LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
                 for b in bits {
-                    let operands = HashMap::from([
-                        (String::from("A"), a),
-                        (String::from("B"), b)
-                    ]);
+                    let operands = HashMap::from([(String::from("A"), a), (String::from("B"), b)]);
                     assert_eq!(lookup_table.evaluate_named(&operands), a & b);
                 }
             }
@@ -564,23 +606,33 @@ mod tests {
             // Test of a noncommutative function. In this case, the implication function (X = !A | B)
             let table = vec![
                 // b = 0
-                Bit::High, Bit::Low, Bit::Var, Bit::Test,
+                Bit::High,
+                Bit::Low,
+                Bit::Var,
+                Bit::Test,
                 // b = 1
-                Bit::High, Bit::High, Bit::High, Bit::High,
+                Bit::High,
+                Bit::High,
+                Bit::High,
+                Bit::High,
                 // b = variable
-                Bit::High, Bit::Var, Bit::Var, Bit::Test,
+                Bit::High,
+                Bit::Var,
+                Bit::Var,
+                Bit::Test,
                 // b = test
-                Bit::High, Bit::Test, Bit::Test, Bit::Test
+                Bit::High,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
             ];
-            let lookup_table = LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
+            let lookup_table =
+                LookupTable::new(2, table, vec![String::from("A"), String::from("B")], None);
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
                 for b in bits {
-                    let operands = HashMap::from([
-                        (String::from("A"), a),
-                        (String::from("B"), b)
-                    ]);
+                    let operands = HashMap::from([(String::from("A"), a), (String::from("B"), b)]);
                     assert_eq!(lookup_table.evaluate_named(&operands), !a | b);
                 }
             }
@@ -591,39 +643,92 @@ mod tests {
             // Table for 3 input and
             let table = vec![
                 // b = 0, c = 0
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 1, c = 0
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = x, c = 0
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = t, c = 0
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 0, c = 1
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 1, c = 1
-                Bit::Low, Bit::High, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::High,
+                Bit::Var,
+                Bit::Test,
                 // b = x, c = 1
-                Bit::Low, Bit::Var, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::Var,
+                Bit::Var,
+                Bit::Test,
                 // b = t, c = 1
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test,
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
                 // b = 0, c = x
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 1, c = x
-                Bit::Low, Bit::Var, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::Var,
+                Bit::Var,
+                Bit::Test,
                 // b = x, c = x
-                Bit::Low, Bit::Var, Bit::Var, Bit::Test,
+                Bit::Low,
+                Bit::Var,
+                Bit::Var,
+                Bit::Test,
                 // b = t, c = x
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test,
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
                 // b = 0, c = t
-                Bit::Low, Bit::Low, Bit::Low, Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
+                Bit::Low,
                 // b = 1, c = t
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test,
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
                 // b = x, c = t
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test,
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
                 // b = t, c = t
-                Bit::Low, Bit::Test, Bit::Test, Bit::Test,
+                Bit::Low,
+                Bit::Test,
+                Bit::Test,
+                Bit::Test,
             ];
-            let lookup_table = LookupTable::new(3, table, vec![String::from("A"), String::from("B"), String::from("C")], None);
+            let lookup_table = LookupTable::new(
+                3,
+                table,
+                vec![String::from("A"), String::from("B"), String::from("C")],
+                None,
+            );
 
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -632,7 +737,7 @@ mod tests {
                         let operands = HashMap::from([
                             (String::from("A"), a),
                             (String::from("B"), b),
-                            (String::from("C"), c)
+                            (String::from("C"), c),
                         ]);
                         assert_eq!(lookup_table.evaluate_named(&operands), a & b & c);
                     }
@@ -642,10 +747,7 @@ mod tests {
 
         #[test]
         fn lookup_table_str_and() {
-            let input_names = vec![
-                "A",
-                "B"
-            ];
+            let input_names = vec!["A", "B"];
             let lookup_table = LookupTable::new_from_string("A & B", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -658,11 +760,7 @@ mod tests {
 
         #[test]
         fn lookup_table_str_and3() {
-            let input_names = vec![
-                "A",
-                "B",
-                "C"
-            ];
+            let input_names = vec!["A", "B", "C"];
             let lookup_table = LookupTable::new_from_string("A & B & C", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -677,11 +775,7 @@ mod tests {
 
         #[test]
         fn lookup_table_str_3_inp_noncommutative() {
-            let input_names = vec![
-                "A",
-                "B",
-                "C"
-            ];
+            let input_names = vec!["A", "B", "C"];
             let lookup_table = LookupTable::new_from_string("!A | (B & C)", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -696,10 +790,7 @@ mod tests {
 
         #[test]
         fn lookup_table_str_hardcoded_high() {
-            let input_names = vec![
-                "A",
-                "B",
-            ];
+            let input_names = vec!["A", "B"];
             let lookup_table = LookupTable::new_from_string("!A | (B & 1)", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
@@ -712,16 +803,16 @@ mod tests {
 
         #[test]
         fn lookup_table_str_hardcoded_low() {
-            let input_names = vec![
-                "A",
-                "B",
-            ];
+            let input_names = vec!["A", "B"];
             let lookup_table = LookupTable::new_from_string("!A | (B & 1) & 0", input_names);
             let bits = [Bit::Low, Bit::High, Bit::Test, Bit::Var];
             for a in bits {
                 for b in bits {
                     let operands = vec![a, b];
-                    assert_eq!(lookup_table.evaluate(&operands), !a | (b & Bit::High) & Bit::Low);
+                    assert_eq!(
+                        lookup_table.evaluate(&operands),
+                        !a | (b & Bit::High) & Bit::Low
+                    );
                 }
             }
         }
