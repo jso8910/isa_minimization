@@ -8,7 +8,7 @@ use std::fs;
 
 use isa_minimization::bit::{Bit, BitPattern};
 use isa_minimization::instruction_semantics::{
-    Effect, Expr, Register, ValueName, add, add_carry_out, add_overflow, and_expr,
+    Effect, Expr, FieldName, Register, ValueName, add, add_carry_out, add_overflow, and_expr,
     arithmetic_shift_right, bool_const, concat, constant, count_ones, derived_value, equal,
     extract, field_is, fixed_register, immediate_field, logical_shift_right, mul as mul_expr,
     not_expr, or_expr, read_fixed_register, read_memory, read_register, read_register_field,
@@ -20,6 +20,7 @@ use isa_minimization::isa_specification::{
     InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not,
 };
 use isa_minimization::parser::parse_netlist;
+use isa_minimization::semantic_matching::instruction_seq_to_effects;
 use isa_minimization::simulator::{GateOutputAssignment, Simulator};
 
 const NETLIST_PATH: &str = "examples/arm32_core_syn.v";
@@ -32,6 +33,8 @@ pub const REG_C: Register = Register(18);
 pub const REG_V: Register = Register(19);
 pub const REG_PC: Register = Register(15);
 pub const REG_LR: Register = Register(14);
+const ARM_REGISTER_IDENTIFIER_WIDTH: u16 = 4;
+const VIRTUAL_REGISTER_IDENTIFIER_WIDTH: u16 = 5;
 
 const SHIFT_TYPE_LSL: u128 = 0b00;
 const SHIFT_TYPE_LSR: u128 = 0b01;
@@ -120,7 +123,7 @@ fn with_effects(
 }
 
 fn reg(register: u8) -> Expr {
-    fixed_register(Register(register), 32)
+    fixed_register(Register(register), ARM_REGISTER_IDENTIFIER_WIDTH)
 }
 
 fn read_reg(register: u8) -> Expr {
@@ -128,7 +131,7 @@ fn read_reg(register: u8) -> Expr {
 }
 
 fn true_pc() -> Expr {
-    read_fixed_register(REG_PC, 32)
+    read_fixed_register(REG_PC, ARM_REGISTER_IDENTIFIER_WIDTH, 32)
 }
 
 fn read_register_field_with_pc_delta(field: &str, pc_delta: u128) -> Expr {
@@ -198,7 +201,10 @@ fn sign_fill(value: Expr) -> Expr {
 }
 
 fn rrx(value: Expr) -> Expr {
-    concat([read_fixed_register(REG_C, 1), extract(value, 31, 1)])
+    concat([
+        read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1),
+        extract(value, 31, 1),
+    ])
 }
 
 fn select_shift_type(shift_type: Expr, lsl: Expr, lsr: Expr, asr: Expr, ror: Expr) -> Expr {
@@ -281,7 +287,7 @@ fn arm_shift_carry_out(value: Expr, shift_type: Expr, amount: Expr, register_shi
     let amount_width = if register_shift { 8 } else { 5 };
     let amount32 = zext32(amount.clone());
     let amount_is_zero = equal(amount.clone(), constant(0, amount_width));
-    let old_c = read_fixed_register(REG_C, 1);
+    let old_c = read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
 
     let lsl_carry_1_to_31 = extract(
         logical_shift_right(value.clone(), sub(constant(32, 32), amount32.clone())),
@@ -355,7 +361,11 @@ fn arm_shift_carry_out(value: Expr, shift_type: Expr, amount: Expr, register_shi
 fn dproc_result() -> Expr {
     let op1 = derived("operand1");
     let op2 = derived("operand2");
-    let c = zext32(read_fixed_register(REG_C, 1));
+    let c = zext32(read_fixed_register(
+        REG_C,
+        VIRTUAL_REGISTER_IDENTIFIER_WIDTH,
+        1,
+    ));
 
     let and_result = and_expr(op1.clone(), op2.clone());
     let eor_result = xor_expr(op1.clone(), op2.clone());
@@ -365,11 +375,19 @@ fn dproc_result() -> Expr {
     let adc_result = add(add(op1.clone(), op2.clone()), c.clone());
     let sbc_result = sub(
         sub(op1.clone(), op2.clone()),
-        one_minus_flag(read_fixed_register(REG_C, 1)),
+        one_minus_flag(read_fixed_register(
+            REG_C,
+            VIRTUAL_REGISTER_IDENTIFIER_WIDTH,
+            1,
+        )),
     );
     let rsc_result = sub(
         sub(op2.clone(), op1.clone()),
-        one_minus_flag(read_fixed_register(REG_C, 1)),
+        one_minus_flag(read_fixed_register(
+            REG_C,
+            VIRTUAL_REGISTER_IDENTIFIER_WIDTH,
+            1,
+        )),
     );
     let orr_result = or_expr(op1.clone(), op2.clone());
     let bic_result = and_expr(op1.clone(), not_expr(op2.clone()));
@@ -408,7 +426,7 @@ fn dproc_result() -> Expr {
 fn dproc_arithmetic_carry_out() -> Expr {
     let op1 = derived("operand1");
     let op2 = derived("operand2");
-    let c = read_fixed_register(REG_C, 1);
+    let c = read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
     let zero = bool_const(false);
     let one = bool_const(true);
 
@@ -461,7 +479,7 @@ fn dproc_arithmetic_carry_out() -> Expr {
 fn dproc_arithmetic_overflow() -> Expr {
     let op1 = derived("operand1");
     let op2 = derived("operand2");
-    let c = read_fixed_register(REG_C, 1);
+    let c = read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
     let zero = bool_const(false);
 
     let opcode = immediate_field("data_proc_opcode");
@@ -566,27 +584,27 @@ fn dproc_effects() -> Vec<Effect> {
         Effect::write_register_if(writes_result, register_field("rd_addr"), result.clone()),
         Effect::write_register_if(
             writes_flags.clone(),
-            fixed_register(REG_N, 1),
+            fixed_register(REG_N, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             bit31(result.clone()),
         ),
         Effect::write_register_if(
             writes_flags.clone(),
-            fixed_register(REG_Z, 1),
+            fixed_register(REG_Z, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             is_zero(result, 32),
         ),
         Effect::write_register_if(
             arithmetic_flags.clone(),
-            fixed_register(REG_C, 1),
+            fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             dproc_arithmetic_carry_out(),
         ),
         Effect::write_register_if(
             arithmetic_flags,
-            fixed_register(REG_V, 1),
+            fixed_register(REG_V, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             dproc_arithmetic_overflow(),
         ),
         Effect::write_register_if(
             logical_flags,
-            fixed_register(REG_C, 1),
+            fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             derived("shifter_carry_out"),
         ),
     ]
@@ -617,10 +635,14 @@ fn mul_effects() -> Vec<Effect> {
         Effect::write_register_if(guard, register_field("rd_addr"), result.clone()),
         Effect::write_register_if(
             flags_guard.clone(),
-            fixed_register(REG_N, 1),
+            fixed_register(REG_N, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             bit31(result.clone()),
         ),
-        Effect::write_register_if(flags_guard, fixed_register(REG_Z, 1), is_zero(result, 32)),
+        Effect::write_register_if(
+            flags_guard,
+            fixed_register(REG_Z, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
+            is_zero(result, 32),
+        ),
     ]
 }
 
@@ -669,10 +691,14 @@ fn mull_effects() -> Vec<Effect> {
         ),
         Effect::write_register_if(
             flags_guard.clone(),
-            fixed_register(REG_N, 1),
+            fixed_register(REG_N, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
             extract(result.clone(), 63, 63),
         ),
-        Effect::write_register_if(flags_guard, fixed_register(REG_Z, 1), is_zero(result, 64)),
+        Effect::write_register_if(
+            flags_guard,
+            fixed_register(REG_Z, VIRTUAL_REGISTER_IDENTIFIER_WIDTH),
+            is_zero(result, 64),
+        ),
     ]
 }
 
@@ -910,17 +936,21 @@ fn branch_effects() -> Vec<Effect> {
     vec![
         Effect::write_register_if(
             guard_all([guard.clone(), if_field("do_link", 1)]),
-            fixed_register(REG_LR, 32),
+            fixed_register(REG_LR, ARM_REGISTER_IDENTIFIER_WIDTH),
             derived("link_value"),
         ),
-        Effect::write_register_if(guard, fixed_register(REG_PC, 32), derived("target")),
+        Effect::write_register_if(
+            guard,
+            fixed_register(REG_PC, ARM_REGISTER_IDENTIFIER_WIDTH),
+            derived("target"),
+        ),
     ]
 }
 
 fn bx_effects() -> Vec<Effect> {
     vec![Effect::write_register_if(
         cond_guard(),
-        fixed_register(REG_PC, 32),
+        fixed_register(REG_PC, ARM_REGISTER_IDENTIFIER_WIDTH),
         derived("target"),
     )]
 }
@@ -950,10 +980,10 @@ fn swp_effects() -> Vec<Effect> {
 }
 
 fn arm_condition_holds() -> Expr {
-    let n = read_fixed_register(REG_N, 1);
-    let z = read_fixed_register(REG_Z, 1);
-    let c = read_fixed_register(REG_C, 1);
-    let v = read_fixed_register(REG_V, 1);
+    let n = read_fixed_register(REG_N, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
+    let z = read_fixed_register(REG_Z, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
+    let c = read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
+    let v = read_fixed_register(REG_V, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1);
 
     let n_equals_v = equal(n.clone(), v.clone());
 
@@ -1252,7 +1282,7 @@ pub fn dproc() -> Instruction {
                         "shifter_carry_out",
                         select(
                             field_is("imm_ror_amt", 0, 4),
-                            read_fixed_register(REG_C, 1),
+                            read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1),
                             bit31(rotate_right(
                                 zero_extend(immediate_field("imm8"), 32),
                                 shift_left(
@@ -1706,45 +1736,19 @@ fn main() {
 
     // Get all the instructions from the binsearch.bin program
     let program_binary_path = "examples/binsearch.bin".to_string();
-    let program_binary =
-        std::fs::read_to_string(program_binary_path).expect("Failed to read program binary");
 
-    let mut decoded_program: Vec<DecodedInstruction> = vec![];
+    let mut decoded_program: Vec<DecodedInstruction> =
+        DecodedInstruction::decode_program("examples/binsearch.bin", &arm32).unwrap();
 
     // Create hashmap of FieldUses
-    let mut field_values: HashMap<String, FieldUses> = std::collections::HashMap::new();
+    let mut field_values: HashMap<FieldName, FieldUses> = std::collections::HashMap::new();
 
-    for (i, line) in program_binary.lines().enumerate() {
-        let bits: Vec<Bit> = line
-            .chars()
-            .map(|c| match c {
-                '0' => Bit::Low,
-                '1' => Bit::High,
-                _ => panic!("Invalid character in program binary: {}", c),
-            })
-            .collect();
-
-        // Try to decode the instruction
-        let mut decoded = None;
-        for instr in &arm32 {
-            if let Some(decoded_instr) = instr.find_match(&bits) {
-                decoded = Some(decoded_instr);
-                break;
-            }
-        }
-
-        if let Some(_) = &decoded {
-        } else {
-            panic!("Instruction {}: Failed to decode", i);
-        }
-
-        decoded_program.push(decoded.clone().unwrap());
-
+    for decoded in decoded_program.iter() {
         for DecodedField {
             name,
             value,
             merge_mode,
-        } in &decoded.unwrap().fields
+        } in &decoded.fields
         {
             let name = match name {
                 Some(name) => name.clone(),
@@ -1922,4 +1926,16 @@ fn main() {
         OPTIMIZED_NETLIST_PATH
     );
     println!("{:#?}", dproc());
+
+    // Program: add r0, r0, r1; mov r1, r0
+    let program = DecodedInstruction::decode_program_str(
+        "11100000100000000000000000000001\n11100001101000000001000000000000",
+        &arm32,
+    )
+    .unwrap();
+    let effects = instruction_seq_to_effects(&program, &arm32);
+    println!("\n\n\n\n\n\n\n");
+    for effect in &effects {
+        println!("{:#?}", effect);
+    }
 }

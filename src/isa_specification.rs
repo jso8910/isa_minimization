@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
-use crate::instruction_semantics::{Effect, Expr, ValueName};
+use crate::instruction_semantics::{Effect, Expr, FieldName, ValueName};
 
 use super::bit::{Bit, BitPattern};
 
@@ -131,6 +134,47 @@ impl DecodedInstruction {
             .iter()
             .find(|field| field.name == Some(name.to_string()))
             .map(|field| &field.value)
+    }
+
+    pub fn decode_program(filename: &str, isa: &Vec<Instruction>) -> Result<Vec<Self>, io::Error> {
+        let program_binary = std::fs::read_to_string(filename)?;
+
+        DecodedInstruction::decode_program_str(&program_binary, isa)
+    }
+
+    pub fn decode_program_str(
+        program: &str,
+        isa: &Vec<Instruction>,
+    ) -> Result<Vec<Self>, io::Error> {
+        let mut decoded_program: Vec<DecodedInstruction> = vec![];
+
+        for (i, line) in program.lines().enumerate() {
+            let bits: Vec<Bit> = line
+                .chars()
+                .map(|c| match c {
+                    '0' => Bit::Low,
+                    '1' => Bit::High,
+                    _ => panic!("Invalid character in program binary: {}", c),
+                })
+                .collect();
+
+            // Try to decode the instruction
+            let mut decoded = None;
+            for instr in isa {
+                if let Some(decoded_instr) = instr.find_match(&bits) {
+                    decoded = Some(decoded_instr);
+                    break;
+                }
+            }
+
+            if let Some(_) = &decoded {
+            } else {
+                panic!("Instruction {}: Failed to decode", i);
+            }
+
+            decoded_program.push(decoded.clone().unwrap());
+        }
+        Ok(decoded_program)
     }
 }
 

@@ -592,10 +592,12 @@ impl Expr {
         }
     }
 
-    fn expr_width(&self) -> Option<u16> {
+    pub fn expr_width(&self) -> Option<u16> {
         match self {
             Expr::Const { width, .. } => Some(*width),
-            Expr::Operand(RegisterField(RegisterRef::Fixed { width, .. })) => Some(*width),
+            Expr::Operand(RegisterField(RegisterRef::Fixed {
+                identifier_width, ..
+            })) => Some(*identifier_width),
             Expr::Operand(ImmediateField(_))
             | Expr::Operand(RegisterField(RegisterRef::FromField(_)))
             | Expr::DerivedValue(_) => None,
@@ -661,8 +663,8 @@ impl Expr {
     }
 
     fn canonicalize_shift_like_op(
-        value: &Expr,
-        amount: &Expr,
+        value: Expr,
+        amount: Expr,
         rebuild: fn(Box<Expr>, Box<Expr>) -> Expr,
     ) -> Self {
         let value = value.canonicalize();
@@ -689,9 +691,9 @@ impl Expr {
     }
 
     fn canonicalize_flag_expr(
-        lhs: &Expr,
-        rhs: &Expr,
-        flag_in: &Expr,
+        lhs: Expr,
+        rhs: Expr,
+        flag_in: Expr,
         width: u16,
         rebuild: fn(Expr, Expr, Expr, u16) -> Expr,
     ) -> Self {
@@ -703,7 +705,7 @@ impl Expr {
         )
     }
 
-    fn canonicalize_assoc_comm_op(op: AssocCommOp, lhs: &Expr, rhs: &Expr) -> Self {
+    fn canonicalize_assoc_comm_op(op: AssocCommOp, lhs: Expr, rhs: Expr) -> Self {
         let mut terms = Vec::new();
         Self::flatten_assoc_comm_op(op, lhs.canonicalize(), &mut terms);
         Self::flatten_assoc_comm_op(op, rhs.canonicalize(), &mut terms);
@@ -807,23 +809,199 @@ impl Expr {
         }
     }
 
-    pub fn collapse_and_canonicalize(&self, instruction: &DecodedInstruction) -> Self {
+    pub fn collapse_and_canonicalize(self, instruction: &DecodedInstruction) -> Self {
         self.collapse(instruction).canonicalize()
     }
 
-    pub fn canonicalize(&self) -> Self {
+    pub fn collapse_canonicalize_substitute(
+        self,
+        instruction: &DecodedInstruction,
+        previous_effects: &Vec<Effect>,
+    ) -> Self {
+        // previous_effects should already be collapsed, which means the collapse only needs to be run on the original Expr
+        self.collapse(instruction)
+            .substitute(previous_effects)
+            .canonicalize()
+    }
+
+    /// Substitute state equations for a state read, in order to change an Expr from a function of state at
+    /// t=n-1 to a function of state at t=0.
+    /// Be careful to never run this function twice on an Expr!
+    pub fn substitute(self, previous_effects: &Vec<Effect>) -> Self {
         match self {
-            Expr::Const { value, width } => Self::const_bits(*value, *width),
-            Expr::Operand(_) | Expr::DerivedValue(_) => self.clone(),
+            Expr::ReadRegister { ref register, .. } => {
+                for effect in previous_effects.iter() {
+                    if let Effect::WriteRegister {
+                        guard,
+                        register: reg_addr,
+                        value,
+                    } = effect
+                    {
+                        if **register == *reg_addr {
+                            // Either return the new value, or the original value
+                            return select(guard.clone(), value.clone(), self);
+                        }
+                    }
+                }
+                // If nothing matched, return self
+                return self;
+            }
+            Expr::ReadMemory { ref address, ref width } => {
+                for effect in previous_effects.iter() {
+                    if let Effect::WriteMemory {
+                        guard,
+                        address: address_mem,
+                        value,
+                        width: width_mem,
+                    } = effect
+                    {
+                        if **address == *address_mem && width == width_mem {
+                            return select(guard.clone(), value.clone(), self);
+                        }
+                    }
+                }
+                return self;
+            }
+            Expr::Add(op1, op2) => Expr::Add(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Sub(op1, op2) => Expr::Sub(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Mul(op1, op2) => Expr::Mul(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::And(op1, op2) => Expr::And(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Or(op1, op2) => Expr::Or(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Xor(op1, op2) => Expr::Xor(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Not(op1) => Expr::Not(Box::new(op1.substitute(previous_effects))),
+            Expr::ShiftLeft(op1, op2) => Expr::ShiftLeft(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::LogicalShiftRight(op1, op2) => Expr::LogicalShiftRight(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::ArithmeticShiftRight(op1, op2) => Expr::ArithmeticShiftRight(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::RotateRight(op1, op2) => Expr::RotateRight(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Equal(op1, op2) => Expr::Equal(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::UnsignedLessThan(op1, op2) => Expr::UnsignedLessThan(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::SignedLessThan(op1, op2) => Expr::UnsignedLessThan(
+                Box::new(op1.substitute(previous_effects)),
+                Box::new(op2.substitute(previous_effects)),
+            ),
+            Expr::Extract { value, high, low } => Expr::Extract {
+                value: Box::new(value.substitute(previous_effects)),
+                high: high,
+                low: low,
+            },
+            Expr::Concat(ops) => {
+                Expr::Concat(ops.into_iter().map(|i| i.substitute(previous_effects)).collect())
+            }
+            Expr::ZeroExtend { value, to_width } => Expr::ZeroExtend {
+                value: Box::new(value.substitute(previous_effects)),
+                to_width: to_width,
+            },
+            Expr::SignExtend { value, to_width } => Expr::SignExtend {
+                value: Box::new(value.substitute(previous_effects)),
+                to_width: to_width,
+            },
+            Expr::CountOnes(op) => Expr::CountOnes(Box::new(op.substitute(previous_effects))),
+            Expr::AddCarryOut {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => Expr::AddCarryOut {
+                lhs: Box::new(lhs.substitute(previous_effects)),
+                rhs: Box::new(rhs.substitute(previous_effects)),
+                carry_in: Box::new(carry_in.substitute(previous_effects)),
+                width: width,
+            },
+            Expr::AddOverflow {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => Expr::AddOverflow {
+                lhs: Box::new(lhs.substitute(previous_effects)),
+                rhs: Box::new(rhs.substitute(previous_effects)),
+                carry_in: Box::new(carry_in.substitute(previous_effects)),
+                width: width,
+            },
+            Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => Expr::SubCarryOut {
+                lhs: Box::new(lhs.substitute(previous_effects)),
+                rhs: Box::new(rhs.substitute(previous_effects)),
+                borrow_in: Box::new(borrow_in.substitute(previous_effects)),
+                width: width,
+            },
+            Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => Expr::SubOverflow {
+                lhs: Box::new(lhs.substitute(previous_effects)),
+                rhs: Box::new(rhs.substitute(previous_effects)),
+                borrow_in: Box::new(borrow_in.substitute(previous_effects)),
+                width: width,
+            },
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => Expr::Select {
+                condition: Box::new(condition.substitute(previous_effects)),
+                when_true: Box::new(when_true.substitute(previous_effects)),
+                when_false: Box::new(when_false.substitute(previous_effects)),
+            },
+            _ => self,
+        }
+    }
+
+    pub fn canonicalize(self) -> Self {
+        match self {
+            Expr::Const { value, width } => Self::const_bits(value, width),
+            Expr::Operand(_) | Expr::DerivedValue(_) => self,
             Expr::ReadRegister { register, width } => Expr::ReadRegister {
                 register: Box::new(register.canonicalize()),
-                width: *width,
+                width: width,
             },
             Expr::ReadMemory { address, width } => Expr::ReadMemory {
                 address: Box::new(address.canonicalize()),
-                width: *width,
+                width: width,
             },
-            Expr::Add(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Add, lhs, rhs),
+            Expr::Add(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Add, *lhs, *rhs),
             Expr::Sub(lhs, rhs) => {
                 let lhs = lhs.canonicalize();
                 let rhs = rhs.canonicalize();
@@ -842,10 +1020,10 @@ impl Expr {
                     Expr::Sub(Box::new(lhs), Box::new(rhs))
                 }
             }
-            Expr::Mul(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, lhs, rhs),
-            Expr::And(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::And, lhs, rhs),
-            Expr::Or(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Or, lhs, rhs),
-            Expr::Xor(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Xor, lhs, rhs),
+            Expr::Mul(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, *lhs, *rhs),
+            Expr::And(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::And, *lhs, *rhs),
+            Expr::Or(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Or, *lhs, *rhs),
+            Expr::Xor(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Xor, *lhs, *rhs),
             Expr::Not(value) => {
                 let value = value.canonicalize();
                 match value {
@@ -854,16 +1032,16 @@ impl Expr {
                 }
             }
             Expr::ShiftLeft(value, amount) => {
-                Self::canonicalize_shift_like_op(value, amount, Expr::ShiftLeft)
+                Self::canonicalize_shift_like_op(*value, *amount, Expr::ShiftLeft)
             }
             Expr::LogicalShiftRight(value, amount) => {
-                Self::canonicalize_shift_like_op(value, amount, Expr::LogicalShiftRight)
+                Self::canonicalize_shift_like_op(*value, *amount, Expr::LogicalShiftRight)
             }
             Expr::ArithmeticShiftRight(value, amount) => {
-                Self::canonicalize_shift_like_op(value, amount, Expr::ArithmeticShiftRight)
+                Self::canonicalize_shift_like_op(*value, *amount, Expr::ArithmeticShiftRight)
             }
             Expr::RotateRight(value, amount) => {
-                Self::canonicalize_shift_like_op(value, amount, Expr::RotateRight)
+                Self::canonicalize_shift_like_op(*value, *amount, Expr::RotateRight)
             }
             Expr::Equal(lhs, rhs) => {
                 let lhs = lhs.canonicalize();
@@ -903,20 +1081,20 @@ impl Expr {
                 let out_width = high - low + 1;
                 Self::assert_valid_width(out_width);
                 if let Some(value_width) = value.expr_width() {
-                    if *high >= value_width {
+                    if high >= value_width {
                         panic!(
                             "Expr::Extract high index {high} is outside value width {value_width}"
                         );
                     }
-                    if *low == 0 && out_width == value_width {
+                    if low == 0 && out_width == value_width {
                         return value;
                     }
                 }
 
                 Expr::Extract {
                     value: Box::new(value),
-                    high: *high,
-                    low: *low,
+                    high: high,
+                    low: low,
                 }
             }
             Expr::Concat(values) => {
@@ -958,12 +1136,12 @@ impl Expr {
             Expr::ZeroExtend { value, to_width } => {
                 let value = value.canonicalize();
                 if let Some(value_width) = value.expr_width() {
-                    if value_width > *to_width {
+                    if value_width > to_width {
                         panic!(
                             "Zext to_width must be at least value width, but got width = {value_width} and to_width = {to_width}"
                         );
                     }
-                    if value_width == *to_width {
+                    if value_width == to_width {
                         return value;
                     }
                 }
@@ -971,23 +1149,23 @@ impl Expr {
                 match value {
                     Expr::ZeroExtend { value, .. } => Expr::ZeroExtend {
                         value,
-                        to_width: *to_width,
+                        to_width: to_width,
                     },
                     value => Expr::ZeroExtend {
                         value: Box::new(value),
-                        to_width: *to_width,
+                        to_width: to_width,
                     },
                 }
             }
             Expr::SignExtend { value, to_width } => {
                 let value = value.canonicalize();
                 if let Some(value_width) = value.expr_width() {
-                    if value_width > *to_width {
+                    if value_width > to_width {
                         panic!(
                             "Sign extend to_width must be at least value width, but got width = {value_width} and to_width = {to_width}"
                         );
                     }
-                    if value_width == *to_width {
+                    if value_width == to_width {
                         return value;
                     }
                 }
@@ -995,11 +1173,11 @@ impl Expr {
                 match value {
                     Expr::SignExtend { value, .. } => Expr::SignExtend {
                         value,
-                        to_width: *to_width,
+                        to_width: to_width,
                     },
                     value => Expr::SignExtend {
                         value: Box::new(value),
-                        to_width: *to_width,
+                        to_width: to_width,
                     },
                 }
             }
@@ -1009,25 +1187,25 @@ impl Expr {
                 rhs,
                 carry_in,
                 width,
-            } => Self::canonicalize_flag_expr(lhs, rhs, carry_in, *width, add_carry_out),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, add_carry_out),
             Expr::AddOverflow {
                 lhs,
                 rhs,
                 carry_in,
                 width,
-            } => Self::canonicalize_flag_expr(lhs, rhs, carry_in, *width, add_overflow),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, add_overflow),
             Expr::SubCarryOut {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(lhs, rhs, borrow_in, *width, sub_carry_out),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, sub_carry_out),
             Expr::SubOverflow {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(lhs, rhs, borrow_in, *width, sub_overflow),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, sub_overflow),
             Expr::Select {
                 condition,
                 when_true,
@@ -1054,8 +1232,8 @@ impl Expr {
 
     /// Evaluates all `Select` statements and `guard`s given the actual instruction, as well as substituting
     /// DerivedValues into the Expr
-    pub fn collapse(&self, instruction: &DecodedInstruction) -> Self {
-        let collapsed_expr = self.clone();
+    pub fn collapse(self, instruction: &DecodedInstruction) -> Self {
+        let collapsed_expr = self;
 
         let derived_values: HashMap<String, DerivedValue> = instruction
             .form
@@ -1092,7 +1270,7 @@ impl Expr {
                             .try_into()
                             .expect("Register address field must fit into u8"),
                     ),
-                    width: reg_ident
+                    identifier_width: reg_ident
                         .bits
                         .len()
                         .try_into()
@@ -1103,7 +1281,7 @@ impl Expr {
             Expr::DerivedValue(name) => derived_values
                 .get(name.0.as_str())
                 .unwrap_or_else(|| panic!("Derived value {} does not exist!", name.0))
-                .value
+                .value.clone()
                 .collapse(instruction),
             Expr::ReadRegister { register, width } => Expr::ReadRegister {
                 register: Box::new(register.collapse(instruction)),
@@ -1512,9 +1690,12 @@ pub enum OperandRef {
 pub enum RegisterRef {
     /// A fixed architectural or virtual register identifier.
     ///
-    /// `width` is the width of the register identifier expression, not
+    /// `identifier_width` is the width of the register identifier expression, not
     /// necessarily the width of the register's stored value.
-    Fixed { register: Register, width: u16 },
+    Fixed {
+        register: Register,
+        identifier_width: u16,
+    },
 
     /// A register identifier decoded from an instruction field.
     FromField(FieldName),
@@ -1625,10 +1806,13 @@ pub fn register_field(name: &str) -> Expr {
 }
 
 /// Produces an expression representing a fixed architectural or virtual register.
-pub fn fixed_register(register: Register, width: u16) -> Expr {
+///
+/// `identifier_width` is the bit width of the register identifier expression,
+/// not the width of the data stored in that register.
+pub fn fixed_register(register: Register, identifier_width: u16) -> Expr {
     Expr::Operand(OperandRef::RegisterField(RegisterRef::Fixed {
         register,
-        width,
+        identifier_width,
     }))
 }
 
@@ -1650,8 +1834,8 @@ pub fn read_register_field(name: &str, width: u16) -> Expr {
     read_register(register_field(name), width)
 }
 
-pub fn read_fixed_register(register: Register, width: u16) -> Expr {
-    read_register(fixed_register(register, width), width)
+pub fn read_fixed_register(register: Register, identifier_width: u16, data_width: u16) -> Expr {
+    read_register(fixed_register(register, identifier_width), data_width)
 }
 
 pub fn equal(lhs: Expr, rhs: Expr) -> Expr {
@@ -1951,7 +2135,10 @@ mod tests {
     fn expr_width_tracks_register_reads_and_unresolved_instruction_values() {
         let instruction = decoded_fixture_instruction();
 
-        assert_eq!(read_fixed_register(Register(1), 32).expr_width(), Some(32));
+        assert_eq!(
+            read_fixed_register(Register(1), 4, 32).expr_width(),
+            Some(32)
+        );
         assert_eq!(
             read_register(fixed_register(Register(1), 4), 32).expr_width(),
             Some(32)
@@ -2153,10 +2340,10 @@ mod tests {
         assert_eq!(
             add(
                 add(constant(250, 8), constant(10, 8)),
-                read_fixed_register(Register(3), 8)
+                read_fixed_register(Register(3), 8, 8)
             )
             .collapse(&instruction),
-            add(read_fixed_register(Register(3), 8), constant(4, 8))
+            add(read_fixed_register(Register(3), 8, 8), constant(4, 8))
         );
     }
 
@@ -2263,7 +2450,7 @@ mod tests {
         let instruction = empty_instruction();
 
         add(
-            add(read_fixed_register(Register(1), 8), constant(1, 8)),
+            add(read_fixed_register(Register(1), 8, 8), constant(1, 8)),
             constant(1, 16),
         )
         .collapse(&instruction);
@@ -2271,8 +2458,8 @@ mod tests {
 
     #[test]
     fn canonicalize_sorts_and_folds_associative_commutative_terms() {
-        let x = read_fixed_register(Register(1), 8);
-        let y = read_fixed_register(Register(2), 8);
+        let x = read_fixed_register(Register(1), 8, 8);
+        let y = read_fixed_register(Register(2), 8, 8);
 
         let expr_1 = add(y.clone(), add(constant(2, 8), x.clone())).canonicalize();
         let expr_2 = add(add(x.clone(), y.clone()), constant(2, 8)).canonicalize();
@@ -2282,10 +2469,10 @@ mod tests {
         assert_eq!(
             add(
                 add(constant(250, 8), constant(10, 8)),
-                read_fixed_register(Register(3), 8)
+                read_fixed_register(Register(3), 8, 8)
             )
             .canonicalize(),
-            add(read_fixed_register(Register(3), 8), constant(4, 8))
+            add(read_fixed_register(Register(3), 8, 8), constant(4, 8))
         );
     }
 
@@ -2334,7 +2521,7 @@ mod tests {
 
     #[test]
     fn canonicalize_cancels_known_width_register_xor() {
-        let x = read_fixed_register(Register(1), 4);
+        let x = read_fixed_register(Register(1), 4, 4);
 
         assert_eq!(
             xor_expr(x.clone(), x.clone()).canonicalize(),
@@ -2344,7 +2531,7 @@ mod tests {
 
     #[test]
     fn canonicalize_identities_annihilators_and_local_rules() {
-        let x = read_fixed_register(Register(1), 8);
+        let x = read_fixed_register(Register(1), 8, 8);
 
         assert_eq!(add(x.clone(), constant(0, 8)).canonicalize(), x.clone());
         assert_eq!(mul(x.clone(), constant(1, 8)).canonicalize(), x.clone());
@@ -2375,8 +2562,8 @@ mod tests {
 
     #[test]
     fn canonicalize_comparisons_and_selects() {
-        let x = read_fixed_register(Register(1), 4);
-        let y = read_fixed_register(Register(2), 4);
+        let x = read_fixed_register(Register(1), 4, 4);
+        let y = read_fixed_register(Register(2), 4, 4);
 
         assert_eq!(
             equal(y.clone(), x.clone()).canonicalize(),
@@ -2396,7 +2583,7 @@ mod tests {
             x.clone()
         );
         assert_eq!(
-            select(read_fixed_register(Register(3), 4), x.clone(), x.clone()).canonicalize(),
+            select(read_fixed_register(Register(3), 4, 4), x.clone(), x.clone()).canonicalize(),
             x
         );
     }
@@ -2414,14 +2601,14 @@ mod tests {
         assert_eq!(
             concat([
                 constant(0xa, 4),
-                read_fixed_register(Register(1), 4),
+                read_fixed_register(Register(1), 4, 4),
                 constant(0x3, 2),
                 constant(0x2, 2),
             ])
             .canonicalize(),
             concat([
                 constant(0xa, 4),
-                read_fixed_register(Register(1), 4),
+                read_fixed_register(Register(1), 4, 4),
                 constant(0xe, 4),
             ])
         );
@@ -2441,7 +2628,7 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_through_effect_helper_expressions() {
-        let x = read_fixed_register(Register(1), 8);
+        let x = read_fixed_register(Register(1), 8, 8);
 
         assert_eq!(
             add_carry_out(

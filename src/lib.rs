@@ -5,8 +5,10 @@ pub mod bit;
 pub mod instruction_semantics;
 pub mod isa_specification;
 pub mod parser;
+pub mod semantic_matching;
 pub mod simulator;
 pub mod stdcell_library;
+pub mod superoptimization;
 
 /// Configuration for the whole program
 #[derive(Debug, Clone, PartialEq, Eq)]
