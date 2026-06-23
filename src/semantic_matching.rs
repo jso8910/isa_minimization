@@ -11,6 +11,38 @@ use crate::{
     isa_specification::{DecodedInstruction, Instruction},
 };
 
+pub type InstructionIdx = u32;
+
+/// A table of all state uses
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateUseTable {
+    /// Vector of tuples, saying which index the update is at and 
+    updates: Vec<(InstructionIdx, StateUse)>
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateUse {
+    Write(StateDestination),
+    Read(StateDestination)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateDestination {
+    /// Register with identifier - `u8`
+    Register(u8),
+    /// Memory byte at address - `usize`
+    MemoryByte(u32)
+}
+
+// impl StateUseTable {
+//     pub fn from_program(program: &Vec<DecodedInstruction>, isa: &Vec<Instruction>) -> Self {
+//         for instruction in program.iter() {
+//             let lowered_effects = instruction_to_lowered_effects(instruction, isa, &vec![]);
+//         }
+//         StateUseTable { updates: () }
+//     }
+// }
+
 /// Given some sequence of instructions, create a list of all Effects of the sequence in terms of the initial state
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
@@ -20,71 +52,7 @@ pub fn instruction_seq_to_effects(
 ) -> Vec<Effect> {
     let mut seq_effects = vec![];
     for instruction in instructions.iter() {
-        let mut instruction_effects = None;
-        let instruction_name = instruction
-            .name
-            .as_ref()
-            .expect("Instruction should have a name");
-        for isa_instruction in isa.iter() {
-            if &isa_instruction.name == instruction_name {
-                instruction_effects = Some(isa_instruction.effects.clone());
-            }
-        }
-        // Now we want to collapse any effect wherever possible
-        let instruction_effects = instruction_effects
-            .unwrap_or_else(|| panic!("Instruction in sequence should match with at least one instruction in ISA, but {} did not match!", instruction_name));
-        let mut lowered_effects = Vec::with_capacity(instruction_effects.len());
-        for effect in instruction_effects {
-            match effect {
-                Effect::WriteMemory {
-                    guard,
-                    address,
-                    value,
-                    width,
-                } => {
-                    let guard = collapse_lower_substitute(guard, instruction, &seq_effects);
-                    let address = collapse_lower_substitute(address, instruction, &seq_effects);
-                    let value = collapse_lower_substitute(value, instruction, &seq_effects);
-                    if width == 8 {
-                        lowered_effects.push(Effect::WriteMemory {
-                            guard,
-                            address,
-                            value,
-                            width,
-                        });
-                    } else {
-                        assert_eq!(width % 8, 0, "Memory write width must be byte-aligned");
-                        let address_width = address
-                            .expr_width()
-                            .expect("Memory address should have established width");
-                        for byte_index in 0..(width / 8) {
-                            let byte_address = if byte_index == 0 {
-                                address.clone()
-                            } else {
-                                add(address.clone(), constant(byte_index as u128, address_width))
-                            };
-                            let low = byte_index * 8;
-                            lowered_effects.push(Effect::WriteMemory {
-                                guard: guard.clone(),
-                                address: byte_address,
-                                value: extract(value.clone(), low + 7, low),
-                                width: 8,
-                            });
-                        }
-                    }
-                }
-                Effect::WriteRegister {
-                    guard,
-                    register,
-                    value,
-                } => {
-                    let guard = collapse_lower_substitute(guard, instruction, &seq_effects);
-                    let register = collapse_lower_substitute(register, instruction, &seq_effects);
-                    let value = collapse_lower_substitute(value, instruction, &seq_effects);
-                    lowered_effects.push(Effect::WriteRegister { guard, register, value });
-                }
-            }
-        }
+        let lowered_effects = instruction_to_lowered_effects(instruction, isa, &seq_effects);
 
         // We want to combine the effects of this instruction with the existing effects in seq_effects
         // The variable name effect_2 refers to the fact that it takes place after the effect_1s that we are comparing it to
@@ -112,6 +80,76 @@ pub fn instruction_seq_to_effects(
         }
     }
     seq_effects
+}
+
+pub fn instruction_to_lowered_effects(instruction: &DecodedInstruction, isa: &Vec<Instruction>, previous_effects: &Vec<Effect>) -> Vec<Effect> {
+let mut instruction_effects = None;
+    let instruction_name = instruction
+        .name
+        .as_ref()
+        .expect("Instruction should have a name");
+    for isa_instruction in isa.iter() {
+        if &isa_instruction.name == instruction_name {
+            instruction_effects = Some(isa_instruction.effects.clone());
+        }
+    }
+    // Now we want to collapse any effect wherever possible
+    let instruction_effects = instruction_effects
+        .unwrap_or_else(|| panic!("Instruction in sequence should match with an instruction in the ISA, but {} did not match!", instruction_name));
+    let mut lowered_effects = Vec::with_capacity(instruction_effects.len());
+    for effect in instruction_effects {
+        match effect {
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } => {
+                let guard = collapse_lower_substitute(guard, instruction, previous_effects);
+                let address = collapse_lower_substitute(address, instruction, previous_effects);
+                let value = collapse_lower_substitute(value, instruction, previous_effects);
+                if width == 8 {
+                    lowered_effects.push(Effect::WriteMemory {
+                        guard,
+                        address,
+                        value,
+                        width,
+                    });
+                } else {
+                    assert_eq!(width % 8, 0, "Memory write width must be byte-aligned");
+                    let address_width = address
+                        .expr_width()
+                        .expect("Memory address should have established width");
+                    for byte_index in 0..(width / 8) {
+                        let byte_address = if byte_index == 0 {
+                            address.clone()
+                        } else {
+                            add(address.clone(), constant(byte_index as u128, address_width))
+                        };
+                        let low = byte_index * 8;
+                        lowered_effects.push(Effect::WriteMemory {
+                            guard: guard.clone(),
+                            address: byte_address,
+                            value: extract(value.clone(), low + 7, low),
+                            width: 8,
+                        });
+                    }
+                }
+            }
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } => {
+                let guard = collapse_lower_substitute(guard, instruction, previous_effects);
+                let register = collapse_lower_substitute(register, instruction, previous_effects);
+                let value = collapse_lower_substitute(value, instruction, previous_effects);
+                lowered_effects.push(Effect::WriteRegister { guard, register, value });
+            }
+        }
+    }
+
+    lowered_effects
 }
 
 fn collapse_lower_substitute(

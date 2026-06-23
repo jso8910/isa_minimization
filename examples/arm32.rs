@@ -1732,13 +1732,14 @@ fn write_optimized_verilog(
 }
 
 fn main() {
+    let program_binary_path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: cargo run --example arm32 -- <program.bin>");
+        std::process::exit(2);
+    });
     let arm32 = instructions();
 
-    // Get all the instructions from the binsearch.bin program
-    let program_binary_path = "examples/binsearch.bin".to_string();
-
-    let mut decoded_program: Vec<DecodedInstruction> =
-        DecodedInstruction::decode_program("examples/binsearch.bin", &arm32).unwrap();
+    let decoded_program: Vec<DecodedInstruction> =
+        DecodedInstruction::decode_program(&program_binary_path, &arm32).unwrap();
 
     // Create hashmap of FieldUses
     let mut field_values: HashMap<FieldName, FieldUses> = std::collections::HashMap::new();
@@ -1925,7 +1926,7 @@ fn main() {
         optimization.assignments.len(),
         OPTIMIZED_NETLIST_PATH
     );
-    println!("{:#?}", dproc());
+    // println!("{:#?}", dproc());
 
     // Program: add r0, r0, r1; mov r1, r0
     let program = DecodedInstruction::decode_program_str(
@@ -1934,8 +1935,14 @@ fn main() {
     )
     .unwrap();
     let effects = instruction_seq_to_effects(&program, &arm32);
-    println!("\n\n\n\n\n\n\n");
-    for effect in &effects {
-        println!("{:#?}", effect);
-    }
+    // println!("\n\n\n\n\n\n\n");
+    // for effect in &effects {
+    //     println!("{:#?}", effect);
+    // }
+
+    // program2: add r1, r0, r1
+    let program2 = DecodedInstruction::decode_program_str("11100000100000000001000000000001", &arm32).unwrap();
+    let effects2 = instruction_seq_to_effects(&program2, &arm32);
+    // effects[1] should be the write to r1 (mov r1, r0) and effects2[0] should be add r1, r0, r1. so these should be semantically equivalent in their contexts
+    assert_eq!(effects[1], effects2[0]);
 }
