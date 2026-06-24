@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::time::Instant;
 
 use isa_minimization::bit::{Bit, BitPattern};
 use isa_minimization::instruction_semantics::{
@@ -1732,10 +1733,12 @@ fn write_optimized_verilog(
 }
 
 fn main() {
-    let program_binary_path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: cargo run --example arm32 -- <program.bin>");
+    let mut args = std::env::args().skip(1);
+    let program_binary_path = args.next().unwrap_or_else(|| {
+        eprintln!("Usage: cargo run --example arm32 -- <program.bin> [--validate]");
         std::process::exit(2);
     });
+    let validate_optimization = args.any(|arg| arg == "--validate");
     let arm32 = instructions();
 
     let decoded_program: Vec<DecodedInstruction> =
@@ -1901,10 +1904,12 @@ fn main() {
     let simulator = Simulator::from_file(NETLIST_PATH, STDCELL_PATH);
     let compiled_sim_inputs = simulator.compile_optimization_inputs(&sim_inputs);
     let mut optimization_workspace = simulator.optimization_workspace();
+    let optimization_started = Instant::now();
     let optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
         &compiled_sim_inputs,
         &mut optimization_workspace,
     );
+    let optimization_elapsed = optimization_started.elapsed();
 
     let gates_to_comment: HashSet<String> = optimization.gates_to_comment.iter().cloned().collect();
 
@@ -1926,6 +1931,25 @@ fn main() {
         optimization.assignments.len(),
         OPTIMIZED_NETLIST_PATH
     );
+    println!(
+        "Optimization without validation took {:.3?}",
+        optimization_elapsed
+    );
+    if validate_optimization {
+        let validation = simulator.validate_compiled_gate_usage_optimization_with_workspace(
+            &compiled_sim_inputs,
+            &optimization,
+            &mut optimization_workspace,
+        );
+        println!(
+            "Validated {} input patterns with {} effective-output comparisons, {} replacement-output proofs, and {} gate evaluations in {:.3?}",
+            validation.input_patterns_checked,
+            validation.effective_outputs_checked,
+            validation.replacement_outputs_checked,
+            validation.gate_evaluations,
+            validation.elapsed,
+        );
+    }
     // println!("{:#?}", dproc());
 
     // Program: add r0, r0, r1; mov r1, r0

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    time::{Duration, Instant},
 };
 
 use petgraph::{
@@ -70,6 +71,15 @@ pub struct GateUsageOptimization {
     pub arbitrary_gates: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizationValidation {
+    pub input_patterns_checked: usize,
+    pub effective_outputs_checked: usize,
+    pub replacement_outputs_checked: usize,
+    pub gate_evaluations: usize,
+    pub elapsed: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledOptimizationInputs {
     // Each optimization input pattern after translating net names to dense wire ids. This avoids
@@ -83,23 +93,6 @@ pub struct OptimizationWorkspace {
     // patterns, but the allocation is kept.
     wires: Vec<Option<Bit>>,
 
-    // Marks wires that are currently needed by the reverse sensitivity walk. Instead of clearing a
-    // Vec<bool> for every input pattern, each marked wire stores `current_generation`. A wire is
-    // currently needed iff needed_generation[wire_id] == current_generation.
-    needed_generation: Vec<u32>,
-
-    // Monotonic marker id for `needed_generation`. Incrementing this logically clears the whole
-    // needed set in O(1). If it wraps, we physically clear the vector and restart at 1.
-    current_generation: u32,
-
-    // Reused scratch vector holding the input values for the gate currently being sensitivity
-    // checked.
-    input_values: Vec<Bit>,
-
-    // Accumulated across all input patterns. gates_impact_output[i] is true if gate i affects an
-    // effective output for at least one input pattern.
-    gates_impact_output: Vec<bool>,
-
     // For each gate output, the concrete value seen so far if that output is still possibly
     // static. `None` means either no pattern has been processed yet for that output, or the shape
     // has just been reset.
@@ -108,45 +101,17 @@ pub struct OptimizationWorkspace {
     // For each gate output, true until we observe either Bit::Var/Bit::Test or a concrete value
     // different from `static_output_values`.
     output_is_static: Vec<Vec<bool>>,
-
-    // For each gate output, whether that output was needed by the reverse sensitivity walk for at
-    // least one input pattern. Outputs that are never needed can be assigned arbitrary constants.
-    output_was_needed: Vec<Vec<bool>>,
-
-    // Like `static_output_values`, but only across patterns where the output was observable. This
-    // lets us replace gates whose output may vary globally but is constant whenever downstream
-    // logic can actually see it.
-    needed_static_output_values: Vec<Vec<Option<Bit>>>,
-
-    // Like `output_is_static`, but only invalidated by patterns where the output was observable.
-    needed_output_is_static: Vec<Vec<bool>>,
 }
 
 impl OptimizationWorkspace {
     fn new(wire_count: usize, gates: &[CompiledGate]) -> Self {
         Self {
             wires: vec![None; wire_count],
-            needed_generation: vec![0; wire_count],
-            current_generation: 0,
-            input_values: Vec::new(),
-            gates_impact_output: vec![false; gates.len()],
             static_output_values: gates
                 .iter()
                 .map(|gate| vec![None; gate.outputs.len()])
                 .collect(),
             output_is_static: gates
-                .iter()
-                .map(|gate| vec![true; gate.outputs.len()])
-                .collect(),
-            output_was_needed: gates
-                .iter()
-                .map(|gate| vec![false; gate.outputs.len()])
-                .collect(),
-            needed_static_output_values: gates
-                .iter()
-                .map(|gate| vec![None; gate.outputs.len()])
-                .collect(),
-            needed_output_is_static: gates
                 .iter()
                 .map(|gate| vec![true; gate.outputs.len()])
                 .collect(),
@@ -158,16 +123,8 @@ impl OptimizationWorkspace {
         // be accumulated over the whole input-pattern set while retaining allocations.
         self.reset_wires(wire_count);
 
-        self.needed_generation.resize(wire_count, 0);
-
-        self.gates_impact_output.clear();
-        self.gates_impact_output.resize(gates.len(), false);
-
         resize_gate_output_bits(&mut self.static_output_values, gates, None);
         resize_gate_output_bits(&mut self.output_is_static, gates, true);
-        resize_gate_output_bits(&mut self.output_was_needed, gates, false);
-        resize_gate_output_bits(&mut self.needed_static_output_values, gates, None);
-        resize_gate_output_bits(&mut self.needed_output_is_static, gates, true);
     }
 
     fn reset_wires(&mut self, wire_count: usize) {
@@ -175,17 +132,6 @@ impl OptimizationWorkspace {
         // preserved across simulations.
         self.wires.clear();
         self.wires.resize(wire_count, None);
-    }
-
-    fn next_needed_generation(&mut self) {
-        // Called for each input pattern before the reverse walk. Advancing the generation makes all
-        // previous needed-wire markings invisible without clearing the vector.
-        self.current_generation = self.current_generation.wrapping_add(1);
-
-        if self.current_generation == 0 {
-            self.needed_generation.fill(0);
-            self.current_generation = 1;
-        }
     }
 }
 
@@ -254,19 +200,20 @@ impl Simulator {
         OptimizationWorkspace::new(self.wire_names.len(), &self.compiled_gates)
     }
 
-    /// Computes, for a given set of valid inputs to the module, which gates are necessary to
-    /// produce all effective outputs. Effective outputs include both module-level outputs and
-    /// inputs to sequential gates, since sequential inputs carry information into future cycles.
+    /// Replaces gates whose every output is globally constant over the supplied abstract input
+    /// patterns. Effective outputs include both module-level outputs and inputs to sequential
+    /// gates, since sequential inputs carry information into future cycles.
     ///
-    /// This uses a reverse sensitivity pass. For each input pattern, we first simulate the whole
-    /// circuit once. Then we walk gates backward from the effective outputs, marking each gate that
-    /// drives a needed wire and recursively marking only the input wires that can affect those
-    /// needed outputs.
+    /// `Bit::Var` inputs conservatively stand for both Boolean values. Therefore a concrete
+    /// low/high result proves that output has the same value for every represented concrete input.
+    /// Gates that are merely unobservable or constant only while observable are retained because
+    /// independently valid don't-care substitutions need not remain valid when applied together.
+    ///
     /// # Arguments
     /// * `bit_inputs` - A list of inputs to the module to test
     ///
     /// # Returns
-    /// * `Vec<String>` - A list of all the instance names in the module which aren't redundant for this set of inputs (ie which affect the output)
+    /// * `Vec<String>` - A list of all retained combinational gate instance names
     pub fn optimize_gate_usage(&self, bit_inputs: &Vec<HashMap<String, Bit>>) -> Vec<String> {
         self.optimize_gate_usage_details(bit_inputs).used_gates
     }
@@ -314,15 +261,13 @@ impl Simulator {
         bit_inputs: &CompiledOptimizationInputs,
         workspace: &mut OptimizationWorkspace,
     ) -> GateUsageOptimization {
-        // Clear all state that is accumulated over an entire optimization run: used gates,
-        // static-output tracking, and the current pattern's wire values. The vectors keep their
-        // allocations so repeated runs stay cheap.
+        // Clear all state accumulated over an optimization run. The vectors keep their allocations
+        // so repeated runs stay cheap.
         workspace.reset_for(self.wire_names.len(), &self.compiled_gates);
 
         for bit_input in &bit_inputs.inputs {
-            // Each input pattern needs a fresh simulated wire state. Other workspace fields, such
-            // as gates_impact_output and static-output tracking, intentionally persist across all
-            // patterns in this optimization run.
+            // Each input pattern needs a fresh simulated wire state. Static-output tracking
+            // intentionally persists across every pattern in this optimization run.
             workspace.reset_wires(self.wire_names.len());
             self.apply_primary_wire_inputs(bit_input, &mut workspace.wires);
             self.apply_sequential_outputs(&mut workspace.wires);
@@ -366,95 +311,14 @@ impl Simulator {
                     }
                 }
             }
-
-            // Start from the effective outputs. As we walk backward, this set grows to include
-            // upstream wires whose values can influence those outputs for this input pattern.
-            //
-            // `needed_generation` is the per-pattern needed set. Advancing the generation is the
-            // equivalent of clearing that set, but avoids touching every wire for every pattern.
-            workspace.next_needed_generation();
-            for &wire_id in &self.top_mod_output_wire_ids {
-                self.mark_wire_and_aliases_needed(wire_id, workspace);
-            }
-
-            // Traverse netlist in reverse topological order
-            for gate_idx in (0..self.compiled_gates.len()).rev() {
-                let gate = &self.compiled_gates[gate_idx];
-
-                // If none of this gate's outputs feed a currently-needed wire, this gate cannot
-                // affect any effective output discovered so far.
-                // Since we are going in reverse order, all outputs which come downstream of this gate
-                // should have already been discovered
-                let gate_output_needed = gate
-                    .output_alias_wires
-                    .iter()
-                    .any(|&wire_id| self.wire_is_needed(wire_id, workspace));
-
-                if !gate_output_needed {
-                    continue;
-                }
-
-                workspace.gates_impact_output[gate_idx] = true;
-
-                // Reconstruct this gate's simulated input vector from the full-circuit simulation.
-                // We use these concrete/symbolic values for local sensitivity checks below.
-                // The vector allocation is reused for every gate.
-                workspace.input_values.clear();
-                for input in &gate.inputs {
-                    let value = read_sim_input(&workspace.wires, input)
-                        .unwrap_or_else(|| panic!("No simulated value for input {:?}", input));
-
-                    workspace.input_values.push(value);
-                }
-
-                for input_idx in 0..gate.inputs.len() {
-                    let SimInput::Wire(wire_id) = gate.inputs[input_idx] else {
-                        continue;
-                    };
-
-                    if self.wire_or_alias_is_needed(wire_id, workspace) {
-                        continue;
-                    }
-
-                    // Locally perturb one gate input to Bit::Test. If any needed output of this
-                    // gate becomes Bit::Test, that input wire is necessary and must be followed
-                    // farther backward.
-                    let old_value =
-                        std::mem::replace(&mut workspace.input_values[input_idx], Bit::Test);
-
-                    let is_sensitive = gate.outputs.iter().any(|output| {
-                        output
-                            .alias_wires
-                            .iter()
-                            .any(|&wire_id| self.wire_is_needed(wire_id, workspace))
-                            && output.function.evaluate(&workspace.input_values) == Bit::Test
-                    });
-
-                    workspace.input_values[input_idx] = old_value;
-
-                    if is_sensitive {
-                        self.mark_wire_and_aliases_needed(wire_id, workspace);
-                    }
-                }
-            }
-
-            // Now that the reverse pass has converged for this pattern, the needed set precisely
-            // describes which gate outputs are observable by effective outputs. Track constants
-            // over only those observable patterns; values on unneeded patterns can be ignored
-            // because downstream logic cannot see them for this input.
-            self.track_observable_static_outputs(workspace);
-            // self.export_wires(&wires);
         }
 
         let mut gates_to_comment = Vec::new();
         let mut assignments = Vec::new();
         let mut static_gates = Vec::new();
-        let mut observably_static_gates = Vec::new();
-        let mut arbitrary_gates = Vec::new();
         let mut used_gates = Vec::new();
 
         for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
-            let gate_is_used = workspace.gates_impact_output[gate_idx];
             let static_values: Option<Vec<Bit>> = gate
                 .outputs
                 .iter()
@@ -466,34 +330,7 @@ impl Simulator {
                 })
                 .collect();
 
-            let output_was_needed = &workspace.output_was_needed[gate_idx];
-            let no_outputs_needed = output_was_needed.iter().all(|&needed| !needed);
-            let needed_static_values: Option<Vec<Bit>> = gate
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(output_idx, _)| {
-                    if output_was_needed[output_idx] {
-                        workspace.needed_output_is_static[gate_idx][output_idx]
-                            .then_some(workspace.needed_static_output_values[gate_idx][output_idx])
-                            .flatten()
-                    } else {
-                        Some(Bit::Low)
-                    }
-                })
-                .collect();
-
-            if no_outputs_needed {
-                arbitrary_gates.push(gate.instance_name.clone());
-                gates_to_comment.push(gate.instance_name.clone());
-
-                for output in &gate.outputs {
-                    assignments.push(GateOutputAssignment {
-                        wire_name: output.wire_name.clone(),
-                        value: Bit::Low,
-                    });
-                }
-            } else if let Some(values) = static_values {
+            if let Some(values) = static_values {
                 static_gates.push(gate.instance_name.clone());
                 gates_to_comment.push(gate.instance_name.clone());
 
@@ -503,68 +340,231 @@ impl Simulator {
                         value,
                     });
                 }
-            } else if let Some(values) = needed_static_values {
-                observably_static_gates.push(gate.instance_name.clone());
-                gates_to_comment.push(gate.instance_name.clone());
-
-                for (output, value) in gate.outputs.iter().zip(values) {
-                    assignments.push(GateOutputAssignment {
-                        wire_name: output.wire_name.clone(),
-                        value,
-                    });
-                }
-            } else if gate_is_used {
+            } else {
                 used_gates.push(gate.instance_name.clone());
             }
         }
 
+        // Arbitrary and observably-static substitutions are intentionally not emitted. Their
+        // classifications are properties of the original circuit only: applying several such
+        // substitutions simultaneously can invalidate the don't-care assumptions used to justify
+        // each one. Globally static outputs do not have that compatibility problem because every
+        // replacement equals the original signal for every represented concrete input.
         GateUsageOptimization {
             used_gates,
             gates_to_comment,
             assignments,
             static_gates,
-            observably_static_gates,
-            arbitrary_gates,
+            observably_static_gates: Vec::new(),
+            arbitrary_gates: Vec::new(),
         }
     }
 
-    fn track_observable_static_outputs(&self, workspace: &mut OptimizationWorkspace) {
-        for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
-            for (output_idx, output) in gate.outputs.iter().enumerate() {
-                let output_needed = output
-                    .alias_wires
-                    .iter()
-                    .any(|&wire_id| self.wire_is_needed(wire_id, workspace));
+    /// Validates an optimization returned by `optimize_compiled_gate_usage_details_with_workspace`.
+    ///
+    /// This is intentionally separate from optimization so callers that do not need the additional
+    /// full-circuit simulations pay no validation cost.
+    pub fn validate_compiled_gate_usage_optimization_with_workspace(
+        &self,
+        bit_inputs: &CompiledOptimizationInputs,
+        optimization: &GateUsageOptimization,
+        workspace: &mut OptimizationWorkspace,
+    ) -> OptimizationValidation {
+        let validation_started = Instant::now();
+        let replacement_values = self.compile_optimization_replacements(optimization);
 
-                if !output_needed {
+        let mut effective_outputs_checked = 0;
+        let mut replacement_outputs_checked = 0;
+        let mut gate_evaluations = 0;
+        let mut optimized_wires = vec![None; self.wire_names.len()];
+
+        for (pattern_idx, bit_input) in bit_inputs.inputs.iter().enumerate() {
+            workspace.reset_wires(self.wire_names.len());
+            optimized_wires.fill(None);
+
+            self.apply_primary_wire_inputs(bit_input, &mut workspace.wires);
+            self.apply_sequential_outputs(&mut workspace.wires);
+            self.apply_constant_assigns(&mut workspace.wires);
+
+            self.apply_primary_wire_inputs(bit_input, &mut optimized_wires);
+            self.apply_sequential_outputs(&mut optimized_wires);
+            self.apply_constant_assigns(&mut optimized_wires);
+
+            self.simulate_compiled_gates_range(&mut workspace.wires, 0, self.compiled_gates.len());
+            gate_evaluations += self.compiled_gates.len();
+
+            gate_evaluations += self.simulate_compiled_gates_with_replacements(
+                &mut optimized_wires,
+                &replacement_values,
+            );
+
+            for (gate_idx, values) in replacement_values.iter().enumerate() {
+                let Some(values) = values else {
                     continue;
-                }
+                };
+                let gate = &self.compiled_gates[gate_idx];
+                assert_eq!(values.len(), gate.outputs.len());
 
-                workspace.output_was_needed[gate_idx][output_idx] = true;
+                for (output, &replacement) in gate.outputs.iter().zip(values) {
+                    assert!(
+                        matches!(replacement, Bit::Low | Bit::High),
+                        "replacement for {}.{} is not a constant",
+                        gate.instance_name,
+                        output.wire_name,
+                    );
 
-                if !workspace.needed_output_is_static[gate_idx][output_idx] {
-                    continue;
-                }
-
-                let wire_id = output.alias_wires[0];
-                let value = workspace.wires[wire_id].unwrap();
-
-                if !matches!(value, Bit::Low | Bit::High) {
-                    workspace.needed_output_is_static[gate_idx][output_idx] = false;
-                    continue;
-                }
-
-                match workspace.needed_static_output_values[gate_idx][output_idx] {
-                    Some(prev) if prev != value => {
-                        workspace.needed_output_is_static[gate_idx][output_idx] = false;
-                    }
-                    Some(_) => {}
-                    None => {
-                        workspace.needed_static_output_values[gate_idx][output_idx] = Some(value);
-                    }
+                    let original = workspace.wires[output.alias_wires[0]]
+                        .expect("replaced gate output was not simulated");
+                    assert_eq!(
+                        original, replacement,
+                        "post-optimization validation rejected {}.{} for input pattern {}",
+                        gate.instance_name, output.wire_name, pattern_idx,
+                    );
+                    replacement_outputs_checked += 1;
                 }
             }
+
+            for &wire_id in &self.top_mod_output_wire_ids {
+                let original =
+                    workspace.wires[wire_id].expect("effective output was not simulated");
+                let optimized =
+                    optimized_wires[wire_id].expect("optimized effective output was not simulated");
+                assert_eq!(
+                    original, optimized,
+                    "post-optimization validation changed effective output {} for input pattern {}",
+                    self.wire_names[wire_id], pattern_idx,
+                );
+                effective_outputs_checked += 1;
+            }
         }
+
+        OptimizationValidation {
+            input_patterns_checked: bit_inputs.inputs.len(),
+            effective_outputs_checked,
+            replacement_outputs_checked,
+            gate_evaluations,
+            elapsed: validation_started.elapsed(),
+        }
+    }
+
+    pub fn validate_gate_usage_optimization(
+        &self,
+        bit_inputs: &Vec<HashMap<String, Bit>>,
+        optimization: &GateUsageOptimization,
+    ) -> OptimizationValidation {
+        let compiled_bit_inputs = self.compile_optimization_inputs(bit_inputs);
+        let mut workspace = self.optimization_workspace();
+        self.validate_compiled_gate_usage_optimization_with_workspace(
+            &compiled_bit_inputs,
+            optimization,
+            &mut workspace,
+        )
+    }
+
+    fn compile_optimization_replacements(
+        &self,
+        optimization: &GateUsageOptimization,
+    ) -> Vec<Option<Vec<Bit>>> {
+        let assignments: HashMap<&str, Bit> = optimization
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.wire_name.as_str(), assignment.value))
+            .collect();
+        assert_eq!(
+            assignments.len(),
+            optimization.assignments.len(),
+            "optimization contains duplicate output assignments",
+        );
+        let gates_to_comment: HashSet<&str> = optimization
+            .gates_to_comment
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let replacement_values: Vec<Option<Vec<Bit>>> = self
+            .compiled_gates
+            .iter()
+            .map(|gate| {
+                if !gates_to_comment.contains(gate.instance_name.as_str()) {
+                    return None;
+                }
+
+                Some(
+                    gate.outputs
+                        .iter()
+                        .map(|output| {
+                            *assignments.get(output.wire_name.as_str()).unwrap_or_else(|| {
+                                panic!(
+                                    "commented gate {} has no replacement for output {}",
+                                    gate.instance_name, output.wire_name,
+                                )
+                            })
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let replacement_gate_count = replacement_values
+            .iter()
+            .filter(|values| values.is_some())
+            .count();
+        let replacement_output_count = replacement_values
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .sum::<usize>();
+
+        assert_eq!(
+            replacement_gate_count,
+            gates_to_comment.len(),
+            "optimization references an unknown gate",
+        );
+        assert_eq!(
+            replacement_output_count,
+            assignments.len(),
+            "optimization contains an assignment that does not replace a commented gate output",
+        );
+
+        replacement_values
+    }
+
+    fn simulate_compiled_gates_with_replacements(
+        &self,
+        wires: &mut [Option<Bit>],
+        replacement_values: &[Option<Vec<Bit>>],
+    ) -> usize {
+        let mut input_values = Vec::new();
+        let mut gate_evaluations = 0;
+
+        for (gate_idx, gate) in self.compiled_gates.iter().enumerate() {
+            if let Some(values) = &replacement_values[gate_idx] {
+                assert_eq!(values.len(), gate.outputs.len());
+
+                for (output, &value) in gate.outputs.iter().zip(values) {
+                    for &wire_id in &output.alias_wires {
+                        wires[wire_id] = Some(value);
+                    }
+                }
+                continue;
+            }
+
+            input_values.clear();
+            for input in &gate.inputs {
+                let value = read_sim_input(wires, input)
+                    .unwrap_or_else(|| panic!("No simulated value for input {:?}", input));
+                input_values.push(value);
+            }
+
+            for output in &gate.outputs {
+                let value = output.function.evaluate(&input_values);
+                for &wire_id in &output.alias_wires {
+                    wires[wire_id] = Some(value);
+                }
+            }
+            gate_evaluations += 1;
+        }
+
+        gate_evaluations
     }
 
     /// Simulates the module from a certain `start_idx` in `compiled_gates` to an `end_idx` (exclusive)
@@ -756,31 +756,6 @@ impl Simulator {
 
         for &alias_id in &self.alias_wire_ids[wire_id] {
             wires_nonarbitrary.insert(alias_id);
-        }
-    }
-
-    fn wire_is_needed(&self, wire_id: WireId, workspace: &OptimizationWorkspace) -> bool {
-        // Membership test for the current reverse-walk needed set. Old pattern markings have a
-        // different generation number and therefore read as false.
-        workspace.needed_generation[wire_id] == workspace.current_generation
-    }
-
-    fn wire_or_alias_is_needed(&self, wire_id: WireId, workspace: &OptimizationWorkspace) -> bool {
-        // Aliased wires represent the same Verilog signal through continuous assigns, so any alias
-        // being needed means this wire must also be treated as needed.
-        self.wire_is_needed(wire_id, workspace)
-            || self.alias_wire_ids[wire_id]
-                .iter()
-                .any(|&alias_id| self.wire_is_needed(alias_id, workspace))
-    }
-
-    fn mark_wire_and_aliases_needed(&self, wire_id: WireId, workspace: &mut OptimizationWorkspace) {
-        // Mark by writing the current generation instead of inserting into a HashSet. This keeps
-        // the inner reverse pass dense and lets `next_needed_generation` clear the set in O(1).
-        workspace.needed_generation[wire_id] = workspace.current_generation;
-
-        for &alias_id in &self.alias_wire_ids[wire_id] {
-            workspace.needed_generation[alias_id] = workspace.current_generation;
         }
     }
 
@@ -1301,6 +1276,38 @@ mod tests {
         simulator.optimize_gate_usage_details(&bit_inputs)
     }
 
+    fn optimize_and_validate_test_netlist(
+        verilog: &str,
+        bit_inputs: Vec<HashMap<String, Bit>>,
+    ) -> (GateUsageOptimization, OptimizationValidation) {
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+        let compiled_inputs = simulator.compile_optimization_inputs(&bit_inputs);
+        let mut workspace = simulator.optimization_workspace();
+        let optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
+            &compiled_inputs,
+            &mut workspace,
+        );
+        let validation = simulator.validate_compiled_gate_usage_optimization_with_workspace(
+            &compiled_inputs,
+            &optimization,
+            &mut workspace,
+        );
+
+        (optimization, validation)
+    }
+
+    fn simulate_test_netlist(
+        verilog: &str,
+        bit_input: HashMap<String, Bit>,
+    ) -> HashMap<String, Bit> {
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+        simulator.simulate(&bit_input, &mut HashSet::new())
+    }
+
     fn test_input(values: &[(&str, Bit)]) -> HashMap<String, Bit> {
         values
             .iter()
@@ -1309,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_marks_observably_static_output() {
+    fn optimize_retains_output_that_is_only_observably_static() {
         let verilog = r#"
 module obs_static(a, b, sel, out);
   input a, b, sel;
@@ -1329,20 +1336,19 @@ endmodule
         let optimization = optimize_test_netlist(verilog, bit_inputs);
 
         assert_eq!(optimization.static_gates, Vec::<String>::new());
+        assert_eq!(optimization.observably_static_gates, Vec::<String>::new());
+        assert!(!optimization.gates_to_comment.contains(&"g_and".to_string()));
         assert!(
-            optimization
-                .observably_static_gates
-                .contains(&"g_and".to_string())
+            !optimization
+                .assignments
+                .iter()
+                .any(|assignment| { assignment.wire_name == "n0" })
         );
-        assert!(optimization.gates_to_comment.contains(&"g_and".to_string()));
-        assert!(optimization.assignments.contains(&GateOutputAssignment {
-            wire_name: "n0".to_string(),
-            value: Bit::Low,
-        }));
+        assert!(optimization.used_gates.contains(&"g_and".to_string()));
     }
 
     #[test]
-    fn optimize_assigns_arbitrary_low_to_never_needed_output() {
+    fn optimize_retains_never_needed_nonconstant_output() {
         let verilog = r#"
 module never_needed(a, out);
   input a;
@@ -1356,21 +1362,110 @@ endmodule
 
         let optimization = optimize_test_netlist(verilog, bit_inputs);
 
+        assert_eq!(optimization.arbitrary_gates, Vec::<String>::new());
         assert!(
-            optimization
-                .arbitrary_gates
-                .contains(&"g_unused".to_string())
-        );
-        assert!(
-            optimization
+            !optimization
                 .gates_to_comment
                 .contains(&"g_unused".to_string())
         );
-        assert!(optimization.assignments.contains(&GateOutputAssignment {
-            wire_name: "unused".to_string(),
-            value: Bit::Low,
-        }));
+        assert!(
+            !optimization
+                .assignments
+                .iter()
+                .any(|assignment| { assignment.wire_name == "unused" })
+        );
+        assert!(optimization.used_gates.contains(&"g_unused".to_string()));
         assert!(optimization.used_gates.contains(&"g_out".to_string()));
+    }
+
+    #[test]
+    fn optimize_rejects_incompatible_arbitrary_substitutions() {
+        let verilog = r#"
+module incompatible_arbitrary(d, out);
+  input d;
+  output out;
+  wire d, out, a, b, either;
+  BUF_X1 g_a(.A (1'b1), .Z (a));
+  BUF_X1 g_b(.A (1'b1), .Z (b));
+  OR2_X1 g_or(.A1 (a), .A2 (b), .ZN (either));
+  XOR2_X1 g_out(.A (either), .B (d), .Z (out));
+endmodule
+"#;
+        let unsafely_optimized_verilog = r#"
+module incompatible_arbitrary(d, out);
+  input d;
+  output out;
+  wire d, out, a, b, either;
+  assign a = 1'b0;
+  assign b = 1'b0;
+  OR2_X1 g_or(.A1 (a), .A2 (b), .ZN (either));
+  XOR2_X1 g_out(.A (either), .B (d), .Z (out));
+endmodule
+"#;
+        let optimization = optimize_test_netlist(verilog, vec![test_input(&[("d", Bit::Var)])]);
+
+        let original_outputs = simulate_test_netlist(verilog, test_input(&[("d", Bit::Low)]));
+        let optimized_outputs =
+            simulate_test_netlist(unsafely_optimized_verilog, test_input(&[("d", Bit::Low)]));
+        assert_eq!(original_outputs["out"], Bit::High);
+        assert_eq!(optimized_outputs["out"], Bit::Low);
+
+        assert!(
+            !optimization.arbitrary_gates.contains(&"g_a".to_string()),
+            "g_a and g_b are individually unobservable but cannot both be replaced with zero"
+        );
+        assert!(!optimization.arbitrary_gates.contains(&"g_b".to_string()));
+    }
+
+    #[test]
+    fn optimize_rejects_observably_static_substitutions_that_change_observability() {
+        let verilog = r#"
+module incompatible_observable_static(p, out);
+  input p;
+  output out;
+  wire p, out, data, select;
+  INV_X1 g_data(.A (p), .ZN (data));
+  INV_X1 g_select(.A (p), .ZN (select));
+  MUX2_X1 g_out(.A (data), .B (1'b1), .S (select), .Z (out));
+endmodule
+"#;
+        let unsafely_optimized_verilog = r#"
+module incompatible_observable_static(p, out);
+  input p;
+  output out;
+  wire p, out, data, select;
+  assign data = 1'b0;
+  assign select = 1'b0;
+  MUX2_X1 g_out(.A (data), .B (1'b1), .S (select), .Z (out));
+endmodule
+"#;
+        let bit_inputs = vec![
+            test_input(&[("p", Bit::Low)]),
+            test_input(&[("p", Bit::High)]),
+        ];
+        let optimization = optimize_test_netlist(verilog, bit_inputs);
+
+        let original_outputs = simulate_test_netlist(verilog, test_input(&[("p", Bit::Low)]));
+        let optimized_outputs =
+            simulate_test_netlist(unsafely_optimized_verilog, test_input(&[("p", Bit::Low)]));
+        assert_eq!(original_outputs["out"], Bit::High);
+        assert_eq!(optimized_outputs["out"], Bit::Low);
+
+        assert!(
+            !optimization
+                .observably_static_gates
+                .contains(&"g_data".to_string()),
+            "data is zero whenever originally observable, but replacing it globally changes p=0"
+        );
+        assert!(
+            !optimization
+                .observably_static_gates
+                .contains(&"g_select".to_string())
+        );
+        assert!(
+            optimization.arbitrary_gates.is_empty(),
+            "the observable-static counterexample must not depend on arbitrary removal"
+        );
     }
 
     #[test]
@@ -1393,7 +1488,92 @@ endmodule
     }
 
     #[test]
-    fn optimize_assigns_constants_for_mixed_needed_and_unneeded_outputs() {
+    fn optimize_replaces_and_validates_globally_static_gate() {
+        let verilog = r#"
+module globally_static(a, b, out);
+  input a, b;
+  output out;
+  wire a, b, out, forced;
+  OR2_X1 g_static(.A1 (a), .A2 (1'b1), .ZN (forced));
+  XOR2_X1 g_out(.A (forced), .B (b), .Z (out));
+endmodule
+"#;
+        let (optimization, validation) = optimize_and_validate_test_netlist(
+            verilog,
+            vec![test_input(&[("a", Bit::Var), ("b", Bit::Var)])],
+        );
+
+        assert!(optimization.static_gates.contains(&"g_static".to_string()));
+        assert!(optimization.assignments.contains(&GateOutputAssignment {
+            wire_name: "forced".to_string(),
+            value: Bit::High,
+        }));
+        assert_eq!(validation.input_patterns_checked, 1);
+        assert!(validation.effective_outputs_checked >= 1);
+        assert_eq!(validation.replacement_outputs_checked, 1);
+    }
+
+    #[test]
+    fn validation_checks_top_level_outputs_and_sequential_inputs() {
+        let verilog = r#"
+module effective_outputs(a, clk, out);
+  input a, clk;
+  output out;
+  wire a, clk, out, d, q;
+  OR2_X1 g_static(.A1 (a), .A2 (1'b1), .ZN (d));
+  DFF_X1 state(.D (d), .CK (clk), .Q (q));
+  BUF_X1 g_out(.A (q), .Z (out));
+endmodule
+"#;
+        let (optimization, validation) = optimize_and_validate_test_netlist(
+            verilog,
+            vec![test_input(&[("a", Bit::Var), ("clk", Bit::Var)])],
+        );
+
+        assert!(optimization.static_gates.contains(&"g_static".to_string()));
+        assert_eq!(
+            validation.effective_outputs_checked, 3,
+            "the top-level output and both DFF inputs must be compared"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "post-optimization validation rejected")]
+    fn validation_rejects_nonconstant_replacement() {
+        let verilog = r#"
+module invalid_replacement(a, out);
+  input a;
+  output out;
+  wire a, out;
+  BUF_X1 g_out(.A (a), .Z (out));
+endmodule
+"#;
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+        let inputs = simulator.compile_optimization_inputs(&vec![test_input(&[("a", Bit::Var)])]);
+        let mut workspace = simulator.optimization_workspace();
+        let invalid_optimization = GateUsageOptimization {
+            used_gates: Vec::new(),
+            gates_to_comment: vec!["g_out".to_string()],
+            assignments: vec![GateOutputAssignment {
+                wire_name: "out".to_string(),
+                value: Bit::Low,
+            }],
+            static_gates: vec!["g_out".to_string()],
+            observably_static_gates: Vec::new(),
+            arbitrary_gates: Vec::new(),
+        };
+
+        simulator.validate_compiled_gate_usage_optimization_with_workspace(
+            &inputs,
+            &invalid_optimization,
+            &mut workspace,
+        );
+    }
+
+    #[test]
+    fn optimize_retains_multi_output_gate_that_is_not_globally_static() {
         let liberty = r#"
 library(test) {
   cell (DUAL_X1) {
@@ -1432,19 +1612,19 @@ endmodule
 
         let optimization = simulator.optimize_gate_usage_details(&bit_inputs);
 
+        assert_eq!(optimization.observably_static_gates, Vec::<String>::new());
         assert!(
-            optimization
-                .observably_static_gates
+            !optimization
+                .gates_to_comment
                 .contains(&"g_dual".to_string())
         );
-        assert!(optimization.assignments.contains(&GateOutputAssignment {
-            wire_name: "n0".to_string(),
-            value: Bit::Low,
-        }));
-        assert!(optimization.assignments.contains(&GateOutputAssignment {
-            wire_name: "n1".to_string(),
-            value: Bit::Low,
-        }));
+        assert!(
+            !optimization
+                .assignments
+                .iter()
+                .any(|assignment| { assignment.wire_name == "n0" || assignment.wire_name == "n1" })
+        );
+        assert!(optimization.used_gates.contains(&"g_dual".to_string()));
     }
 
     #[test]
