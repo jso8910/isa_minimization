@@ -3,9 +3,22 @@ use std::{
     io,
 };
 
-use crate::instruction_semantics::{Effect, Expr, FieldName, ValueName};
+use crate::instruction_semantics::{Effect, Expr, ValueName};
 
 use super::bit::{Bit, BitPattern};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ISA {
+    pub registers: Vec<ArchitecturalRegister>,
+    pub instructions: Vec<Instruction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchitecturalRegister {
+    pub identifier: u8,
+    pub identifier_width: u8,
+    pub width: u8
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
@@ -136,7 +149,7 @@ impl DecodedInstruction {
             .map(|field| &field.value)
     }
 
-    pub fn decode_program(filename: &str, isa: &Vec<Instruction>) -> Result<Vec<Self>, io::Error> {
+    pub fn decode_program(filename: &str, isa: &ISA) -> Result<Vec<Self>, io::Error> {
         let program_binary = std::fs::read_to_string(filename)?;
 
         DecodedInstruction::decode_program_str(&program_binary, isa)
@@ -144,7 +157,7 @@ impl DecodedInstruction {
 
     pub fn decode_program_str(
         program: &str,
-        isa: &Vec<Instruction>,
+        isa: &ISA,
     ) -> Result<Vec<Self>, io::Error> {
         let mut decoded_program: Vec<DecodedInstruction> = vec![];
 
@@ -160,7 +173,7 @@ impl DecodedInstruction {
 
             // Try to decode the instruction
             let mut decoded = None;
-            for instr in isa {
+            for instr in isa.instructions.iter() {
                 if let Some(decoded_instr) = instr.find_match(&bits) {
                     decoded = Some(decoded_instr);
                     break;

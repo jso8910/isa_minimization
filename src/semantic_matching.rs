@@ -4,11 +4,15 @@
 //  2. Random testing to attempt to see if the Exprs are obviously different
 //  3. Z3 (easier to program) or Bitwuzla (potentially faster) SMT solver to authoritatively check if the two Exprs are equivalent
 
+// TODO multiple threads perchance? command line option
+const THREAD_COUNT: u32 = 1;
+
+use oxidd::bcdd::BCDDFunction;
+
 use crate::{
     instruction_semantics::{
         Effect, Expr, add, concat, constant, extract, or_expr, read_memory, select,
-    },
-    isa_specification::{DecodedInstruction, Instruction},
+    }, isa_specification::{DecodedInstruction, ISA, Instruction},
 };
 
 pub type InstructionIdx = u32;
@@ -34,6 +38,12 @@ pub enum StateDestination {
     MemoryByte(u32),
 }
 
+/// Representation of a variable for the purposes of creating a BDD
+pub enum BddVariable {
+    Memory(Expr),
+    Register(Expr)
+}
+
 // impl StateUseTable {
 //     pub fn from_program(program: &Vec<DecodedInstruction>, isa: &Vec<Instruction>) -> Self {
 //         for instruction in program.iter() {
@@ -43,12 +53,20 @@ pub enum StateDestination {
 //     }
 // }
 
+/// A word which is created by a vector of BCDDs
+/// So, each bit is defined by some function.
+#[derive(Clone)]
+pub struct BddWord {
+    /// bits[0] is the least-significant bit.
+    pub bits: Vec<BCDDFunction>,
+}
+
 /// Given some sequence of instructions, create a list of all Effects of the sequence in terms of the initial state
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
 pub fn instruction_seq_to_effects(
     instructions: &[DecodedInstruction],
-    isa: &[Instruction],
+    isa: &ISA,
 ) -> Vec<Effect> {
     let mut seq_effects = vec![];
     for instruction in instructions.iter() {
@@ -84,14 +102,14 @@ pub fn instruction_seq_to_effects(
 
 pub fn instruction_to_lowered_effects(
     instruction: &DecodedInstruction,
-    isa: &[Instruction],
+    isa: &ISA,
     previous_effects: &[Effect],
 ) -> Vec<Effect> {
     let instruction_name = instruction
         .name
         .as_ref()
         .expect("Instruction should have a name");
-    let instruction_effects = &isa
+    let instruction_effects = &isa.instructions
         .iter()
         .find(|candidate| candidate.name == *instruction_name)
         .unwrap_or_else(|| {
@@ -395,19 +413,22 @@ mod tests {
         let r0 = read_reg(0);
         let single_add = add(r0.clone(), r0).canonicalize();
         let double_substituted = add(single_add.clone(), single_add.clone()).canonicalize();
-        let isa = vec![
-            isa_instruction(
-                "ADD_R0_R0_R0",
-                vec![Effect::write_register(
-                    reg(0),
-                    add(read_reg(0), read_reg(0)),
-                )],
-            ),
-            isa_instruction(
-                "MOV_R1_R0",
-                vec![Effect::write_register(reg(1), read_reg(0))],
-            ),
-        ];
+        let isa = ISA {
+            instructions: vec![
+                isa_instruction(
+                    "ADD_R0_R0_R0",
+                    vec![Effect::write_register(
+                        reg(0),
+                        add(read_reg(0), read_reg(0)),
+                    )],
+                ),
+                isa_instruction(
+                    "MOV_R1_R0",
+                    vec![Effect::write_register(reg(1), read_reg(0))],
+                ),
+            ],
+            registers: vec![]
+        };
         let sequence = vec![decoded("ADD_R0_R0_R0"), decoded("MOV_R1_R0")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
@@ -421,10 +442,13 @@ mod tests {
     fn instruction_seq_to_effects_lowers_memory_writes_to_bytes() {
         let address = constant(0x100, 32);
         let value = constant(0xaabb_ccdd, 32);
-        let isa = vec![isa_instruction(
-            "STORE32",
-            vec![Effect::write_memory(address.clone(), value.clone(), 32)],
-        )];
+        let isa = ISA {
+            instructions: vec![isa_instruction(
+                "STORE32",
+                vec![Effect::write_memory(address.clone(), value.clone(), 32)],
+            )],
+            registers: vec![]
+        };
         let sequence = vec![decoded("STORE32")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
@@ -456,19 +480,22 @@ mod tests {
     fn instruction_seq_to_effects_lowers_memory_reads_before_substitution() {
         let address = constant(0x100, 32);
         let value = constant(0xaabb_ccdd, 32);
-        let isa = vec![
-            isa_instruction(
-                "STORE32",
-                vec![Effect::write_memory(address.clone(), value.clone(), 32)],
-            ),
-            isa_instruction(
-                "LOAD32_R0",
-                vec![Effect::write_register(
-                    reg(0),
-                    read_memory(address.clone(), 32),
-                )],
-            ),
-        ];
+        let isa = ISA {
+            instructions: vec![
+                isa_instruction(
+                    "STORE32",
+                    vec![Effect::write_memory(address.clone(), value.clone(), 32)],
+                ),
+                isa_instruction(
+                    "LOAD32_R0",
+                    vec![Effect::write_register(
+                        reg(0),
+                        read_memory(address.clone(), 32),
+                    )],
+                ),
+            ],
+            registers: vec![]
+        };
         let sequence = vec![decoded("STORE32"), decoded("LOAD32_R0")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);

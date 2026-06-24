@@ -1902,7 +1902,9 @@ pub enum RegisterRef {
     /// A fixed architectural or virtual register identifier.
     ///
     /// `identifier_width` is the width of the register identifier expression, not
-    /// necessarily the width of the register's stored value.
+    /// the width of the register's stored value.
+    /// `identifier_width` must be consistent. The boolean equivalence
+    /// will see Fixed(0, 2) as different from Fixed(0, 4).
     Fixed {
         register: Register,
         identifier_width: u16,
