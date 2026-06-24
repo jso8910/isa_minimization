@@ -932,7 +932,7 @@ impl Expr {
     /// Leaf expressions are returned unchanged. Transformations that need
     /// special handling for a node must match that node before calling this
     /// helper.
-    fn map_children(self, mut map: impl FnMut(Expr) -> Expr) -> Self {
+    pub(crate) fn map_children(self, mut map: impl FnMut(Expr) -> Expr) -> Self {
         match self {
             Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => self,
             Expr::ReadRegister { register, width } => read_register(map(*register), width),

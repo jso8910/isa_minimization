@@ -6,7 +6,7 @@
 
 use crate::{
     instruction_semantics::{
-        Effect, Expr, add, concat, constant, extract, or_expr, read_memory, select,
+        add, concat, constant, extract, or_expr, read_memory, select, Effect, Expr,
     },
     isa_specification::{DecodedInstruction, Instruction},
 };
@@ -16,14 +16,14 @@ pub type InstructionIdx = u32;
 /// A table of all state uses
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateUseTable {
-    /// Vector of tuples, saying which index the update is at and 
-    updates: Vec<(InstructionIdx, StateUse)>
+    /// Vector of tuples, saying which index the update is at and
+    updates: Vec<(InstructionIdx, StateUse)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateUse {
     Write(StateDestination),
-    Read(StateDestination)
+    Read(StateDestination),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub enum StateDestination {
     /// Register with identifier - `u8`
     Register(u8),
     /// Memory byte at address - `usize`
-    MemoryByte(u32)
+    MemoryByte(u32),
 }
 
 // impl StateUseTable {
@@ -47,8 +47,8 @@ pub enum StateDestination {
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
 pub fn instruction_seq_to_effects(
-    instructions: &Vec<DecodedInstruction>,
-    isa: &Vec<Instruction>,
+    instructions: &[DecodedInstruction],
+    isa: &[Instruction],
 ) -> Vec<Effect> {
     let mut seq_effects = vec![];
     for instruction in instructions.iter() {
@@ -71,7 +71,7 @@ pub fn instruction_seq_to_effects(
                 // However, we don't want to add it if the effect_2.guard is a constant 0
                 let guard = match effect_2 {
                     Effect::WriteMemory { ref guard, .. } => guard,
-                    Effect::WriteRegister { ref guard, .. } => guard
+                    Effect::WriteRegister { ref guard, .. } => guard,
                 };
                 if *guard != constant(0, 1) {
                     seq_effects.push(effect_2);
@@ -82,22 +82,26 @@ pub fn instruction_seq_to_effects(
     seq_effects
 }
 
-pub fn instruction_to_lowered_effects(instruction: &DecodedInstruction, isa: &Vec<Instruction>, previous_effects: &Vec<Effect>) -> Vec<Effect> {
-let mut instruction_effects = None;
+pub fn instruction_to_lowered_effects(
+    instruction: &DecodedInstruction,
+    isa: &[Instruction],
+    previous_effects: &[Effect],
+) -> Vec<Effect> {
     let instruction_name = instruction
         .name
         .as_ref()
         .expect("Instruction should have a name");
-    for isa_instruction in isa.iter() {
-        if &isa_instruction.name == instruction_name {
-            instruction_effects = Some(isa_instruction.effects.clone());
-        }
-    }
-    // Now we want to collapse any effect wherever possible
-    let instruction_effects = instruction_effects
-        .unwrap_or_else(|| panic!("Instruction in sequence should match with an instruction in the ISA, but {} did not match!", instruction_name));
+    let instruction_effects = &isa
+        .iter()
+        .find(|candidate| candidate.name == *instruction_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "Instruction in sequence should match with an instruction in the ISA, but {instruction_name} did not match!"
+            )
+        })
+        .effects;
     let mut lowered_effects = Vec::with_capacity(instruction_effects.len());
-    for effect in instruction_effects {
+    for effect in instruction_effects.iter().cloned() {
         match effect {
             Effect::WriteMemory {
                 guard,
@@ -121,15 +125,10 @@ let mut instruction_effects = None;
                         .expr_width()
                         .expect("Memory address should have established width");
                     for byte_index in 0..(width / 8) {
-                        let byte_address = if byte_index == 0 {
-                            address.clone()
-                        } else {
-                            add(address.clone(), constant(byte_index as u128, address_width))
-                        };
                         let low = byte_index * 8;
                         lowered_effects.push(Effect::WriteMemory {
                             guard: guard.clone(),
-                            address: byte_address,
+                            address: byte_address(&address, byte_index, address_width),
                             value: extract(value.clone(), low + 7, low),
                             width: 8,
                         });
@@ -144,7 +143,11 @@ let mut instruction_effects = None;
                 let guard = collapse_lower_substitute(guard, instruction, previous_effects);
                 let register = collapse_lower_substitute(register, instruction, previous_effects);
                 let value = collapse_lower_substitute(value, instruction, previous_effects);
-                lowered_effects.push(Effect::WriteRegister { guard, register, value });
+                lowered_effects.push(Effect::WriteRegister {
+                    guard,
+                    register,
+                    value,
+                });
             }
         }
     }
@@ -155,7 +158,7 @@ let mut instruction_effects = None;
 fn collapse_lower_substitute(
     expr: Expr,
     instruction: &DecodedInstruction,
-    previous_effects: &Vec<Effect>,
+    previous_effects: &[Effect],
 ) -> Expr {
     lower_memory_reads(expr.collapse(instruction))
         .substitute(previous_effects)
@@ -175,140 +178,18 @@ fn lower_memory_reads(expr: Expr) -> Expr {
                 .expr_width()
                 .expect("Memory address should have established width");
             concat((0..(width / 8)).rev().map(|byte_index| {
-                let byte_address = if byte_index == 0 {
-                    address.clone()
-                } else {
-                    add(address.clone(), constant(byte_index as u128, address_width))
-                };
-                read_memory(byte_address, 8)
+                read_memory(byte_address(&address, byte_index, address_width), 8)
             }))
         }
-        Expr::ReadRegister { register, width } => Expr::ReadRegister {
-            register: Box::new(lower_memory_reads(*register)),
-            width,
-        },
-        Expr::Add(lhs, rhs) => Expr::Add(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Sub(lhs, rhs) => Expr::Sub(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Mul(lhs, rhs) => Expr::Mul(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::And(lhs, rhs) => Expr::And(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Or(lhs, rhs) => Expr::Or(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Xor(lhs, rhs) => Expr::Xor(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Not(value) => Expr::Not(Box::new(lower_memory_reads(*value))),
-        Expr::ShiftLeft(lhs, rhs) => Expr::ShiftLeft(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::LogicalShiftRight(lhs, rhs) => Expr::LogicalShiftRight(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::ArithmeticShiftRight(lhs, rhs) => Expr::ArithmeticShiftRight(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::RotateRight(lhs, rhs) => Expr::RotateRight(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Equal(lhs, rhs) => Expr::Equal(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::UnsignedLessThan(lhs, rhs) => Expr::UnsignedLessThan(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::SignedLessThan(lhs, rhs) => Expr::SignedLessThan(
-            Box::new(lower_memory_reads(*lhs)),
-            Box::new(lower_memory_reads(*rhs)),
-        ),
-        Expr::Extract { value, high, low } => Expr::Extract {
-            value: Box::new(lower_memory_reads(*value)),
-            high,
-            low,
-        },
-        Expr::Concat(values) => Expr::Concat(values.into_iter().map(lower_memory_reads).collect()),
-        Expr::ZeroExtend { value, to_width } => Expr::ZeroExtend {
-            value: Box::new(lower_memory_reads(*value)),
-            to_width,
-        },
-        Expr::SignExtend { value, to_width } => Expr::SignExtend {
-            value: Box::new(lower_memory_reads(*value)),
-            to_width,
-        },
-        Expr::CountOnes(value) => Expr::CountOnes(Box::new(lower_memory_reads(*value))),
-        Expr::AddCarryOut {
-            lhs,
-            rhs,
-            carry_in,
-            width,
-        } => Expr::AddCarryOut {
-            lhs: Box::new(lower_memory_reads(*lhs)),
-            rhs: Box::new(lower_memory_reads(*rhs)),
-            carry_in: Box::new(lower_memory_reads(*carry_in)),
-            width,
-        },
-        Expr::AddOverflow {
-            lhs,
-            rhs,
-            carry_in,
-            width,
-        } => Expr::AddOverflow {
-            lhs: Box::new(lower_memory_reads(*lhs)),
-            rhs: Box::new(lower_memory_reads(*rhs)),
-            carry_in: Box::new(lower_memory_reads(*carry_in)),
-            width,
-        },
-        Expr::SubCarryOut {
-            lhs,
-            rhs,
-            borrow_in,
-            width,
-        } => Expr::SubCarryOut {
-            lhs: Box::new(lower_memory_reads(*lhs)),
-            rhs: Box::new(lower_memory_reads(*rhs)),
-            borrow_in: Box::new(lower_memory_reads(*borrow_in)),
-            width,
-        },
-        Expr::SubOverflow {
-            lhs,
-            rhs,
-            borrow_in,
-            width,
-        } => Expr::SubOverflow {
-            lhs: Box::new(lower_memory_reads(*lhs)),
-            rhs: Box::new(lower_memory_reads(*rhs)),
-            borrow_in: Box::new(lower_memory_reads(*borrow_in)),
-            width,
-        },
-        Expr::Select {
-            condition,
-            when_true,
-            when_false,
-        } => Expr::Select {
-            condition: Box::new(lower_memory_reads(*condition)),
-            when_true: Box::new(lower_memory_reads(*when_true)),
-            when_false: Box::new(lower_memory_reads(*when_false)),
-        },
-        Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => expr,
+        expr => expr.map_children(lower_memory_reads),
+    }
+}
+
+fn byte_address(address: &Expr, byte_index: u16, address_width: u16) -> Expr {
+    if byte_index == 0 {
+        address.clone()
+    } else {
+        add(address.clone(), constant(byte_index as u128, address_width))
     }
 }
 
@@ -468,7 +349,7 @@ fn combine_effects(effect_1: &Effect, effect_2: &Effect) -> Option<Effect> {
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::{Register, bool_const, fixed_register, read_memory, read_register},
+        instruction_semantics::{bool_const, fixed_register, read_memory, read_register, Register},
         isa_specification::InstructionForm,
     };
 
@@ -616,6 +497,22 @@ mod tests {
                 read_memory(add(address.clone(), constant(1, 32)), 8),
                 read_memory(address, 8),
             ])
+        );
+    }
+
+    #[test]
+    fn lower_memory_reads_recurses_through_other_expressions() {
+        let address = constant(0x100, 32);
+
+        assert_eq!(
+            lower_memory_reads(add(read_memory(address.clone(), 16), constant(1, 16))),
+            add(
+                concat([
+                    read_memory(add(address.clone(), constant(1, 32)), 8),
+                    read_memory(address, 8),
+                ]),
+                constant(1, 16),
+            )
         );
     }
 
