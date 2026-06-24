@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use crate::{
     instruction_semantics::OperandRef::{ImmediateField, RegisterField},
-    isa_specification::{DecodedInstruction, DerivedValue},
+    isa_specification::DecodedInstruction,
 };
 
 /// Symbolic expression used to describe instruction semantics.
@@ -18,9 +16,11 @@ use crate::{
 /// widths. Boolean conditions are represented as 1-bit expressions where `1`
 /// means true and `0` means false.
 ///
-/// Importantly, all Exprs with multiple operands *must* have the same bit-width for all values
-/// This will not necessarily be strictly enforced unless something evaluates to a Const, but it should
-/// still be kept in mind.
+/// Fixed-width arithmetic, logical, comparison, and shift operators require
+/// equal operand widths. Exceptions are explicitly modeled: concatenation
+/// combines different widths, `Select` has a 1-bit condition plus equal-width
+/// result arms, and carry/borrow helpers have a separate 1-bit flag input.
+/// Some width errors are detected only after fields have been collapsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     /// Literal bit-vector value with an explicit width.
@@ -215,6 +215,7 @@ pub enum Expr {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Associative and commutative operators supported by shared normalization.
 enum AssocCommOp {
     Add,
     Mul,
@@ -223,13 +224,106 @@ enum AssocCommOp {
     Xor,
 }
 
+#[derive(Clone, Copy, Debug)]
+/// Carry/overflow helper variants sharing collapse and rebuild behavior.
+enum FlagOp {
+    AddCarryOut,
+    AddOverflow,
+    SubCarryOut,
+    SubOverflow,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// Width-extension variants sharing validation and constant folding.
+enum ExtensionOp {
+    Zero,
+    Sign,
+}
+
+impl ExtensionOp {
+    /// Constructs the extension node represented by this operation.
+    fn build(self, value: Expr, to_width: u16) -> Expr {
+        match self {
+            Self::Zero => zero_extend(value, to_width),
+            Self::Sign => sign_extend(value, to_width),
+        }
+    }
+
+    /// Returns the user-facing operation name used in validation errors.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Zero => "Zero extension",
+            Self::Sign => "Sign extension",
+        }
+    }
+
+    /// Evaluates this extension on a constant input.
+    fn fold(self, value: u128, from_width: u16, to_width: u16) -> u128 {
+        match self {
+            Self::Zero => Expr::zero_extend_const(value, from_width, to_width),
+            Self::Sign => Expr::sign_extend_const(value, from_width, to_width),
+        }
+    }
+
+    /// Removes one nested extension of the same kind.
+    fn strip_nested(self, value: Expr) -> Expr {
+        match (self, value) {
+            (Self::Zero, Expr::ZeroExtend { value, .. })
+            | (Self::Sign, Expr::SignExtend { value, .. }) => *value,
+            (_, value) => value,
+        }
+    }
+}
+
+impl FlagOp {
+    /// Constructs the AST node represented by this flag operation.
+    fn build(self, lhs: Expr, rhs: Expr, flag_in: Expr, width: u16) -> Expr {
+        match self {
+            Self::AddCarryOut => add_carry_out(lhs, rhs, flag_in, width),
+            Self::AddOverflow => add_overflow(lhs, rhs, flag_in, width),
+            Self::SubCarryOut => sub_carry_out(lhs, rhs, flag_in, width),
+            Self::SubOverflow => sub_overflow(lhs, rhs, flag_in, width),
+        }
+    }
+
+    /// Returns the operation name used in validation errors.
+    fn name(self) -> &'static str {
+        match self {
+            Self::AddCarryOut => "AddCarryOut",
+            Self::AddOverflow => "AddOverflow",
+            Self::SubCarryOut => "SubCarryOut",
+            Self::SubOverflow => "SubOverflow",
+        }
+    }
+
+    /// Returns the public name of the 1-bit input consumed by this operation.
+    fn flag_name(self) -> &'static str {
+        match self {
+            Self::AddCarryOut | Self::AddOverflow => "carry_in",
+            Self::SubCarryOut | Self::SubOverflow => "borrow_in",
+        }
+    }
+
+    /// Evaluates this flag operation on canonical constant operands.
+    fn fold(self, lhs: u128, rhs: u128, flag_in: u128, width: u16) -> bool {
+        match self {
+            Self::AddCarryOut => Expr::add_carry_out_const(lhs, rhs, flag_in, width),
+            Self::AddOverflow => Expr::add_overflow_const(lhs, rhs, flag_in, width),
+            Self::SubCarryOut => Expr::sub_carry_out_const(lhs, rhs, flag_in, width),
+            Self::SubOverflow => Expr::sub_overflow_const(lhs, rhs, flag_in, width),
+        }
+    }
+}
+
 impl Expr {
+    /// Panics unless `width` is representable by the `u128` evaluator.
     fn assert_valid_width(width: u16) {
         if width == 0 || width > 128 {
             panic!("Bit-vector width must be in 1..=128, got {width}");
         }
     }
 
+    /// Returns a mask with the low `width` bits set.
     fn bit_mask(width: u16) -> u128 {
         Self::assert_valid_width(width);
         if width == 128 {
@@ -239,15 +333,18 @@ impl Expr {
         }
     }
 
+    /// Returns the most-significant bit mask for a value of `width` bits.
     fn sign_bit(width: u16) -> u128 {
         Self::assert_valid_width(width);
         1u128 << (width - 1)
     }
 
+    /// Truncates `value` to the requested bit-vector width.
     fn canonical(value: u128, width: u16) -> u128 {
         value & Self::bit_mask(width)
     }
 
+    /// Constructs a width-validated constant truncated to `width` bits.
     fn const_bits(value: u128, width: u16) -> Self {
         Expr::Const {
             value: Self::canonical(value, width),
@@ -255,6 +352,7 @@ impl Expr {
         }
     }
 
+    /// Validates equal nonzero operand widths and returns the shared width.
     fn expect_same_width(lhs_width: u16, rhs_width: u16) -> u16 {
         if lhs_width != rhs_width {
             panic!(
@@ -265,6 +363,7 @@ impl Expr {
         lhs_width
     }
 
+    /// Validates a boolean constant and returns its canonical 0/1 value.
     fn expect_bool_const(value: u128, width: u16, name: &str) -> u128 {
         if width != 1 {
             panic!("{name} must have width 1, got width = {width}");
@@ -272,6 +371,10 @@ impl Expr {
         Self::canonical(value, width)
     }
 
+    /// Sign-extends a width-limited value across all 128 host bits.
+    ///
+    /// This is an evaluator helper; it does not change an expression's
+    /// architectural width.
     fn sign_extend_to_u128(value: u128, width: u16) -> u128 {
         let value = Self::canonical(value, width);
         if value & Self::sign_bit(width) == 0 {
@@ -281,10 +384,12 @@ impl Expr {
         }
     }
 
+    /// Interprets the low `width` bits of `value` as a signed integer.
     fn signed_value(value: u128, width: u16) -> i128 {
         Self::sign_extend_to_u128(value, width) as i128
     }
 
+    /// Evaluates zero extension after validating that it does not shrink.
     fn zero_extend_const(value: u128, from_width: u16, to_width: u16) -> u128 {
         if from_width > to_width {
             panic!(
@@ -295,6 +400,7 @@ impl Expr {
         Self::canonical(value, from_width)
     }
 
+    /// Evaluates sign extension after validating that it does not shrink.
     fn sign_extend_const(value: u128, from_width: u16, to_width: u16) -> u128 {
         if from_width > to_width {
             panic!(
@@ -311,6 +417,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates a logical left shift, returning zero for oversized amounts.
     fn shift_left_const(value: u128, amount: u128, width: u16) -> u128 {
         if amount >= width as u128 {
             0
@@ -319,6 +426,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates a logical right shift, returning zero for oversized amounts.
     fn logical_shift_right_const(value: u128, amount: u128, width: u16) -> u128 {
         if amount >= width as u128 {
             0
@@ -327,6 +435,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates an arithmetic right shift with sign fill.
     fn arithmetic_shift_right_const(value: u128, amount: u128, width: u16) -> u128 {
         let value = Self::canonical(value, width);
         let negative = value & Self::sign_bit(width) != 0;
@@ -337,6 +446,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates rotate-right with the amount reduced modulo `width`.
     fn rotate_right_const(value: u128, amount: u128, width: u16) -> u128 {
         let value = Self::canonical(value, width);
         let shift = (amount % width as u128) as u32;
@@ -347,6 +457,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates unsigned carry-out from `lhs + rhs + carry_in`.
     fn add_carry_out_const(lhs: u128, rhs: u128, carry_in: u128, width: u16) -> bool {
         let lhs = Self::canonical(lhs, width);
         let rhs = Self::canonical(rhs, width);
@@ -360,6 +471,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates architectural subtraction carry, meaning “no borrow.”
     fn sub_carry_out_const(lhs: u128, rhs: u128, borrow_in: u128, width: u16) -> bool {
         let lhs = Self::canonical(lhs, width);
         let rhs = Self::canonical(rhs, width);
@@ -369,6 +481,7 @@ impl Expr {
         !(borrow1 || borrow2)
     }
 
+    /// Evaluates signed overflow from `lhs + rhs + carry_in`.
     fn add_overflow_const(lhs: u128, rhs: u128, carry_in: u128, width: u16) -> bool {
         let lhs = Self::canonical(lhs, width);
         let rhs = Self::canonical(rhs, width);
@@ -377,6 +490,7 @@ impl Expr {
         (!(lhs ^ rhs) & (lhs ^ result) & Self::sign_bit(width)) != 0
     }
 
+    /// Evaluates signed overflow from `lhs - rhs - borrow_in`.
     fn sub_overflow_const(lhs: u128, rhs: u128, borrow_in: u128, width: u16) -> bool {
         let lhs = Self::canonical(lhs, width);
         let rhs = Self::canonical(rhs, width);
@@ -385,6 +499,7 @@ impl Expr {
         ((lhs ^ rhs) & (lhs ^ result) & Self::sign_bit(width)) != 0
     }
 
+    /// Constructs the binary expression associated with `op`.
     fn make_assoc_comm_expr(op: AssocCommOp, lhs: Expr, rhs: Expr) -> Self {
         match op {
             AssocCommOp::Add => Expr::Add(Box::new(lhs), Box::new(rhs)),
@@ -395,6 +510,9 @@ impl Expr {
         }
     }
 
+    /// Appends the leaves of a same-operator associative tree to `terms`.
+    ///
+    /// This only flattens `op`; child expressions are otherwise left untouched.
     fn flatten_assoc_comm_op(op: AssocCommOp, expr: Expr, terms: &mut Vec<Expr>) {
         match (op, expr) {
             (AssocCommOp::Add, Expr::Add(lhs, rhs))
@@ -409,6 +527,7 @@ impl Expr {
         }
     }
 
+    /// Evaluates one associative/commutative operation on two constants.
     fn fold_assoc_comm_const(op: AssocCommOp, lhs: u128, rhs: u128, _width: u16) -> u128 {
         match op {
             AssocCommOp::Add => lhs.wrapping_add(rhs),
@@ -419,6 +538,7 @@ impl Expr {
         }
     }
 
+    /// Reports whether `value` is the neutral element for `op`.
     fn is_assoc_comm_identity(op: AssocCommOp, value: u128, width: u16) -> bool {
         match op {
             AssocCommOp::Add | AssocCommOp::Or | AssocCommOp::Xor => value == 0,
@@ -427,6 +547,7 @@ impl Expr {
         }
     }
 
+    /// Reports whether `value` determines the result of `op`.
     fn is_assoc_comm_annihilator(op: AssocCommOp, value: u128, width: u16) -> bool {
         match op {
             AssocCommOp::Mul | AssocCommOp::And => value == 0,
@@ -435,6 +556,7 @@ impl Expr {
         }
     }
 
+    /// Rebuilds a nonempty left-associated tree from ordered terms.
     fn rebuild_assoc_comm_op(op: AssocCommOp, mut terms: Vec<Expr>) -> Self {
         let first = terms
             .drain(..1)
@@ -445,10 +567,15 @@ impl Expr {
             .fold(first, |acc, term| Self::make_assoc_comm_expr(op, acc, term))
     }
 
+    /// Collapses an associative/commutative expression and combines constants.
+    ///
+    /// Unlike `canonicalize_assoc_comm_op`, this preserves the order of
+    /// nonconstant terms and performs no sorting, deduplication, cancellation,
+    /// complement, or absorption rewrites.
     fn collapse_assoc_comm_op(
         instruction: &DecodedInstruction,
-        op1: Box<Expr>,
-        op2: Box<Expr>,
+        op1: Expr,
+        op2: Expr,
         op: AssocCommOp,
     ) -> Self {
         let mut terms = Vec::new();
@@ -496,15 +623,20 @@ impl Expr {
         Self::rebuild_assoc_comm_op(op, non_const_terms)
     }
 
+    /// Collapses both operands of a binary node and folds a constant pair.
+    ///
+    /// `fold` receives canonical operand values and their shared width and must
+    /// construct the complete replacement expression, including its result
+    /// width. Nonconstant operands are rebuilt with `rebuild`.
     fn collapse_binary_op<F>(
         instruction: &DecodedInstruction,
-        op1: Box<Expr>,
-        op2: Box<Expr>,
+        op1: Expr,
+        op2: Expr,
         rebuild: fn(Box<Expr>, Box<Expr>) -> Expr,
         fold: F,
     ) -> Self
     where
-        F: FnOnce(u128, u128, u16) -> u128,
+        F: FnOnce(u128, u128, u16) -> Expr,
     {
         let op1_collapsed = op1.collapse(instruction);
         let op2_collapsed = op2.collapse(instruction);
@@ -520,12 +652,9 @@ impl Expr {
                 },
             ) => {
                 let width = Self::expect_same_width(width_op1, width_op2);
-                Self::const_bits(
-                    fold(
-                        Self::canonical(value_op1, width),
-                        Self::canonical(value_op2, width),
-                        width,
-                    ),
+                fold(
+                    Self::canonical(value_op1, width),
+                    Self::canonical(value_op2, width),
                     width,
                 )
             }
@@ -535,48 +664,10 @@ impl Expr {
         }
     }
 
-    fn collapse_binary_pred<F>(
-        instruction: &DecodedInstruction,
-        op1: Box<Expr>,
-        op2: Box<Expr>,
-        rebuild: fn(Box<Expr>, Box<Expr>) -> Expr,
-        pred: F,
-    ) -> Self
-    where
-        F: FnOnce(u128, u128, u16) -> bool,
-    {
-        let op1_collapsed = op1.collapse(instruction);
-        let op2_collapsed = op2.collapse(instruction);
-        match (op1_collapsed, op2_collapsed) {
-            (
-                Expr::Const {
-                    value: value_op1,
-                    width: width_op1,
-                },
-                Expr::Const {
-                    value: value_op2,
-                    width: width_op2,
-                },
-            ) => {
-                let width = Self::expect_same_width(width_op1, width_op2);
-                Expr::Const {
-                    value: pred(
-                        Self::canonical(value_op1, width),
-                        Self::canonical(value_op2, width),
-                        width,
-                    ) as u128,
-                    width: 1,
-                }
-            }
-            (op1_collapsed, op2_collapsed) => {
-                rebuild(Box::new(op1_collapsed), Box::new(op2_collapsed))
-            }
-        }
-    }
-
+    /// Collapses a unary node and folds it when its child is constant.
     fn collapse_unary_op<F>(
         instruction: &DecodedInstruction,
-        op: Box<Expr>,
+        op: Expr,
         rebuild: fn(Box<Expr>) -> Expr,
         fold: F,
     ) -> Self
@@ -592,6 +683,11 @@ impl Expr {
         }
     }
 
+    /// Returns the statically known result width, if all required widths agree.
+    ///
+    /// This method does not resolve instruction fields or derived values.
+    /// Call `collapse` first when width information comes from a decoded
+    /// instruction.
     pub fn expr_width(&self) -> Option<u16> {
         match self {
             Expr::Const { width, .. } => Some(*width),
@@ -658,10 +754,54 @@ impl Expr {
         }
     }
 
+    /// Produces a deterministic structural key used to order commutative terms.
     fn canonical_sort_key(expr: &Expr) -> String {
         format!("{expr:?}")
     }
 
+    /// Rebuilds a concatenation while merging adjacent constant chunks.
+    ///
+    /// Inputs must already have undergone the caller's recursive transform
+    /// (`collapse` or `canonicalize`). A single remaining chunk is returned
+    /// directly; an empty input remains an empty `Concat`.
+    fn rebuild_concat(values: impl IntoIterator<Item = Expr>) -> Self {
+        let mut merged = Vec::new();
+        for value in values {
+            match value {
+                Expr::Const { value, width } => {
+                    Self::assert_valid_width(width);
+                    if let Some(Expr::Const {
+                        value: previous_value,
+                        width: previous_width,
+                    }) = merged.last_mut()
+                    {
+                        let combined_width = *previous_width + width;
+                        Self::assert_valid_width(combined_width);
+                        *previous_value = Self::canonical(
+                            (Self::canonical(*previous_value, *previous_width) << width)
+                                | Self::canonical(value, width),
+                            combined_width,
+                        );
+                        *previous_width = combined_width;
+                    } else {
+                        merged.push(Self::const_bits(value, width));
+                    }
+                }
+                value => merged.push(value),
+            }
+        }
+
+        match merged.len() {
+            1 => merged.into_iter().next().expect("length was checked"),
+            _ => Expr::Concat(merged),
+        }
+    }
+
+    /// Canonicalizes a shift/rotate and removes zero-value identities.
+    ///
+    /// Both children are canonicalized first. A zero amount returns the input;
+    /// a zero input returns a zero constant. Constant evaluation itself is done
+    /// by `collapse`.
     fn canonicalize_shift_like_op(
         value: Expr,
         amount: Expr,
@@ -690,14 +830,12 @@ impl Expr {
         }
     }
 
-    fn canonicalize_flag_expr(
-        lhs: Expr,
-        rhs: Expr,
-        flag_in: Expr,
-        width: u16,
-        rebuild: fn(Expr, Expr, Expr, u16) -> Expr,
-    ) -> Self {
-        rebuild(
+    /// Canonicalizes the three children of a flag expression and rebuilds it.
+    ///
+    /// This helper deliberately does not rewrite flag semantics; constant
+    /// evaluation remains the responsibility of `collapse`.
+    fn canonicalize_flag_expr(lhs: Expr, rhs: Expr, flag_in: Expr, width: u16, op: FlagOp) -> Self {
+        op.build(
             lhs.canonicalize(),
             rhs.canonicalize(),
             flag_in.canonicalize(),
@@ -705,15 +843,279 @@ impl Expr {
         )
     }
 
+    /// Collapses and constant-folds a carry/overflow helper expression.
+    ///
+    /// All three children are collapsed first. Folding occurs only when both
+    /// arithmetic operands and the 1-bit carry/borrow input are constants.
+    fn collapse_flag_expr(
+        instruction: &DecodedInstruction,
+        lhs: Expr,
+        rhs: Expr,
+        flag_in: Expr,
+        width: u16,
+        op: FlagOp,
+    ) -> Self {
+        let collapsed = (
+            lhs.collapse(instruction),
+            rhs.collapse(instruction),
+            flag_in.collapse(instruction),
+        );
+
+        match collapsed {
+            (
+                Expr::Const {
+                    value: lhs,
+                    width: lhs_width,
+                },
+                Expr::Const {
+                    value: rhs,
+                    width: rhs_width,
+                },
+                Expr::Const {
+                    value: flag_in,
+                    width: flag_width,
+                },
+            ) => {
+                if Self::expect_same_width(lhs_width, rhs_width) != width {
+                    panic!(
+                        "LHS, RHS, and output must have equal width for {}",
+                        op.name()
+                    );
+                }
+                let flag_in = Self::expect_bool_const(flag_in, flag_width, op.flag_name());
+                bool_const(op.fold(lhs, rhs, flag_in, width))
+            }
+            (lhs, rhs, flag_in) => op.build(lhs, rhs, flag_in, width),
+        }
+    }
+
+    /// Canonicalizes an extension and removes redundant nesting.
+    ///
+    /// The child is canonicalized first. Equal-width extensions disappear,
+    /// nested extensions of the same kind collapse to the outer width, and
+    /// shrinking a statically known value is rejected.
+    fn canonicalize_extension(value: Expr, to_width: u16, op: ExtensionOp) -> Self {
+        let value = value.canonicalize();
+        if let Some(value_width) = value.expr_width() {
+            if value_width > to_width {
+                panic!(
+                    "{} target width must be at least value width, but got width = {value_width} and to_width = {to_width}",
+                    op.name()
+                );
+            }
+            if value_width == to_width {
+                return value;
+            }
+        }
+
+        op.build(op.strip_nested(value), to_width)
+    }
+
+    /// Collapses an extension and folds it when its child becomes constant.
+    fn collapse_extension(
+        instruction: &DecodedInstruction,
+        value: Expr,
+        to_width: u16,
+        op: ExtensionOp,
+    ) -> Self {
+        match value.collapse(instruction) {
+            Expr::Const { value, width } => {
+                Self::const_bits(op.fold(value, width, to_width), to_width)
+            }
+            value => op.build(value, to_width),
+        }
+    }
+
+    /// Rebuilds this node after applying `map` to each immediate child.
+    ///
+    /// This is a one-level traversal: `map` decides whether and how to recurse.
+    /// Leaf expressions are returned unchanged. Transformations that need
+    /// special handling for a node must match that node before calling this
+    /// helper.
+    fn map_children(self, mut map: impl FnMut(Expr) -> Expr) -> Self {
+        match self {
+            Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => self,
+            Expr::ReadRegister { register, width } => read_register(map(*register), width),
+            Expr::ReadMemory { address, width } => read_memory(map(*address), width),
+            Expr::Add(lhs, rhs) => add(map(*lhs), map(*rhs)),
+            Expr::Sub(lhs, rhs) => sub(map(*lhs), map(*rhs)),
+            Expr::Mul(lhs, rhs) => mul(map(*lhs), map(*rhs)),
+            Expr::And(lhs, rhs) => and_expr(map(*lhs), map(*rhs)),
+            Expr::Or(lhs, rhs) => or_expr(map(*lhs), map(*rhs)),
+            Expr::Xor(lhs, rhs) => xor_expr(map(*lhs), map(*rhs)),
+            Expr::Not(value) => not_expr(map(*value)),
+            Expr::ShiftLeft(value, amount) => shift_left(map(*value), map(*amount)),
+            Expr::LogicalShiftRight(value, amount) => {
+                logical_shift_right(map(*value), map(*amount))
+            }
+            Expr::ArithmeticShiftRight(value, amount) => {
+                arithmetic_shift_right(map(*value), map(*amount))
+            }
+            Expr::RotateRight(value, amount) => rotate_right(map(*value), map(*amount)),
+            Expr::Equal(lhs, rhs) => equal(map(*lhs), map(*rhs)),
+            Expr::UnsignedLessThan(lhs, rhs) => unsigned_less_than(map(*lhs), map(*rhs)),
+            Expr::SignedLessThan(lhs, rhs) => signed_less_than(map(*lhs), map(*rhs)),
+            Expr::Extract { value, high, low } => extract(map(*value), high, low),
+            Expr::Concat(values) => concat(values.into_iter().map(map)),
+            Expr::ZeroExtend { value, to_width } => zero_extend(map(*value), to_width),
+            Expr::SignExtend { value, to_width } => sign_extend(map(*value), to_width),
+            Expr::CountOnes(value) => count_ones(map(*value)),
+            Expr::AddCarryOut {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => add_carry_out(map(*lhs), map(*rhs), map(*carry_in), width),
+            Expr::AddOverflow {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => add_overflow(map(*lhs), map(*rhs), map(*carry_in), width),
+            Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => sub_carry_out(map(*lhs), map(*rhs), map(*borrow_in), width),
+            Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => sub_overflow(map(*lhs), map(*rhs), map(*borrow_in), width),
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => select(map(*condition), map(*when_true), map(*when_false)),
+        }
+    }
+
+    /// Lowers `Or`, `Xor`, and `Select` into the primitive operator set.
+    ///
+    /// `Or` and `Xor` become combinations of `And` and `Not`. `Select`
+    /// sign-extends its 1-bit condition into an all-zero/all-one mask and uses
+    /// the same primitive operators. Call this only after child expressions and
+    /// same-operator associative terms have been canonicalized.
+    fn lower_operators(self) -> Self {
+        match self {
+            Expr::Or(lhs, rhs) => not_expr(and_expr(not_expr(*lhs), not_expr(*rhs))).canonicalize(),
+            Expr::Xor(lhs, rhs) => or_expr(
+                and_expr(*lhs.clone(), not_expr(*rhs.clone())),
+                and_expr(not_expr(*lhs), *rhs),
+            )
+            .canonicalize(),
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                if let Some(condition_width) = condition.expr_width()
+                    && condition_width != 1
+                {
+                    panic!(
+                        "Expr::Select condition must have width 1, got width = {condition_width}"
+                    );
+                }
+                let width_1 = when_true
+                    .expr_width()
+                    .expect("when_true should have valid width");
+                let width_2 = when_false
+                    .expr_width()
+                    .expect("when_false should have valid width");
+                let width = (width_1 == width_2).then_some(width_2).expect(
+                    "Expr::Select -- both when_true and when_false should have matching width",
+                );
+                let cond_width = sign_extend(*condition, width);
+                not_expr(and_expr(
+                    not_expr(and_expr(not_expr(cond_width.clone()), *when_false)),
+                    not_expr(and_expr(cond_width, *when_true)),
+                ))
+                .canonicalize()
+            }
+            expr => expr,
+        }
+    }
+
+    /// Searches an `op` tree for a term equal to canonical `needle`.
+    fn assoc_comm_expr_contains(op: AssocCommOp, expr: &Expr, needle: &Expr) -> bool {
+        match (op, expr) {
+            (AssocCommOp::Add, Expr::Add(lhs, rhs))
+            | (AssocCommOp::Mul, Expr::Mul(lhs, rhs))
+            | (AssocCommOp::And, Expr::And(lhs, rhs))
+            | (AssocCommOp::Or, Expr::Or(lhs, rhs))
+            | (AssocCommOp::Xor, Expr::Xor(lhs, rhs)) => {
+                Self::assoc_comm_expr_contains(op, lhs, needle)
+                    || Self::assoc_comm_expr_contains(op, rhs, needle)
+            }
+            (_, expr) => expr.clone().canonicalize() == *needle,
+        }
+    }
+
+    /// Removes terms made redundant by Boolean absorption.
+    ///
+    /// For an outer `And`, this removes `x | ...` terms containing another
+    /// top-level term `x`; for an outer `Or`, it analogously removes `x & ...`.
+    /// This must run before nested `Or` nodes are lowered to `And`/`Not`.
+    fn remove_absorbed_terms(op: AssocCommOp, terms: &mut Vec<Expr>) {
+        let opposite_op = match op {
+            AssocCommOp::And => AssocCommOp::Or,
+            AssocCommOp::Or => AssocCommOp::And,
+            AssocCommOp::Add | AssocCommOp::Mul | AssocCommOp::Xor => return,
+        };
+
+        let canonical_terms: Vec<_> = terms.iter().cloned().map(Expr::canonicalize).collect();
+        let mut keep = vec![true; terms.len()];
+
+        for (candidate_index, candidate) in terms.iter().enumerate() {
+            if !matches!(
+                (opposite_op, candidate),
+                (AssocCommOp::And, Expr::And(_, _)) | (AssocCommOp::Or, Expr::Or(_, _))
+            ) {
+                continue;
+            }
+
+            for (needle_index, needle) in canonical_terms.iter().enumerate() {
+                if candidate_index != needle_index
+                    && Self::assoc_comm_expr_contains(opposite_op, candidate, needle)
+                {
+                    keep[candidate_index] = false;
+                    break;
+                }
+            }
+        }
+
+        let mut index = 0;
+        terms.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+    }
+
+    /// Fully canonicalizes an associative/commutative operation.
+    ///
+    /// The pass flattens before and after recursively canonicalizing children,
+    /// folds constants, sorts terms, removes identities and annihilators,
+    /// deduplicates `And`/`Or`, cancels even `Xor` multiplicities, applies
+    /// complement laws, and performs Boolean absorption before logical
+    /// lowering. Callers lower `Or`/`Xor` only after this returns.
     fn canonicalize_assoc_comm_op(op: AssocCommOp, lhs: Expr, rhs: Expr) -> Self {
         let mut terms = Vec::new();
-        Self::flatten_assoc_comm_op(op, lhs.canonicalize(), &mut terms);
-        Self::flatten_assoc_comm_op(op, rhs.canonicalize(), &mut terms);
+        Self::flatten_assoc_comm_op(op, lhs, &mut terms);
+        Self::flatten_assoc_comm_op(op, rhs, &mut terms);
+        Self::remove_absorbed_terms(op, &mut terms);
+
+        let mut canonicalized_terms = Vec::new();
+        for term in terms {
+            Self::flatten_assoc_comm_op(op, term.canonicalize(), &mut canonicalized_terms);
+        }
 
         let mut non_const_terms = Vec::new();
         let mut folded_const: Option<(u128, u16)> = None;
 
-        for term in terms {
+        for term in canonicalized_terms {
             match term {
                 Expr::Const { value, width } => {
                     let value = Self::canonical(value, width);
@@ -777,6 +1179,25 @@ impl Expr {
             AssocCommOp::Add | AssocCommOp::Mul => {}
         }
 
+        if matches!(op, AssocCommOp::And | AssocCommOp::Or)
+            && non_const_terms.iter().enumerate().any(|(index, lhs)| {
+                non_const_terms[index + 1..].iter().any(|rhs| {
+                    matches!(lhs, Expr::Not(inner) if inner.as_ref() == rhs)
+                        || matches!(rhs, Expr::Not(inner) if inner.as_ref() == lhs)
+                })
+            })
+            && let Some(width) = non_const_terms
+                .iter()
+                .find_map(Expr::expr_width)
+                .or_else(|| folded_const.map(|(_, width)| width))
+        {
+            return match op {
+                AssocCommOp::And => Self::const_bits(0, width),
+                AssocCommOp::Or => Self::const_bits(Self::bit_mask(width), width),
+                _ => unreachable!(),
+            };
+        }
+
         let Some((const_value, const_width)) = folded_const else {
             return match non_const_terms.len() {
                 0 => {
@@ -809,14 +1230,21 @@ impl Expr {
         }
     }
 
+    /// Resolves instruction-dependent values, then canonicalizes the result.
     pub fn collapse_and_canonicalize(self, instruction: &DecodedInstruction) -> Self {
         self.collapse(instruction).canonicalize()
     }
 
-    pub fn collapse_canonicalize_substitute(
+    /// Resolves the current instruction, substitutes prior state writes, then
+    /// canonicalizes the resulting expression.
+    ///
+    /// `previous_effects` must already refer to collapsed expressions in the
+    /// same state coordinate system. Substitution intentionally occurs before
+    /// canonicalization so inserted `Select` nodes and arithmetic can reduce.
+    pub fn collapse_substitute_and_canonicalize(
         self,
         instruction: &DecodedInstruction,
-        previous_effects: &Vec<Effect>,
+        previous_effects: &[Effect],
     ) -> Self {
         // previous_effects should already be collapsed, which means the collapse only needs to be run on the original Expr
         self.collapse(instruction)
@@ -824,184 +1252,174 @@ impl Expr {
             .canonicalize()
     }
 
-    /// Substitute state equations for a state read, in order to change an Expr from a function of state at
-    /// t=n-1 to a function of state at t=0.
-    /// Be careful to never run this function twice on an Expr!
-    pub fn substitute(self, previous_effects: &Vec<Effect>) -> Self {
+    /// Replaces register/memory reads with matching prior guarded writes.
+    ///
+    /// The first matching effect produces `select(guard, written_value,
+    /// original_read)`. Newly inserted values are not recursively substituted.
+    /// All other AST children are traversed recursively. Run this once per
+    /// instruction-composition step; applying it repeatedly to the same prior
+    /// effects can repeatedly wrap the fallback read.
+    pub fn substitute(self, previous_effects: &[Effect]) -> Self {
         match self {
             Expr::ReadRegister { ref register, .. } => {
-                for effect in previous_effects.iter() {
+                for effect in previous_effects {
                     if let Effect::WriteRegister {
                         guard,
                         register: reg_addr,
                         value,
                     } = effect
+                        && **register == *reg_addr
                     {
-                        if **register == *reg_addr {
-                            // Either return the new value, or the original value
-                            return select(guard.clone(), value.clone(), self);
-                        }
+                        return select(guard.clone(), value.clone(), self);
                     }
                 }
-                // If nothing matched, return self
-                return self;
+                self
             }
-            Expr::ReadMemory { ref address, ref width } => {
-                for effect in previous_effects.iter() {
+            Expr::ReadMemory {
+                ref address,
+                ref width,
+            } => {
+                for effect in previous_effects {
                     if let Effect::WriteMemory {
                         guard,
                         address: address_mem,
                         value,
                         width: width_mem,
                     } = effect
+                        && **address == *address_mem
+                        && width == width_mem
                     {
-                        if **address == *address_mem && width == width_mem {
-                            return select(guard.clone(), value.clone(), self);
-                        }
+                        return select(guard.clone(), value.clone(), self);
                     }
                 }
-                return self;
+                self
             }
-            Expr::Add(op1, op2) => Expr::Add(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Sub(op1, op2) => Expr::Sub(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Mul(op1, op2) => Expr::Mul(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::And(op1, op2) => Expr::And(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Or(op1, op2) => Expr::Or(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Xor(op1, op2) => Expr::Xor(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Not(op1) => Expr::Not(Box::new(op1.substitute(previous_effects))),
-            Expr::ShiftLeft(op1, op2) => Expr::ShiftLeft(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::LogicalShiftRight(op1, op2) => Expr::LogicalShiftRight(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::ArithmeticShiftRight(op1, op2) => Expr::ArithmeticShiftRight(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::RotateRight(op1, op2) => Expr::RotateRight(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Equal(op1, op2) => Expr::Equal(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::UnsignedLessThan(op1, op2) => Expr::UnsignedLessThan(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::SignedLessThan(op1, op2) => Expr::UnsignedLessThan(
-                Box::new(op1.substitute(previous_effects)),
-                Box::new(op2.substitute(previous_effects)),
-            ),
-            Expr::Extract { value, high, low } => Expr::Extract {
-                value: Box::new(value.substitute(previous_effects)),
-                high: high,
-                low: low,
-            },
-            Expr::Concat(ops) => {
-                Expr::Concat(ops.into_iter().map(|i| i.substitute(previous_effects)).collect())
-            }
-            Expr::ZeroExtend { value, to_width } => Expr::ZeroExtend {
-                value: Box::new(value.substitute(previous_effects)),
-                to_width: to_width,
-            },
-            Expr::SignExtend { value, to_width } => Expr::SignExtend {
-                value: Box::new(value.substitute(previous_effects)),
-                to_width: to_width,
-            },
-            Expr::CountOnes(op) => Expr::CountOnes(Box::new(op.substitute(previous_effects))),
-            Expr::AddCarryOut {
-                lhs,
-                rhs,
-                carry_in,
-                width,
-            } => Expr::AddCarryOut {
-                lhs: Box::new(lhs.substitute(previous_effects)),
-                rhs: Box::new(rhs.substitute(previous_effects)),
-                carry_in: Box::new(carry_in.substitute(previous_effects)),
-                width: width,
-            },
-            Expr::AddOverflow {
-                lhs,
-                rhs,
-                carry_in,
-                width,
-            } => Expr::AddOverflow {
-                lhs: Box::new(lhs.substitute(previous_effects)),
-                rhs: Box::new(rhs.substitute(previous_effects)),
-                carry_in: Box::new(carry_in.substitute(previous_effects)),
-                width: width,
-            },
-            Expr::SubCarryOut {
-                lhs,
-                rhs,
-                borrow_in,
-                width,
-            } => Expr::SubCarryOut {
-                lhs: Box::new(lhs.substitute(previous_effects)),
-                rhs: Box::new(rhs.substitute(previous_effects)),
-                borrow_in: Box::new(borrow_in.substitute(previous_effects)),
-                width: width,
-            },
-            Expr::SubOverflow {
-                lhs,
-                rhs,
-                borrow_in,
-                width,
-            } => Expr::SubOverflow {
-                lhs: Box::new(lhs.substitute(previous_effects)),
-                rhs: Box::new(rhs.substitute(previous_effects)),
-                borrow_in: Box::new(borrow_in.substitute(previous_effects)),
-                width: width,
-            },
-            Expr::Select {
-                condition,
-                when_true,
-                when_false,
-            } => Expr::Select {
-                condition: Box::new(condition.substitute(previous_effects)),
-                when_true: Box::new(when_true.substitute(previous_effects)),
-                when_false: Box::new(when_false.substitute(previous_effects)),
-            },
-            _ => self,
+            expr => expr.map_children(|child| child.substitute(previous_effects)),
         }
     }
 
+
+    /// Reduces multiplies, where one operand is a constant, to a combination of shift and add
+    fn canonicalize_mul(self) -> Self {
+        let width = self.expr_width().expect("Multiply must have established width in decoded instruction");
+        match self {
+            Expr::Mul(lhs, rhs) => {
+                match (*lhs, *rhs) {
+                    // Both consts, reduce to const
+                    (Expr::Const { value: value1, .. }, Expr::Const { value: value2, .. }) => {
+                        constant((value1 * value2) & Expr::bit_mask(width), width)
+                    },
+                    (Expr::Const { value, .. }, expr2) => {
+                        Self::mul_to_shift_add(expr2, value, constant(0, width), width)
+                    },
+                    (expr, Expr::Const { value, .. }) => {
+                        Self::mul_to_shift_add(expr, value, constant(0, width), width)
+                    },
+                    (expr, expr2) => {
+                        mul(expr, expr2)
+                    }
+                }
+            },
+            expr => expr
+        }
+    }
+
+    /// Given a variable term x (ie unknown) and a constant term a, convert x * a to
+    /// a series of shifts and adds
+    fn mul_to_shift_add(variable_term: Expr, constant_term: u128, accumulator: Expr, width: u16) -> Self {
+        if constant_term == 0 {
+            return accumulator.canonicalize()
+        }
+
+        let mut new_term = accumulator;
+        // If the LSB of the constant term is 1, shifting it right by one
+        // will result in a lost bit, so we need to add 1
+        if constant_term & 1 == 1 {
+            new_term = add(new_term, variable_term.clone());
+        }
+
+        // Now we will shift the variable term
+        // If the variable term is already a shift, however, we can just add one to its shift value
+        let new_variable_term = if let Expr::ShiftLeft(value, shift_amt) = variable_term {
+            shift_left(*value, add(*shift_amt, constant(1, width)))
+        } else { shift_left(variable_term, constant(1, width)) };
+        Self::mul_to_shift_add(new_variable_term, constant_term >> 1, new_term, width)
+    }
+
+    /// Recursively converts an expression to a deterministic reduced form.
+    ///
+    /// This pass does not resolve decoded fields or derived values and does not
+    /// generally evaluate constant operations; call `collapse` first for those
+    /// jobs. It normalizes associative operations, rewrites subtraction into
+    /// addition, and lowers `Or`, `Xor`, and `Select` to `And`/`Not`.
+    ///
+    /// Handles the following identities:
+    ///
+    /// Associative/commutative normalization:
+    /// - Flatten and sort nested `Add`, `Mul`, `And`, `Or`, and `Xor` terms.
+    /// - Fold constant terms of the same width.
+    ///
+    /// Neutral elements:
+    /// - `x + 0 = x`
+    /// - `x * 1 = x`
+    /// - `x & all_ones = x`
+    /// - `x | 0 = x`
+    /// - `x ^ 0 = x`
+    /// - `x - 0 = x`
+    ///
+    /// Absorbing elements:
+    /// - `x * 0 = 0`
+    /// - `x & 0 = 0`
+    /// - `x | all_ones = all_ones`
+    ///
+    /// Idempotence and cancellation:
+    /// - `x & x = x`
+    /// - `x | x = x`
+    /// - `x ^ x = 0`
+    /// - `x - x = 0`
+    /// - `x & !x = 0`
+    /// - `x | !x = all_ones`
+    ///
+    /// Absorption:
+    /// - `x & (x | y) = x`
+    /// - `x | (x & y) = x`
+    ///
+    /// Arithmetic and logical normalization:
+    /// - `x - y = x + !y + 1`
+    /// - `!!x = x`
+    /// - Fold `!constant`
+    ///
+    /// Shift and rotate identities:
+    /// - Shifting or rotating by zero returns the input.
+    /// - Shifting or rotating zero returns zero.
+    ///
+    /// Comparisons and selection:
+    /// - `x == x = true` (constant(1, 1))
+    /// - `x < x = false` (constant(0, 1))
+    /// - `select(true, x, y) = x`
+    /// - `select(false, x, y) = y`
+    /// - `select(c, x, x) = x`
+    ///
+    /// Width and structural identities:
+    /// - Extracting x bits of a value of width x returns the value itself
+    /// - Extending a value of with x to x bits returns the value itself
+    /// - Collapse nested extensions and adjacent constant concatenation terms.
+    ///
+    /// Multiplication is currently limited to associative ordering, constant
+    /// aggregation, and the `0`/`1` rules; it is not expanded into shifts/adds.
     pub fn canonicalize(self) -> Self {
         match self {
             Expr::Const { value, width } => Self::const_bits(value, width),
             Expr::Operand(_) | Expr::DerivedValue(_) => self,
             Expr::ReadRegister { register, width } => Expr::ReadRegister {
                 register: Box::new(register.canonicalize()),
-                width: width,
+                width,
             },
             Expr::ReadMemory { address, width } => Expr::ReadMemory {
                 address: Box::new(address.canonicalize()),
-                width: width,
+                width,
             },
-            Expr::Add(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Add, *lhs, *rhs),
+            Expr::Add(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Add, *lhs, *rhs).canonicalize_mul(),
             Expr::Sub(lhs, rhs) => {
                 let lhs = lhs.canonicalize();
                 let rhs = rhs.canonicalize();
@@ -1011,26 +1429,30 @@ impl Expr {
                 ) {
                     lhs
                 } else if lhs == rhs {
-                    if let Some(width) = lhs.expr_width() {
-                        Self::const_bits(0, width)
-                    } else {
-                        Expr::Sub(Box::new(lhs), Box::new(rhs))
-                    }
+                    let width = lhs
+                        .expr_width()
+                        .expect("canonicalized expression must have a known width");
+                    Self::const_bits(0, width)
                 } else {
-                    Expr::Sub(Box::new(lhs), Box::new(rhs))
+                    let width = lhs
+                        .expr_width()
+                        .expect("canonicalized expression must have a known width");
+                    add(add(lhs, not_expr(rhs)), constant(1, width)).canonicalize()
                 }
             }
-            Expr::Mul(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, *lhs, *rhs),
+            Expr::Mul(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, *lhs, *rhs).canonicalize_mul(),
             Expr::And(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::And, *lhs, *rhs),
-            Expr::Or(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Or, *lhs, *rhs),
-            Expr::Xor(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Xor, *lhs, *rhs),
-            Expr::Not(value) => {
-                let value = value.canonicalize();
-                match value {
-                    Expr::Not(inner) => *inner,
-                    value => Expr::Not(Box::new(value)),
-                }
+            Expr::Or(lhs, rhs) => {
+                Self::canonicalize_assoc_comm_op(AssocCommOp::Or, *lhs, *rhs).lower_operators()
             }
+            Expr::Xor(lhs, rhs) => {
+                Self::canonicalize_assoc_comm_op(AssocCommOp::Xor, *lhs, *rhs).lower_operators()
+            }
+            Expr::Not(value) => match value.canonicalize() {
+                Expr::Const { value, width } => Self::const_bits(!value, width),
+                Expr::Not(inner) => *inner,
+                value => Expr::Not(Box::new(value)),
+            },
             Expr::ShiftLeft(value, amount) => {
                 Self::canonicalize_shift_like_op(*value, *amount, Expr::ShiftLeft)
             }
@@ -1093,93 +1515,18 @@ impl Expr {
 
                 Expr::Extract {
                     value: Box::new(value),
-                    high: high,
-                    low: low,
+                    high,
+                    low,
                 }
             }
             Expr::Concat(values) => {
-                let mut new_values = Vec::new();
-                for value in values {
-                    let value = value.canonicalize();
-                    match value {
-                        Expr::Const { value, width } => {
-                            Self::assert_valid_width(width);
-                            if let Some(Expr::Const {
-                                value: previous_value,
-                                width: previous_width,
-                            }) = new_values.last_mut()
-                            {
-                                let combined_width = *previous_width + width;
-                                Self::assert_valid_width(combined_width);
-                                *previous_value = Self::canonical(
-                                    (Self::canonical(*previous_value, *previous_width) << width)
-                                        | Self::canonical(value, width),
-                                    combined_width,
-                                );
-                                *previous_width = combined_width;
-                            } else {
-                                new_values.push(Self::const_bits(value, width));
-                            }
-                        }
-                        value => new_values.push(value),
-                    }
-                }
-                if new_values.len() == 1 {
-                    new_values
-                        .into_iter()
-                        .next()
-                        .expect("Length is 1, so there should be one value")
-                } else {
-                    Expr::Concat(new_values)
-                }
+                Self::rebuild_concat(values.into_iter().map(Expr::canonicalize))
             }
             Expr::ZeroExtend { value, to_width } => {
-                let value = value.canonicalize();
-                if let Some(value_width) = value.expr_width() {
-                    if value_width > to_width {
-                        panic!(
-                            "Zext to_width must be at least value width, but got width = {value_width} and to_width = {to_width}"
-                        );
-                    }
-                    if value_width == to_width {
-                        return value;
-                    }
-                }
-
-                match value {
-                    Expr::ZeroExtend { value, .. } => Expr::ZeroExtend {
-                        value,
-                        to_width: to_width,
-                    },
-                    value => Expr::ZeroExtend {
-                        value: Box::new(value),
-                        to_width: to_width,
-                    },
-                }
+                Self::canonicalize_extension(*value, to_width, ExtensionOp::Zero)
             }
             Expr::SignExtend { value, to_width } => {
-                let value = value.canonicalize();
-                if let Some(value_width) = value.expr_width() {
-                    if value_width > to_width {
-                        panic!(
-                            "Sign extend to_width must be at least value width, but got width = {value_width} and to_width = {to_width}"
-                        );
-                    }
-                    if value_width == to_width {
-                        return value;
-                    }
-                }
-
-                match value {
-                    Expr::SignExtend { value, .. } => Expr::SignExtend {
-                        value,
-                        to_width: to_width,
-                    },
-                    value => Expr::SignExtend {
-                        value: Box::new(value),
-                        to_width: to_width,
-                    },
-                }
+                Self::canonicalize_extension(*value, to_width, ExtensionOp::Sign)
             }
             Expr::CountOnes(value) => Expr::CountOnes(Box::new(value.canonicalize())),
             Expr::AddCarryOut {
@@ -1187,25 +1534,25 @@ impl Expr {
                 rhs,
                 carry_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, add_carry_out),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, FlagOp::AddCarryOut),
             Expr::AddOverflow {
                 lhs,
                 rhs,
                 carry_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, add_overflow),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *carry_in, width, FlagOp::AddOverflow),
             Expr::SubCarryOut {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, sub_carry_out),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, FlagOp::SubCarryOut),
             Expr::SubOverflow {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, sub_overflow),
+            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, FlagOp::SubOverflow),
             Expr::Select {
                 condition,
                 when_true,
@@ -1224,28 +1571,30 @@ impl Expr {
                         condition: Box::new(condition),
                         when_true: Box::new(when_true),
                         when_false: Box::new(when_false),
-                    },
+                    }
+                    .lower_operators(),
                 }
             }
         }
     }
 
-    /// Evaluates all `Select` statements and `guard`s given the actual instruction, as well as substituting
-    /// DerivedValues into the Expr
+    /// Resolves instruction-dependent leaves and folds newly constant subtrees.
+    ///
+    /// Immediate/register fields and `DerivedValue`s are replaced using
+    /// `instruction`. Constant arithmetic, comparisons, shifts, extensions,
+    /// concatenations, flag helpers, and constant-condition `Select`s are
+    /// evaluated recursively. Nonconstant structure and operand order are
+    /// preserved; this method does not perform algebraic canonicalization or
+    /// prior-state substitution.
     pub fn collapse(self, instruction: &DecodedInstruction) -> Self {
-        let collapsed_expr = self;
-
-        let derived_values: HashMap<String, DerivedValue> = instruction
+        let derived_values = &instruction
             .form
             .as_ref()
             .expect("DecodedInstruction.form must not be None")
-            .derived_values
-            .iter()
-            .map(|v| (v.name.0.clone(), v.clone()))
-            .collect();
+            .derived_values;
 
-        match collapsed_expr {
-            Expr::Const { .. } => collapsed_expr,
+        match self {
+            constant @ Expr::Const { .. } => constant,
             Expr::Operand(ImmediateField(field_name)) => {
                 let imm = instruction
                     .field_value(&field_name)
@@ -1277,11 +1626,13 @@ impl Expr {
                         .expect("Register address length value must fit into u16"),
                 }))
             }
-            Expr::Operand(RegisterField(RegisterRef::Fixed { .. })) => collapsed_expr,
+            fixed @ Expr::Operand(RegisterField(RegisterRef::Fixed { .. })) => fixed,
             Expr::DerivedValue(name) => derived_values
-                .get(name.0.as_str())
+                .iter()
+                .find(|value| value.name == name)
                 .unwrap_or_else(|| panic!("Derived value {} does not exist!", name.0))
-                .value.clone()
+                .value
+                .clone()
                 .collapse(instruction),
             Expr::ReadRegister { register, width } => Expr::ReadRegister {
                 register: Box::new(register.collapse(instruction)),
@@ -1292,76 +1643,89 @@ impl Expr {
                 width,
             },
             Expr::Add(op1, op2) => {
-                Self::collapse_assoc_comm_op(instruction, op1, op2, AssocCommOp::Add)
+                Self::collapse_assoc_comm_op(instruction, *op1, *op2, AssocCommOp::Add)
             }
             Expr::Sub(op1, op2) => {
-                Self::collapse_binary_op(instruction, op1, op2, Expr::Sub, |lhs, rhs, _width| {
-                    lhs.wrapping_sub(rhs)
+                Self::collapse_binary_op(instruction, *op1, *op2, Expr::Sub, |lhs, rhs, width| {
+                    Self::const_bits(lhs.wrapping_sub(rhs), width)
                 })
             }
             Expr::Mul(op1, op2) => {
-                Self::collapse_assoc_comm_op(instruction, op1, op2, AssocCommOp::Mul)
+                Self::collapse_assoc_comm_op(instruction, *op1, *op2, AssocCommOp::Mul)
             }
             Expr::And(op1, op2) => {
-                Self::collapse_assoc_comm_op(instruction, op1, op2, AssocCommOp::And)
+                Self::collapse_assoc_comm_op(instruction, *op1, *op2, AssocCommOp::And)
             }
             Expr::Or(op1, op2) => {
-                Self::collapse_assoc_comm_op(instruction, op1, op2, AssocCommOp::Or)
+                Self::collapse_assoc_comm_op(instruction, *op1, *op2, AssocCommOp::Or)
             }
             Expr::Xor(op1, op2) => {
-                Self::collapse_assoc_comm_op(instruction, op1, op2, AssocCommOp::Xor)
+                Self::collapse_assoc_comm_op(instruction, *op1, *op2, AssocCommOp::Xor)
             }
             Expr::Not(op) => {
-                Self::collapse_unary_op(instruction, op, Expr::Not, |value, _width| !value)
+                Self::collapse_unary_op(instruction, *op, Expr::Not, |value, _width| !value)
             }
             Expr::ShiftLeft(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::ShiftLeft,
-                Self::shift_left_const,
+                |value, amount, width| {
+                    Self::const_bits(Self::shift_left_const(value, amount, width), width)
+                },
             ),
             Expr::LogicalShiftRight(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::LogicalShiftRight,
-                Self::logical_shift_right_const,
+                |value, amount, width| {
+                    Self::const_bits(Self::logical_shift_right_const(value, amount, width), width)
+                },
             ),
             Expr::ArithmeticShiftRight(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::ArithmeticShiftRight,
-                Self::arithmetic_shift_right_const,
+                |value, amount, width| {
+                    Self::const_bits(
+                        Self::arithmetic_shift_right_const(value, amount, width),
+                        width,
+                    )
+                },
             ),
             Expr::RotateRight(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::RotateRight,
-                Self::rotate_right_const,
+                |value, amount, width| {
+                    Self::const_bits(Self::rotate_right_const(value, amount, width), width)
+                },
             ),
-            Expr::Equal(op1, op2) => Self::collapse_binary_pred(
+            Expr::Equal(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::Equal,
-                |lhs, rhs, _width| lhs == rhs,
+                |lhs, rhs, _width| bool_const(lhs == rhs),
             ),
-            Expr::UnsignedLessThan(op1, op2) => Self::collapse_binary_pred(
+            Expr::UnsignedLessThan(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::UnsignedLessThan,
-                |lhs, rhs, _width| lhs < rhs,
+                |lhs, rhs, _width| bool_const(lhs < rhs),
             ),
-            Expr::SignedLessThan(op1, op2) => Self::collapse_binary_pred(
+            Expr::SignedLessThan(op1, op2) => Self::collapse_binary_op(
                 instruction,
-                op1,
-                op2,
+                *op1,
+                *op2,
                 Expr::SignedLessThan,
-                |lhs, rhs, width| Self::signed_value(lhs, width) < Self::signed_value(rhs, width),
+                |lhs, rhs, width| {
+                    bool_const(Self::signed_value(lhs, width) < Self::signed_value(rhs, width))
+                },
             ),
             Expr::Extract { value, high, low } => {
                 if high < low {
@@ -1394,76 +1758,16 @@ impl Expr {
                 }
             }
             Expr::Concat(exprs) => {
-                let mut new_exprs = vec![];
-                for expr in exprs {
-                    let expr_collapsed = expr.collapse(instruction);
-                    match expr_collapsed {
-                        Expr::Const { value, width } => {
-                            Self::assert_valid_width(width);
-                            if let Some(Expr::Const {
-                                value: value_2,
-                                width: width_2,
-                            }) = new_exprs.last_mut()
-                            {
-                                let combined_width = *width_2 + width;
-                                Self::assert_valid_width(combined_width);
-                                *value_2 = Self::canonical(
-                                    (Self::canonical(*value_2, *width_2) << width)
-                                        | Self::canonical(value, width),
-                                    combined_width,
-                                );
-                                *width_2 = combined_width;
-                            } else {
-                                new_exprs.push(Self::const_bits(value, width))
-                            }
-                        }
-                        expr_collapsed => new_exprs.push(expr_collapsed),
-                    }
-                }
-                // If new_exprs has just one element, return that element
-                if new_exprs.len() == 1 {
-                    new_exprs
-                        .into_iter()
-                        .next()
-                        .expect("Since the length is 1, there should be a first element")
-                } else {
-                    Expr::Concat(new_exprs)
-                }
+                Self::rebuild_concat(exprs.into_iter().map(|expr| expr.collapse(instruction)))
             }
             Expr::ZeroExtend { value, to_width } => {
-                let value_collapsed = value.collapse(instruction);
-                match value_collapsed {
-                    Expr::Const {
-                        value: value_val,
-                        width,
-                    } => Expr::Const {
-                        value: Self::zero_extend_const(value_val, width, to_width),
-                        width: to_width,
-                    },
-                    value_collapsed => Expr::ZeroExtend {
-                        value: Box::new(value_collapsed),
-                        to_width,
-                    },
-                }
+                Self::collapse_extension(instruction, *value, to_width, ExtensionOp::Zero)
             }
             Expr::SignExtend { value, to_width } => {
-                let value_collapsed = value.collapse(instruction);
-                match value_collapsed {
-                    Expr::Const {
-                        value: value_val,
-                        width,
-                    } => Expr::Const {
-                        value: Self::sign_extend_const(value_val, width, to_width),
-                        width: to_width,
-                    },
-                    value_collapsed => Expr::SignExtend {
-                        value: Box::new(value_collapsed),
-                        to_width,
-                    },
-                }
+                Self::collapse_extension(instruction, *value, to_width, ExtensionOp::Sign)
             }
             Expr::CountOnes(expr) => {
-                Self::collapse_unary_op(instruction, expr, Expr::CountOnes, |value, _width| {
+                Self::collapse_unary_op(instruction, *expr, Expr::CountOnes, |value, _width| {
                     value.count_ones() as u128
                 })
             }
@@ -1472,161 +1776,53 @@ impl Expr {
                 rhs,
                 carry_in,
                 width,
-            } => {
-                let lhs_collapsed = lhs.collapse(instruction);
-                let rhs_collapsed = rhs.collapse(instruction);
-                let cin_collapsed = carry_in.collapse(instruction);
-                if let Expr::Const {
-                    value: lhs_val,
-                    width: lhs_width,
-                } = lhs_collapsed
-                    && let Expr::Const {
-                        value: rhs_val,
-                        width: rhs_width,
-                    } = rhs_collapsed
-                    && let Expr::Const {
-                        value: cin_val,
-                        width: cin_width,
-                    } = cin_collapsed
-                {
-                    if !(Self::expect_same_width(lhs_width, rhs_width) == width) {
-                        panic!("LHS, RHS, and output must have equal width for AddCarryOut");
-                    }
-                    let cin_val = Self::expect_bool_const(cin_val, cin_width, "carry_in");
-                    let cout_set = Self::add_carry_out_const(lhs_val, rhs_val, cin_val, width);
-                    Expr::Const {
-                        value: cout_set as u128,
-                        width: 1,
-                    }
-                } else {
-                    Expr::AddCarryOut {
-                        lhs: Box::new(lhs_collapsed),
-                        rhs: Box::new(rhs_collapsed),
-                        carry_in: Box::new(cin_collapsed),
-                        width: width,
-                    }
-                }
-            }
+            } => Self::collapse_flag_expr(
+                instruction,
+                *lhs,
+                *rhs,
+                *carry_in,
+                width,
+                FlagOp::AddCarryOut,
+            ),
             Expr::AddOverflow {
                 lhs,
                 rhs,
                 carry_in,
                 width,
-            } => {
-                let lhs_collapsed = lhs.collapse(instruction);
-                let rhs_collapsed = rhs.collapse(instruction);
-                let cin_collapsed = carry_in.collapse(instruction);
-                if let Expr::Const {
-                    value: lhs_val,
-                    width: lhs_width,
-                } = lhs_collapsed
-                    && let Expr::Const {
-                        value: rhs_val,
-                        width: rhs_width,
-                    } = rhs_collapsed
-                    && let Expr::Const {
-                        value: cin_val,
-                        width: cin_width,
-                    } = cin_collapsed
-                {
-                    if !(Self::expect_same_width(lhs_width, rhs_width) == width) {
-                        panic!("LHS, RHS, and output must have equal width for AddOverflow");
-                    }
-                    let cin_val = Self::expect_bool_const(cin_val, cin_width, "carry_in");
-                    let overflow = Self::add_overflow_const(lhs_val, rhs_val, cin_val, width);
-                    Expr::Const {
-                        value: overflow as u128,
-                        width: 1,
-                    }
-                } else {
-                    Expr::AddOverflow {
-                        lhs: Box::new(lhs_collapsed),
-                        rhs: Box::new(rhs_collapsed),
-                        carry_in: Box::new(cin_collapsed),
-                        width: width,
-                    }
-                }
-            }
+            } => Self::collapse_flag_expr(
+                instruction,
+                *lhs,
+                *rhs,
+                *carry_in,
+                width,
+                FlagOp::AddOverflow,
+            ),
             Expr::SubCarryOut {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => {
-                let lhs_collapsed = lhs.collapse(instruction);
-                let rhs_collapsed = rhs.collapse(instruction);
-                let bin_collapsed = borrow_in.collapse(instruction);
-                if let Expr::Const {
-                    value: lhs_val,
-                    width: lhs_width,
-                } = lhs_collapsed
-                    && let Expr::Const {
-                        value: rhs_val,
-                        width: rhs_width,
-                    } = rhs_collapsed
-                    && let Expr::Const {
-                        value: bin_val,
-                        width: bin_width,
-                    } = bin_collapsed
-                {
-                    if !(Self::expect_same_width(lhs_width, rhs_width) == width) {
-                        panic!("LHS, RHS, and output must have equal width for SubCarryOut");
-                    }
-                    let bin_val = Self::expect_bool_const(bin_val, bin_width, "borrow_in");
-                    let cout_set = Self::sub_carry_out_const(lhs_val, rhs_val, bin_val, width);
-                    Expr::Const {
-                        value: cout_set as u128,
-                        width: 1,
-                    }
-                } else {
-                    Expr::SubCarryOut {
-                        lhs: Box::new(lhs_collapsed),
-                        rhs: Box::new(rhs_collapsed),
-                        borrow_in: Box::new(bin_collapsed),
-                        width,
-                    }
-                }
-            }
+            } => Self::collapse_flag_expr(
+                instruction,
+                *lhs,
+                *rhs,
+                *borrow_in,
+                width,
+                FlagOp::SubCarryOut,
+            ),
             Expr::SubOverflow {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => {
-                let lhs_collapsed = lhs.collapse(instruction);
-                let rhs_collapsed = rhs.collapse(instruction);
-                let bin_collapsed = borrow_in.collapse(instruction);
-                if let Expr::Const {
-                    value: lhs_val,
-                    width: lhs_width,
-                } = lhs_collapsed
-                    && let Expr::Const {
-                        value: rhs_val,
-                        width: rhs_width,
-                    } = rhs_collapsed
-                    && let Expr::Const {
-                        value: bin_val,
-                        width: bin_width,
-                    } = bin_collapsed
-                {
-                    if !(Self::expect_same_width(lhs_width, rhs_width) == width) {
-                        panic!("LHS, RHS, and output must have equal width for SubOverflow");
-                    }
-                    let bin_val = Self::expect_bool_const(bin_val, bin_width, "borrow_in");
-                    let overflow = Self::sub_overflow_const(lhs_val, rhs_val, bin_val, width);
-                    Expr::Const {
-                        value: overflow as u128,
-                        width: 1,
-                    }
-                } else {
-                    Expr::SubOverflow {
-                        lhs: Box::new(lhs_collapsed),
-                        rhs: Box::new(rhs_collapsed),
-                        borrow_in: Box::new(bin_collapsed),
-                        width: width,
-                    }
-                }
-            }
+            } => Self::collapse_flag_expr(
+                instruction,
+                *lhs,
+                *rhs,
+                *borrow_in,
+                width,
+                FlagOp::SubOverflow,
+            ),
             Expr::Select {
                 condition,
                 when_true,
@@ -1660,9 +1856,14 @@ impl Expr {
     }
 }
 
+/// Name of a form-local derived semantic value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ValueName(pub String);
+pub struct ValueName(
+    /// Owned identifier used to match a form's derived-value definition.
+    pub String,
+);
 
+/// Name of a decoded instruction field.
 pub type FieldName = String;
 
 /// A decoded instruction operand that can appear inside an expression.
@@ -1707,7 +1908,10 @@ pub enum RegisterRef {
 /// if there is some value stored in state that needs to be stored.
 /// This should be used for ALL state that isn't memory (including eg flags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Register(pub u8);
+pub struct Register(
+    /// Numeric architectural or virtual register identifier.
+    pub u8,
+);
 
 /// Effect of an instruction
 /// Every effect is either on a register or memory
@@ -1742,6 +1946,7 @@ pub enum Effect {
 }
 
 impl Effect {
+    /// Creates an unconditional register write.
     pub fn write_register(register: Expr, value: Expr) -> Self {
         Self::WriteRegister {
             guard: bool_const(true),
@@ -1750,6 +1955,7 @@ impl Effect {
         }
     }
 
+    /// Creates a register write guarded by a 1-bit condition.
     pub fn write_register_if(guard: Expr, register: Expr, value: Expr) -> Self {
         Self::WriteRegister {
             guard,
@@ -1758,6 +1964,7 @@ impl Effect {
         }
     }
 
+    /// Creates an unconditional memory write of `width` bits.
     pub fn write_memory(address: Expr, value: Expr, width: u16) -> Self {
         Self::WriteMemory {
             guard: bool_const(true),
@@ -1767,6 +1974,7 @@ impl Effect {
         }
     }
 
+    /// Creates a memory write guarded by a 1-bit condition.
     pub fn write_memory_if(guard: Expr, address: Expr, value: Expr, width: u16) -> Self {
         Self::WriteMemory {
             guard,
@@ -1777,22 +1985,30 @@ impl Effect {
     }
 }
 
+/// Allocates an owned instruction-field name.
 pub fn field_name(name: &str) -> FieldName {
     name.to_owned()
 }
 
+/// Constructs a literal bit-vector.
+///
+/// The value is truncated when evaluated or canonicalized, not by this
+/// lightweight constructor.
 pub fn constant(value: u128, width: u16) -> Expr {
     Expr::Const { value, width }
 }
 
+/// Constructs a canonical 1-bit boolean literal.
 pub fn bool_const(value: bool) -> Expr {
     constant(value as u128, 1)
 }
 
+/// References the raw value of an immediate instruction field.
 pub fn immediate_field(name: &str) -> Expr {
     Expr::Operand(OperandRef::ImmediateField(field_name(name)))
 }
 
+/// References a value defined by the matched instruction form.
 pub fn derived_value(name: &str) -> Expr {
     Expr::DerivedValue(ValueName(name.to_owned()))
 }
@@ -1816,6 +2032,9 @@ pub fn fixed_register(register: Register, identifier_width: u16) -> Expr {
     }))
 }
 
+/// Constructs a state read from a register-identifier expression.
+///
+/// `width` is the width of the stored value, not the register identifier.
 pub fn read_register(register: Expr, width: u16) -> Expr {
     Expr::ReadRegister {
         register: Box::new(register),
@@ -1823,6 +2042,7 @@ pub fn read_register(register: Expr, width: u16) -> Expr {
     }
 }
 
+/// Constructs a memory read of `width` bits from a byte-address expression.
 pub fn read_memory(address: Expr, width: u16) -> Expr {
     Expr::ReadMemory {
         address: Box::new(address),
@@ -1830,70 +2050,89 @@ pub fn read_memory(address: Expr, width: u16) -> Expr {
     }
 }
 
+/// Reads the register whose identifier is encoded by instruction field `name`.
 pub fn read_register_field(name: &str, width: u16) -> Expr {
     read_register(register_field(name), width)
 }
 
+/// Reads a fixed register with separate identifier and stored-value widths.
 pub fn read_fixed_register(register: Register, identifier_width: u16, data_width: u16) -> Expr {
     read_register(fixed_register(register, identifier_width), data_width)
 }
 
+/// Constructs an equality comparison returning one bit.
 pub fn equal(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Equal(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs an unsigned less-than comparison returning one bit.
 pub fn unsigned_less_than(lhs: Expr, rhs: Expr) -> Expr {
     Expr::UnsignedLessThan(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs a signed two's-complement less-than comparison returning one bit.
 pub fn signed_less_than(lhs: Expr, rhs: Expr) -> Expr {
     Expr::SignedLessThan(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs wrapping bit-vector addition.
 pub fn add(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Add(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs wrapping bit-vector subtraction.
 pub fn sub(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Sub(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs width-preserving wrapping multiplication.
 pub fn mul(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Mul(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs bitwise AND, or Boolean conjunction for 1-bit operands.
 pub fn and_expr(lhs: Expr, rhs: Expr) -> Expr {
     Expr::And(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs bitwise OR, or Boolean disjunction for 1-bit operands.
 pub fn or_expr(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Or(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs bitwise XOR, or Boolean inequality for 1-bit operands.
 pub fn xor_expr(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Xor(Box::new(lhs), Box::new(rhs))
 }
 
+/// Constructs bitwise NOT, or Boolean negation for a 1-bit operand.
 pub fn not_expr(value: Expr) -> Expr {
     Expr::Not(Box::new(value))
 }
 
+/// Constructs a logical left shift by an unsigned amount.
 pub fn shift_left(value: Expr, amount: Expr) -> Expr {
     Expr::ShiftLeft(Box::new(value), Box::new(amount))
 }
 
+/// Constructs a zero-filling logical right shift.
 pub fn logical_shift_right(value: Expr, amount: Expr) -> Expr {
     Expr::LogicalShiftRight(Box::new(value), Box::new(amount))
 }
 
+/// Constructs a sign-filling arithmetic right shift.
 pub fn arithmetic_shift_right(value: Expr, amount: Expr) -> Expr {
     Expr::ArithmeticShiftRight(Box::new(value), Box::new(amount))
 }
 
+/// Constructs rotate-right; evaluated amounts are reduced modulo value width.
 pub fn rotate_right(value: Expr, amount: Expr) -> Expr {
     Expr::RotateRight(Box::new(value), Box::new(amount))
 }
 
+/// Extracts inclusive bit range `high..=low`.
+///
+/// Range validation occurs during `collapse` or `canonicalize`.
 pub fn extract(value: Expr, high: u16, low: u16) -> Expr {
     Expr::Extract {
         value: Box::new(value),
@@ -1902,10 +2141,12 @@ pub fn extract(value: Expr, high: u16, low: u16) -> Expr {
     }
 }
 
+/// Concatenates values from most-significant chunk to least-significant chunk.
 pub fn concat(values: impl IntoIterator<Item = Expr>) -> Expr {
     Expr::Concat(values.into_iter().collect())
 }
 
+/// Constructs zero extension to `to_width`.
 pub fn zero_extend(value: Expr, to_width: u16) -> Expr {
     Expr::ZeroExtend {
         value: Box::new(value),
@@ -1913,6 +2154,7 @@ pub fn zero_extend(value: Expr, to_width: u16) -> Expr {
     }
 }
 
+/// Constructs sign extension to `to_width`.
 pub fn sign_extend(value: Expr, to_width: u16) -> Expr {
     Expr::SignExtend {
         value: Box::new(value),
@@ -1920,10 +2162,12 @@ pub fn sign_extend(value: Expr, to_width: u16) -> Expr {
     }
 }
 
+/// Counts set bits; the expression result retains the input's declared width.
 pub fn count_ones(value: Expr) -> Expr {
     Expr::CountOnes(Box::new(value))
 }
 
+/// Constructs unsigned carry-out from `lhs + rhs + carry_in`.
 pub fn add_carry_out(lhs: Expr, rhs: Expr, carry_in: Expr, width: u16) -> Expr {
     Expr::AddCarryOut {
         lhs: Box::new(lhs),
@@ -1933,6 +2177,7 @@ pub fn add_carry_out(lhs: Expr, rhs: Expr, carry_in: Expr, width: u16) -> Expr {
     }
 }
 
+/// Constructs signed overflow from `lhs + rhs + carry_in`.
 pub fn add_overflow(lhs: Expr, rhs: Expr, carry_in: Expr, width: u16) -> Expr {
     Expr::AddOverflow {
         lhs: Box::new(lhs),
@@ -1942,6 +2187,7 @@ pub fn add_overflow(lhs: Expr, rhs: Expr, carry_in: Expr, width: u16) -> Expr {
     }
 }
 
+/// Constructs subtraction carry (“no borrow”) from `lhs - rhs - borrow_in`.
 pub fn sub_carry_out(lhs: Expr, rhs: Expr, borrow_in: Expr, width: u16) -> Expr {
     Expr::SubCarryOut {
         lhs: Box::new(lhs),
@@ -1951,6 +2197,7 @@ pub fn sub_carry_out(lhs: Expr, rhs: Expr, borrow_in: Expr, width: u16) -> Expr 
     }
 }
 
+/// Constructs signed overflow from `lhs - rhs - borrow_in`.
 pub fn sub_overflow(lhs: Expr, rhs: Expr, borrow_in: Expr, width: u16) -> Expr {
     Expr::SubOverflow {
         lhs: Box::new(lhs),
@@ -1960,6 +2207,9 @@ pub fn sub_overflow(lhs: Expr, rhs: Expr, borrow_in: Expr, width: u16) -> Expr {
     }
 }
 
+/// Constructs a conditional expression.
+///
+/// `condition` must be one bit and both result branches must have equal width.
 pub fn select(condition: Expr, when_true: Expr, when_false: Expr) -> Expr {
     Expr::Select {
         condition: Box::new(condition),
@@ -1968,6 +2218,7 @@ pub fn select(condition: Expr, when_true: Expr, when_false: Expr) -> Expr {
     }
 }
 
+/// Compares an immediate field with a literal of the supplied width.
 pub fn field_is(name: &str, value: u128, width: u16) -> Expr {
     equal(immediate_field(name), constant(value, width))
 }
@@ -1982,6 +2233,7 @@ mod tests {
         },
     };
 
+    /// Builds a decoded instruction with no fields or derived values.
     fn empty_instruction() -> DecodedInstruction {
         DecodedInstruction {
             name: Some("test".to_owned()),
@@ -1991,6 +2243,7 @@ mod tests {
         }
     }
 
+    /// Builds the shared decoded fixture used by field-resolution tests.
     fn decoded_fixture_instruction() -> DecodedInstruction {
         let instruction = Instruction::new("fixture", 8).form(
             InstructionForm::new("imm_form")
@@ -2010,6 +2263,76 @@ mod tests {
         instruction
             .find_match(&bits.bits)
             .expect("fixture instruction should decode")
+    }
+
+    /// Asserts recursively that subtraction, OR, and XOR have been lowered.
+    fn assert_operator_reduced(expr: &Expr) {
+        match expr {
+            Expr::Sub(_, _) | Expr::Or(_, _) | Expr::Xor(_, _) => {
+                panic!("expression still contains a reduced operator: {expr:?}")
+            }
+            Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => {}
+            Expr::ReadRegister { register, .. } => assert_operator_reduced(register),
+            Expr::ReadMemory { address, .. } => assert_operator_reduced(address),
+            Expr::Not(value)
+            | Expr::CountOnes(value)
+            | Expr::Extract { value, .. }
+            | Expr::ZeroExtend { value, .. }
+            | Expr::SignExtend { value, .. } => assert_operator_reduced(value),
+            Expr::Add(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::ShiftLeft(lhs, rhs)
+            | Expr::LogicalShiftRight(lhs, rhs)
+            | Expr::ArithmeticShiftRight(lhs, rhs)
+            | Expr::RotateRight(lhs, rhs)
+            | Expr::Equal(lhs, rhs)
+            | Expr::UnsignedLessThan(lhs, rhs)
+            | Expr::SignedLessThan(lhs, rhs) => {
+                assert_operator_reduced(lhs);
+                assert_operator_reduced(rhs);
+            }
+            Expr::Concat(values) => {
+                for value in values {
+                    assert_operator_reduced(value);
+                }
+            }
+            Expr::AddCarryOut {
+                lhs, rhs, carry_in, ..
+            }
+            | Expr::AddOverflow {
+                lhs, rhs, carry_in, ..
+            } => {
+                assert_operator_reduced(lhs);
+                assert_operator_reduced(rhs);
+                assert_operator_reduced(carry_in);
+            }
+            Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in,
+                ..
+            }
+            | Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in,
+                ..
+            } => {
+                assert_operator_reduced(lhs);
+                assert_operator_reduced(rhs);
+                assert_operator_reduced(borrow_in);
+            }
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                assert_operator_reduced(condition);
+                assert_operator_reduced(when_true);
+                assert_operator_reduced(when_false);
+            }
+        }
     }
 
     #[test]
@@ -2201,6 +2524,18 @@ mod tests {
                 constant(0xff, 8),
             )
         );
+    }
+
+    #[test]
+    fn substitute_preserves_signed_comparison_kind() {
+        let lhs = read_fixed_register(Register(1), 4, 8);
+        let rhs = read_fixed_register(Register(2), 4, 8);
+        let expression = signed_less_than(lhs, rhs);
+
+        assert!(matches!(
+            expression.substitute(&[]),
+            Expr::SignedLessThan(_, _)
+        ));
     }
 
     #[test]
@@ -2497,17 +2832,13 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_bitwise_deduplicates_and_cancels_terms() {
+    fn canonicalize_bitwise_deduplicates_and_cancels_and_xor_terms() {
         let x = fixed_register(Register(1), 4);
         let y = fixed_register(Register(2), 4);
 
         assert_eq!(
             and_expr(y.clone(), and_expr(x.clone(), x.clone())).canonicalize(),
             and_expr(x.clone(), y.clone())
-        );
-        assert_eq!(
-            or_expr(y.clone(), or_expr(x.clone(), x.clone())).canonicalize(),
-            or_expr(x.clone(), y.clone())
         );
         assert_eq!(
             xor_expr(x.clone(), x.clone()).canonicalize(),
@@ -2589,6 +2920,150 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_reduces_boolean_select_to_and_and_not() {
+        let condition = read_fixed_register(Register(1), 4, 1);
+        let when_true = read_fixed_register(Register(2), 4, 1);
+        let when_false = read_fixed_register(Register(3), 4, 1);
+
+        let canonical = select(condition, when_true, when_false).canonicalize();
+
+        assert_operator_reduced(&canonical);
+        assert!(!matches!(canonical, Expr::Select { .. }));
+        assert_eq!(canonical.expr_width(), Some(1));
+        assert_eq!(canonical.clone().canonicalize(), canonical);
+    }
+
+    #[test]
+    fn canonicalize_boolean_select_matches_sum_of_products() {
+        let condition = read_fixed_register(Register(1), 4, 1);
+        let when_true = read_fixed_register(Register(2), 4, 1);
+        let when_false = read_fixed_register(Register(3), 4, 1);
+        let sum_of_products = or_expr(
+            and_expr(condition.clone(), when_true.clone()),
+            and_expr(not_expr(condition.clone()), when_false.clone()),
+        );
+
+        assert_eq!(
+            select(condition, when_true, when_false).canonicalize(),
+            sum_of_products.canonicalize()
+        );
+    }
+
+    #[test]
+    fn canonicalize_select_preserves_vector_result_width() {
+        let condition = read_fixed_register(Register(1), 4, 1);
+        let when_true = read_fixed_register(Register(2), 4, 8);
+        let when_false = read_fixed_register(Register(3), 4, 8);
+
+        assert_eq!(
+            select(condition, when_true, when_false)
+                .canonicalize()
+                .expr_width(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn canonicalize_vector_select_matches_masked_sum_of_products() {
+        let condition = read_fixed_register(Register(1), 4, 1);
+        let when_true = read_fixed_register(Register(2), 4, 8);
+        let when_false = read_fixed_register(Register(3), 4, 8);
+        let mask = sign_extend(condition.clone(), 8);
+        let sum_of_products = or_expr(
+            and_expr(mask.clone(), when_true.clone()),
+            and_expr(not_expr(mask), when_false.clone()),
+        );
+
+        assert_eq!(
+            select(condition, when_true, when_false).canonicalize(),
+            sum_of_products.canonicalize()
+        );
+    }
+
+    #[test]
+    fn canonicalize_folds_constants_across_nested_bitwise_operations() {
+        let x = read_fixed_register(Register(1), 4, 4);
+
+        assert_eq!(
+            and_expr(
+                constant(0b1110, 4),
+                and_expr(x.clone(), constant(0b1001, 4)),
+            )
+            .canonicalize(),
+            and_expr(x.clone(), constant(0b1000, 4))
+        );
+        assert_eq!(
+            and_expr(
+                and_expr(constant(0b1111, 4), x.clone()),
+                and_expr(constant(0b1101, 4), constant(0b1011, 4)),
+            )
+            .canonicalize(),
+            and_expr(x, constant(0b1001, 4))
+        );
+
+        let x = read_fixed_register(Register(1), 4, 4);
+        assert_eq!(
+            or_expr(constant(0b0100, 4), or_expr(x.clone(), constant(0b0011, 4)),).canonicalize(),
+            or_expr(x.clone(), constant(0b0111, 4)).canonicalize()
+        );
+        assert_eq!(
+            xor_expr(
+                constant(0b1100, 4),
+                xor_expr(x.clone(), constant(0b1010, 4)),
+            )
+            .canonicalize(),
+            xor_expr(x, constant(0b0110, 4)).canonicalize()
+        );
+    }
+
+    #[test]
+    fn canonicalize_folds_not_constants_and_complements() {
+        let x = read_fixed_register(Register(1), 4, 8);
+        let y = read_fixed_register(Register(2), 4, 8);
+
+        assert_eq!(
+            not_expr(constant(0b1010_1100, 8)).canonicalize(),
+            constant(0b0101_0011, 8)
+        );
+        assert_eq!(
+            and_expr(x.clone(), not_expr(x.clone())).canonicalize(),
+            constant(0, 8)
+        );
+        assert_eq!(
+            and_expr(y.clone(), and_expr(not_expr(x.clone()), x.clone())).canonicalize(),
+            constant(0, 8)
+        );
+        assert_eq!(
+            or_expr(x.clone(), not_expr(x.clone())).canonicalize(),
+            constant(0xff, 8)
+        );
+        assert_eq!(
+            or_expr(y, or_expr(x.clone(), not_expr(x))).canonicalize(),
+            constant(0xff, 8)
+        );
+    }
+
+    #[test]
+    fn canonicalize_applies_boolean_absorption() {
+        let x = read_fixed_register(Register(1), 4, 8);
+        let y = read_fixed_register(Register(2), 4, 8);
+        let z = read_fixed_register(Register(3), 4, 8);
+
+        assert_eq!(
+            and_expr(x.clone(), or_expr(x.clone(), y.clone())).canonicalize(),
+            x.clone()
+        );
+        assert_eq!(
+            or_expr(x.clone(), and_expr(x.clone(), y.clone())).canonicalize(),
+            x.clone()
+        );
+        assert_eq!(
+            and_expr(z.clone(), and_expr(or_expr(y, z.clone()), x.clone()),).canonicalize(),
+            and_expr(x, z)
+        );
+    }
+
+    #[test]
     fn canonicalize_width_changing_and_structural_ops() {
         let instruction = empty_instruction();
         let x = fixed_register(Register(1), 8);
@@ -2649,6 +3124,310 @@ mod tests {
             )
             .canonicalize(),
             sub_overflow(x, constant(0x80, 8), bool_const(false), 8)
+        );
+    }
+
+    #[test]
+    fn canonicalize_equates_logical_normal_forms() {
+        let a = read_fixed_register(Register(1), 4, 8);
+        let b = read_fixed_register(Register(2), 4, 8);
+        let c = read_fixed_register(Register(3), 4, 8);
+
+        let associated_or = or_expr(or_expr(a.clone(), b.clone()), c.clone()).canonicalize();
+        let permuted_or = or_expr(c.clone(), or_expr(b.clone(), a.clone())).canonicalize();
+        assert_eq!(associated_or, permuted_or);
+
+        let de_morgan_or = not_expr(and_expr(not_expr(a.clone()), not_expr(b.clone())));
+        assert_eq!(
+            or_expr(a.clone(), b.clone()).canonicalize(),
+            de_morgan_or.canonicalize()
+        );
+
+        let de_morgan_and = not_expr(or_expr(not_expr(a.clone()), not_expr(b.clone())));
+        assert_eq!(
+            and_expr(a.clone(), b.clone()).canonicalize(),
+            de_morgan_and.canonicalize()
+        );
+
+        let xor_sum_of_products = or_expr(
+            and_expr(a.clone(), not_expr(b.clone())),
+            and_expr(not_expr(a.clone()), b.clone()),
+        );
+        assert_eq!(
+            xor_expr(a.clone(), b.clone()).canonicalize(),
+            xor_sum_of_products.canonicalize()
+        );
+
+        let associated_xor = xor_expr(xor_expr(a.clone(), b.clone()), c.clone()).canonicalize();
+        let permuted_xor = xor_expr(c, xor_expr(b, a)).canonicalize();
+        assert_eq!(associated_xor, permuted_xor);
+
+        assert_eq!(associated_or.clone().canonicalize(), associated_or);
+        assert_eq!(associated_xor.clone().canonicalize(), associated_xor);
+    }
+
+    #[test]
+    fn canonicalize_equates_addition_and_subtraction_normal_forms() {
+        let x = read_fixed_register(Register(1), 4, 8);
+        let y = read_fixed_register(Register(2), 4, 8);
+        let z = read_fixed_register(Register(3), 4, 8);
+
+        let associated_add = add(
+            add(x.clone(), constant(3, 8)),
+            add(y.clone(), constant(5, 8)),
+        )
+        .canonicalize();
+        let permuted_add = add(constant(8, 8), add(y.clone(), x.clone())).canonicalize();
+        assert_eq!(associated_add, permuted_add);
+
+        let twos_complement_sub = add(add(x.clone(), not_expr(y.clone())), constant(1, 8));
+        assert_eq!(
+            sub(x.clone(), y.clone()).canonicalize(),
+            twos_complement_sub.canonicalize()
+        );
+
+        let add_of_subtraction = add(x.clone(), sub(y.clone(), z.clone())).canonicalize();
+        let subtraction_of_add = sub(add(y, x), z).canonicalize();
+        assert_eq!(add_of_subtraction, subtraction_of_add);
+    }
+
+    #[test]
+    fn canonicalize_eliminates_reduced_operators_recursively() {
+        let x = read_fixed_register(Register(1), 4, 8);
+        let y = read_fixed_register(Register(2), 4, 8);
+        let z = read_fixed_register(Register(3), 4, 8);
+        let expression = add(
+            sub(
+                or_expr(x.clone(), z.clone()),
+                xor_expr(y.clone(), z.clone()),
+            ),
+            xor_expr(x.clone(), or_expr(y, sub(z, x))),
+        );
+
+        let canonical = expression.canonicalize();
+        assert_operator_reduced(&canonical);
+        assert_eq!(canonical.clone().canonicalize(), canonical);
+    }
+
+    #[test]
+    fn canonicalize_reduces_operators_after_resolving_instruction_fields() {
+        let instruction = decoded_fixture_instruction();
+        let expression = sub(
+            or_expr(
+                derived_value("expanded"),
+                zero_extend(immediate_field("imm"), 8),
+            ),
+            xor_expr(
+                read_register(register_field("rd"), 8),
+                derived_value("doubled"),
+            ),
+        );
+
+        let canonical = expression.collapse_and_canonicalize(&instruction);
+        assert_operator_reduced(&canonical);
+        assert_eq!(canonical.clone().canonicalize(), canonical);
+    }
+
+    #[test]
+    fn canonicalize_reduction_handles_identities_before_expansion() {
+        let x = read_fixed_register(Register(1), 4, 8);
+
+        assert_eq!(or_expr(x.clone(), x.clone()).canonicalize(), x.clone());
+        assert_eq!(or_expr(x.clone(), constant(0, 8)).canonicalize(), x.clone());
+        assert_eq!(
+            or_expr(x.clone(), constant(0xff, 8)).canonicalize(),
+            constant(0xff, 8)
+        );
+        assert_eq!(
+            xor_expr(x.clone(), x.clone()).canonicalize(),
+            constant(0, 8)
+        );
+        assert_eq!(
+            xor_expr(x.clone(), constant(0, 8)).canonicalize(),
+            x.clone()
+        );
+        assert_eq!(sub(x.clone(), x.clone()).canonicalize(), constant(0, 8));
+        assert_eq!(sub(x.clone(), constant(0, 8)).canonicalize(), x);
+    }
+
+    #[test]
+    fn canonicalize_reduction_is_idempotent_across_widths() {
+        for width in [1, 8, 128] {
+            let x = read_fixed_register(Register(1), 4, width);
+            let y = read_fixed_register(Register(2), 4, width);
+            let canonical =
+                sub(xor_expr(x.clone(), y.clone()), or_expr(not_expr(x), y)).canonicalize();
+
+            assert_operator_reduced(&canonical);
+            assert_eq!(canonical.clone().canonicalize(), canonical);
+        }
+    }
+
+    #[test]
+    fn canonicalize_equates_multiplicative_and_nested_normal_forms() {
+        let x = read_fixed_register(Register(1), 4, 8);
+        let y = read_fixed_register(Register(2), 4, 8);
+        let z = read_fixed_register(Register(3), 4, 8);
+
+        let associated_mul = mul(
+            mul(x.clone(), constant(3, 8)),
+            mul(y.clone(), constant(5, 8)),
+        )
+        .canonicalize();
+        let permuted_mul = mul(constant(15, 8), mul(y.clone(), x.clone())).canonicalize();
+        assert_eq!(associated_mul, permuted_mul);
+
+        let nested_left = and_expr(
+            or_expr(x.clone(), y.clone()),
+            not_expr(xor_expr(y.clone(), z.clone())),
+        )
+        .canonicalize();
+        let nested_right = and_expr(
+            not_expr(and_expr(not_expr(y.clone()), not_expr(x.clone()))),
+            not_expr(or_expr(
+                and_expr(y.clone(), not_expr(z.clone())),
+                and_expr(not_expr(y), z),
+            )),
+        )
+        .canonicalize();
+        assert_eq!(nested_left, nested_right);
+
+        assert_eq!(nested_left.clone().canonicalize(), nested_left);
+    }
+
+    #[test]
+    fn canonicalize_rewrites_preserve_four_bit_semantics() {
+        let instruction = empty_instruction();
+
+        for lhs in 0..16 {
+            for rhs in 0..16 {
+                let lhs = constant(lhs, 4);
+                let rhs = constant(rhs, 4);
+                let expressions = [
+                    add(lhs.clone(), rhs.clone()),
+                    sub(lhs.clone(), rhs.clone()),
+                    or_expr(lhs.clone(), rhs.clone()),
+                    xor_expr(lhs.clone(), rhs.clone()),
+                    xor_expr(
+                        or_expr(lhs.clone(), rhs.clone()),
+                        and_expr(not_expr(lhs.clone()), rhs.clone()),
+                    ),
+                    sub(
+                        add(lhs.clone(), rhs.clone()),
+                        xor_expr(lhs.clone(), rhs.clone()),
+                    ),
+                ];
+
+                for expression in expressions {
+                    let original = expression.clone().collapse(&instruction);
+                    let canonical = expression.canonicalize().collapse(&instruction);
+                    assert_eq!(canonical, original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalize_rewrites_preserve_edge_width_semantics() {
+        let instruction = empty_instruction();
+
+        for (width, lhs, rhs) in [
+            (1, 0, 1),
+            (1, 1, 1),
+            (8, 0, 0xff),
+            (8, 0x80, 0x7f),
+            (128, 0, u128::MAX),
+            (128, 1 << 127, (1 << 127) - 1),
+        ] {
+            let lhs = constant(lhs, width);
+            let rhs = constant(rhs, width);
+            let expressions = [
+                sub(lhs.clone(), rhs.clone()),
+                or_expr(lhs.clone(), rhs.clone()),
+                xor_expr(lhs.clone(), rhs.clone()),
+                sub(
+                    xor_expr(lhs.clone(), rhs.clone()),
+                    or_expr(not_expr(lhs.clone()), rhs.clone()),
+                ),
+            ];
+
+            for expression in expressions {
+                let expected = expression.clone().collapse(&instruction);
+                let canonical = expression.canonicalize();
+                assert_operator_reduced(&canonical);
+                assert_eq!(canonical.collapse(&instruction), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mul_by_two_reduces_to_shift() {
+        let instruction = empty_instruction();
+        let lhs = read_fixed_register(Register(1), 4, 8);
+        let rhs = constant(2, 8);
+        let expression = mul(lhs.clone(), rhs);
+        assert_eq!(
+            expression.collapse_and_canonicalize(&instruction),
+            shift_left(lhs, constant(1, 8)).collapse_and_canonicalize(&instruction)
+        )
+    }
+
+    #[test]
+    fn mul_by_three_reduces_to_shift_add() {
+        let instruction = empty_instruction();
+        let lhs = read_fixed_register(Register(1), 4, 8);
+        let rhs = constant(3, 8);
+        let expression = mul(lhs.clone(), rhs);
+        assert_eq!(
+            expression.collapse_and_canonicalize(&instruction),
+            add(shift_left(lhs.clone(), constant(1, 8)), lhs).collapse_and_canonicalize(&instruction)
+        )
+    }
+
+    #[test]
+    fn mul_by_seven_reduces_to_shift_add() {
+        let instruction = empty_instruction();
+        let lhs = read_fixed_register(Register(1), 4, 8);
+        let rhs = constant(7, 8);
+        let expression = mul(lhs.clone(), rhs);
+        assert_eq!(
+            expression.collapse_and_canonicalize(&instruction),
+            // x * 7 = x << 2 + x << 1 + x
+            add(shift_left(lhs.clone(), constant(2, 8)), add(shift_left(lhs.clone(), constant(1, 8)), lhs)).collapse_and_canonicalize(&instruction)
+        )
+    }
+
+    #[test]
+    fn mul_nested() {
+        let instruction = empty_instruction();
+        let register = read_fixed_register(Register(1), 4, 8);
+        let lhs = constant(2, 8);
+        let rhs = mul(register.clone(), constant(4, 8));
+        let expression = mul(lhs, rhs);
+
+        assert_eq!(
+            expression.collapse_and_canonicalize(&instruction),
+            // 2 * (x * 4) = x << 3
+            shift_left(register, constant(3, 8))
+        )
+    }
+
+    #[test]
+    fn mul_add_identity() {
+        let instruction = empty_instruction();
+        let register = read_fixed_register(Register(1), 4, 8);
+        let expression = add(constant(0, 8), mul(constant(5, 8), register.clone()));
+        assert_eq!(
+            expression.clone().collapse_and_canonicalize(&instruction),
+            // 0 + (x * 5) = x << 2 + x
+            add(register.clone(), shift_left(register.clone(), constant(2, 8))).canonicalize()
+        );
+
+        // also check another order just for fun
+        assert_eq!(
+            expression.collapse_and_canonicalize(&instruction),
+            // 0 + (x * 5) = x << 2 + x
+            add(shift_left(register.clone(), constant(2, 8)), register).canonicalize()
         );
     }
 }
