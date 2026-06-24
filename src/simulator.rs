@@ -493,12 +493,14 @@ impl Simulator {
                     gate.outputs
                         .iter()
                         .map(|output| {
-                            *assignments.get(output.wire_name.as_str()).unwrap_or_else(|| {
-                                panic!(
-                                    "commented gate {} has no replacement for output {}",
-                                    gate.instance_name, output.wire_name,
-                                )
-                            })
+                            *assignments
+                                .get(output.wire_name.as_str())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "commented gate {} has no replacement for output {}",
+                                        gate.instance_name, output.wire_name,
+                                    )
+                                })
                         })
                         .collect(),
                 )
@@ -1285,10 +1287,8 @@ mod tests {
             Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
         let compiled_inputs = simulator.compile_optimization_inputs(&bit_inputs);
         let mut workspace = simulator.optimization_workspace();
-        let optimization = simulator.optimize_compiled_gate_usage_details_with_workspace(
-            &compiled_inputs,
-            &mut workspace,
-        );
+        let optimization = simulator
+            .optimize_compiled_gate_usage_details_with_workspace(&compiled_inputs, &mut workspace);
         let validation = simulator.validate_compiled_gate_usage_optimization_with_workspace(
             &compiled_inputs,
             &optimization,

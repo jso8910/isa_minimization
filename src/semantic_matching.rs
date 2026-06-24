@@ -6,7 +6,7 @@
 
 use crate::{
     instruction_semantics::{
-        add, concat, constant, extract, or_expr, read_memory, select, Effect, Expr,
+        Effect, Expr, add, concat, constant, extract, or_expr, read_memory, select,
     },
     isa_specification::{DecodedInstruction, Instruction},
 };
@@ -349,7 +349,7 @@ fn combine_effects(effect_1: &Effect, effect_2: &Effect) -> Option<Effect> {
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::{bool_const, fixed_register, read_memory, read_register, Register},
+        instruction_semantics::{Register, bool_const, fixed_register, read_memory, read_register},
         isa_specification::InstructionForm,
     };
 

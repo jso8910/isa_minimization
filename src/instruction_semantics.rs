@@ -1298,37 +1298,41 @@ impl Expr {
         }
     }
 
-
     /// Reduces multiplies, where one operand is a constant, to a combination of shift and add
     fn canonicalize_mul(self) -> Self {
-        let width = self.expr_width().expect("Multiply must have established width in decoded instruction");
+        let width = self
+            .expr_width()
+            .expect("Multiply must have established width in decoded instruction");
         match self {
             Expr::Mul(lhs, rhs) => {
                 match (*lhs, *rhs) {
                     // Both consts, reduce to const
                     (Expr::Const { value: value1, .. }, Expr::Const { value: value2, .. }) => {
                         constant((value1 * value2) & Expr::bit_mask(width), width)
-                    },
+                    }
                     (Expr::Const { value, .. }, expr2) => {
                         Self::mul_to_shift_add(expr2, value, constant(0, width), width)
-                    },
+                    }
                     (expr, Expr::Const { value, .. }) => {
                         Self::mul_to_shift_add(expr, value, constant(0, width), width)
-                    },
-                    (expr, expr2) => {
-                        mul(expr, expr2)
                     }
+                    (expr, expr2) => mul(expr, expr2),
                 }
-            },
-            expr => expr
+            }
+            expr => expr,
         }
     }
 
     /// Given a variable term x (ie unknown) and a constant term a, convert x * a to
     /// a series of shifts and adds
-    fn mul_to_shift_add(variable_term: Expr, constant_term: u128, accumulator: Expr, width: u16) -> Self {
+    fn mul_to_shift_add(
+        variable_term: Expr,
+        constant_term: u128,
+        accumulator: Expr,
+        width: u16,
+    ) -> Self {
         if constant_term == 0 {
-            return accumulator.canonicalize()
+            return accumulator.canonicalize();
         }
 
         let mut new_term = accumulator;
@@ -1342,7 +1346,9 @@ impl Expr {
         // If the variable term is already a shift, however, we can just add one to its shift value
         let new_variable_term = if let Expr::ShiftLeft(value, shift_amt) = variable_term {
             shift_left(*value, add(*shift_amt, constant(1, width)))
-        } else { shift_left(variable_term, constant(1, width)) };
+        } else {
+            shift_left(variable_term, constant(1, width))
+        };
         Self::mul_to_shift_add(new_variable_term, constant_term >> 1, new_term, width)
     }
 
@@ -1419,7 +1425,9 @@ impl Expr {
                 address: Box::new(address.canonicalize()),
                 width,
             },
-            Expr::Add(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Add, *lhs, *rhs).canonicalize_mul(),
+            Expr::Add(lhs, rhs) => {
+                Self::canonicalize_assoc_comm_op(AssocCommOp::Add, *lhs, *rhs).canonicalize_mul()
+            }
             Expr::Sub(lhs, rhs) => {
                 let lhs = lhs.canonicalize();
                 let rhs = rhs.canonicalize();
@@ -1440,7 +1448,9 @@ impl Expr {
                     add(add(lhs, not_expr(rhs)), constant(1, width)).canonicalize()
                 }
             }
-            Expr::Mul(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, *lhs, *rhs).canonicalize_mul(),
+            Expr::Mul(lhs, rhs) => {
+                Self::canonicalize_assoc_comm_op(AssocCommOp::Mul, *lhs, *rhs).canonicalize_mul()
+            }
             Expr::And(lhs, rhs) => Self::canonicalize_assoc_comm_op(AssocCommOp::And, *lhs, *rhs),
             Expr::Or(lhs, rhs) => {
                 Self::canonicalize_assoc_comm_op(AssocCommOp::Or, *lhs, *rhs).lower_operators()
@@ -3380,7 +3390,8 @@ mod tests {
         let expression = mul(lhs.clone(), rhs);
         assert_eq!(
             expression.collapse_and_canonicalize(&instruction),
-            add(shift_left(lhs.clone(), constant(1, 8)), lhs).collapse_and_canonicalize(&instruction)
+            add(shift_left(lhs.clone(), constant(1, 8)), lhs)
+                .collapse_and_canonicalize(&instruction)
         )
     }
 
@@ -3393,7 +3404,11 @@ mod tests {
         assert_eq!(
             expression.collapse_and_canonicalize(&instruction),
             // x * 7 = x << 2 + x << 1 + x
-            add(shift_left(lhs.clone(), constant(2, 8)), add(shift_left(lhs.clone(), constant(1, 8)), lhs)).collapse_and_canonicalize(&instruction)
+            add(
+                shift_left(lhs.clone(), constant(2, 8)),
+                add(shift_left(lhs.clone(), constant(1, 8)), lhs)
+            )
+            .collapse_and_canonicalize(&instruction)
         )
     }
 
@@ -3420,7 +3435,11 @@ mod tests {
         assert_eq!(
             expression.clone().collapse_and_canonicalize(&instruction),
             // 0 + (x * 5) = x << 2 + x
-            add(register.clone(), shift_left(register.clone(), constant(2, 8))).canonicalize()
+            add(
+                register.clone(),
+                shift_left(register.clone(), constant(2, 8))
+            )
+            .canonicalize()
         );
 
         // also check another order just for fun
