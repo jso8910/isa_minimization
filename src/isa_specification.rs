@@ -17,7 +17,7 @@ pub struct ISA {
 pub struct ArchitecturalRegister {
     pub identifier: u8,
     pub identifier_width: u8,
-    pub width: u8
+    pub width: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,10 +155,7 @@ impl DecodedInstruction {
         DecodedInstruction::decode_program_str(&program_binary, isa)
     }
 
-    pub fn decode_program_str(
-        program: &str,
-        isa: &ISA,
-    ) -> Result<Vec<Self>, io::Error> {
+    pub fn decode_program_str(program: &str, isa: &ISA) -> Result<Vec<Self>, io::Error> {
         let mut decoded_program: Vec<DecodedInstruction> = vec![];
 
         for (i, line) in program.lines().enumerate() {

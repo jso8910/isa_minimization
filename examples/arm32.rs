@@ -17,7 +17,9 @@ use isa_minimization::instruction_semantics::{
     sub_overflow, unsigned_less_than, xor_expr, zero_extend,
 };
 use isa_minimization::isa_specification::{
-    ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA, Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in, not,
+    ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA,
+    Instruction, InstructionField, InstructionForm, MergeMode, and, bit_eq, c, field_eq, field_in,
+    not,
 };
 use isa_minimization::parser::parse_netlist;
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
@@ -1634,33 +1636,31 @@ pub fn instructions() -> Vec<Instruction> {
 }
 
 pub fn gpr(identifier: u8) -> ArchitecturalRegister {
-    ArchitecturalRegister { identifier, identifier_width: ARM_REGISTER_IDENTIFIER_WIDTH as u8, width: 32 }
+    ArchitecturalRegister {
+        identifier,
+        identifier_width: ARM_REGISTER_IDENTIFIER_WIDTH as u8,
+        width: 32,
+    }
 }
 
 pub fn flag(identifier: u8) -> ArchitecturalRegister {
-    ArchitecturalRegister { identifier, identifier_width: VIRTUAL_REGISTER_IDENTIFIER_WIDTH as u8, width: 1 }
+    ArchitecturalRegister {
+        identifier,
+        identifier_width: VIRTUAL_REGISTER_IDENTIFIER_WIDTH as u8,
+        width: 1,
+    }
 }
 
 pub fn gprs() -> Vec<ArchitecturalRegister> {
-    (0..=15)
-        .map(|i| gpr(i))
-        .collect()
+    (0..=15).map(|i| gpr(i)).collect()
 }
 
 pub fn flags() -> Vec<ArchitecturalRegister> {
-    vec![
-        flag(REG_N.0),
-        flag(REG_Z.0),
-        flag(REG_C.0),
-        flag(REG_V.0)
-    ]
+    vec![flag(REG_N.0), flag(REG_Z.0), flag(REG_C.0), flag(REG_V.0)]
 }
 
 pub fn registers() -> Vec<ArchitecturalRegister> {
-    gprs()
-        .into_iter()
-        .chain(flags())
-        .collect()
+    gprs().into_iter().chain(flags()).collect()
 }
 
 fn pattern_to_sim_inputs(pattern: &BitPattern, primary_inputs: &[String]) -> HashMap<String, Bit> {
@@ -1770,7 +1770,7 @@ fn main() {
     let validate_optimization = args.any(|arg| arg == "--validate");
     let arm32 = ISA {
         registers: registers(),
-        instructions: instructions()
+        instructions: instructions(),
     };
 
     let decoded_program: Vec<DecodedInstruction> =

@@ -4,7 +4,6 @@
 //  2. Random testing to attempt to see if the Exprs are obviously different
 //  3. Z3 (easier to program) or Bitwuzla (potentially faster) SMT solver to authoritatively check if the two Exprs are equivalent
 
-
 // potential constraint for synthesis: never read from a register or memory address unless
 //      1. the original instruction read from it (eg if ReadMemory(R4 + 4) is present, you can read from there)
 //      2. the new program has already written to it
@@ -19,12 +18,18 @@ const RIGHT_EXPR: bool = false;
 
 use std::{cmp::Reverse, collections::BTreeMap};
 
-use oxidd::{BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef, bcdd::{BCDDFunction, BCDDManagerRef}, util::AllocResult};
+use oxidd::{
+    BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef,
+    bcdd::{BCDDFunction, BCDDManagerRef},
+    util::AllocResult,
+};
 
 use crate::{
     instruction_semantics::{
-        Effect, Expr, add, concat, constant, extract, or_expr, read_memory, select,
-    }, isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
+        Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr,
+        read_memory, select,
+    },
+    isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
 };
 
 pub type InstructionIdx = u32;
@@ -51,28 +56,14 @@ pub enum StateDestination {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub enum MemoryRead {
-    Lowered(LoweredMemoryRead),
-    Unlowered(UnloweredMemoryRead)
-}
-
-/// Memory read before loweirng address_expr to a BDD
-#[derive(Clone, PartialEq, Eq)]
-pub struct UnloweredMemoryRead {
+pub struct MemoryRead {
     read_id: ReadId,
     /// If a memory read is used as the address or destination for another memory read,
     /// then it has a depth of 1. If it is a top level memory read it has a depth of 0. etc.
     depth: u8,
     address_expr: Expr,
+    lowered_address: Option<BddWord>,
     width: u16,
-    value: BddWord,
-}
-
-/// Memory read with actual reference to Bdd variables for value, and Bdd functions for address
-#[derive(Clone, PartialEq, Eq)]
-pub struct LoweredMemoryRead {
-    read_id: ReadId,
-    address: BddWord,
     value: BddWord,
 }
 
@@ -82,8 +73,15 @@ type ReadId = u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VariableDescription {
     Unallocated,
-    RegisterBit { register: ArchitecturalRegister, bit: usize },
-    MemoryReadValueBit { read_id: ReadId, left: bool, bit: usize },
+    RegisterBit {
+        register: ArchitecturalRegister,
+        bit: usize,
+    },
+    MemoryReadValueBit {
+        read_id: ReadId,
+        left: bool,
+        bit: usize,
+    },
 }
 
 //NOTE: should probably put this in some other file
@@ -118,7 +116,7 @@ pub struct BddManager {
     registers: Vec<ArchitecturalRegister>,
 
     true_fn: BCDDFunction,
-    false_fn: BCDDFunction
+    false_fn: BCDDFunction,
 }
 
 impl BddManager {
@@ -138,8 +136,7 @@ impl BddManager {
                 .next()
                 .expect("Expected one new BCDD variable");
 
-            BCDDFunction::var(&*manager, variable_number)
-                .expect("Failed to create BCDD variable")
+            BCDDFunction::var(&*manager, variable_number).expect("Failed to create BCDD variable")
         });
 
         self.variables.push((description, function.clone()));
@@ -172,14 +169,11 @@ impl BddManager {
         variable: &BCDDFunction,
         false_fn: &BCDDFunction,
     ) -> bool {
-        table.iter().any(|read| match read {
-            MemoryRead::Unlowered(read) => {
-                Self::word_uses_variable(&read.value, variable, false_fn)
-            }
-            MemoryRead::Lowered(read) => {
-                Self::word_uses_variable(&read.address, variable, false_fn)
-                    || Self::word_uses_variable(&read.value, variable, false_fn)
-            }
+        table.iter().any(|read| {
+            read.lowered_address
+                .as_ref()
+                .is_some_and(|address| Self::word_uses_variable(address, variable, false_fn))
+                || Self::word_uses_variable(&read.value, variable, false_fn)
         })
     }
 
@@ -199,24 +193,18 @@ impl BddManager {
         let used = Self::word_uses_variable(&self.left, &variable, false_fn)
             || Self::word_uses_variable(&self.right, &variable, false_fn)
             || Self::function_uses_variable(&self.constraint, &variable, false_fn)
-            || Self::table_uses_variable(
-                &self.left_memory_read_table,
-                &variable,
-                false_fn,
-            )
-            || Self::table_uses_variable(
-                &self.right_memory_read_table,
-                &variable,
-                false_fn,
-            )
+            || Self::table_uses_variable(&self.left_memory_read_table, &variable, false_fn)
+            || Self::table_uses_variable(&self.right_memory_read_table, &variable, false_fn)
             || Self::function_uses_variable(&self.true_fn, &variable, false_fn)
             || Self::function_uses_variable(&self.false_fn, &variable, false_fn)
-            || self.variables.iter().enumerate().any(
-                |(index, (_, function))| {
+            || self
+                .variables
+                .iter()
+                .enumerate()
+                .any(|(index, (_, function))| {
                     index != variable_index
                         && Self::function_uses_variable(function, &variable, false_fn)
-                },
-            );
+                });
 
         assert!(
             !used,
@@ -227,10 +215,10 @@ impl BddManager {
     }
 
     pub fn from_exprs(left_expr: Expr, right_expr: Expr, isa: &ISA) -> Self {
-        let manager_ref = oxidd::bcdd::new_manager(INNER_NODE_CAPACITY, APPLY_CACHE_CAPACITY, THREAD_COUNT);
-        let (true_fn, false_fn) = manager_ref.with_manager_shared(|manager| {
-            (BCDDFunction::t(manager), BCDDFunction::f(manager))
-        });
+        let manager_ref =
+            oxidd::bcdd::new_manager(INNER_NODE_CAPACITY, APPLY_CACHE_CAPACITY, THREAD_COUNT);
+        let (true_fn, false_fn) = manager_ref
+            .with_manager_shared(|manager| (BCDDFunction::t(manager), BCDDFunction::f(manager)));
 
         let left_width = left_expr.expr_width();
         let right_width = right_expr.expr_width();
@@ -241,10 +229,10 @@ impl BddManager {
 
         // Initialize left and right words
         let left = BddWord {
-            bits: Vec::with_capacity(width as usize)
+            bits: Vec::with_capacity(width as usize),
         };
         let right = BddWord {
-            bits: Vec::with_capacity(width as usize)
+            bits: Vec::with_capacity(width as usize),
         };
 
         // Initialize constraint as true_fn
@@ -275,10 +263,8 @@ impl BddManager {
                         continue;
                     }
 
-                    let variable_number = manager
-                        .add_vars(1)
-                        .next()
-                        .expect("Expected one variable");
+                    let variable_number =
+                        manager.add_vars(1).next().expect("Expected one variable");
 
                     let function = BCDDFunction::var(&*manager, variable_number)
                         .expect("Failed to allocate BCDD variable");
@@ -299,7 +285,20 @@ impl BddManager {
         let left_memory_read_table = vec![];
         let right_memory_read_table = vec![];
 
-        let mut inst = Self { manager_ref, left_memory_read_table, right_memory_read_table, variables, left, right, constraint, left_expr, right_expr, registers, true_fn, false_fn };
+        let mut inst = Self {
+            manager_ref,
+            left_memory_read_table,
+            right_memory_read_table,
+            variables,
+            left,
+            right,
+            constraint,
+            left_expr,
+            right_expr,
+            registers,
+            true_fn,
+            false_fn,
+        };
         inst.assign_memory_read_variables(LEFT_EXPR);
         // Right memory read variables should be at the end of the
         // variable pool, because the left variables are static,
@@ -308,7 +307,6 @@ impl BddManager {
         inst.assign_memory_read_variables(RIGHT_EXPR);
         inst
     }
-
 
     /// Creates the memory read table and creates variables for one expression
     /// If left is true, it creates the memory read table for the left expression
@@ -322,35 +320,48 @@ impl BddManager {
             &self.right_memory_read_table
         };
 
-        assert_eq!(existing_table.len(), 0, "Memory read table should be cleared before running assign_memory_read_variables. Use replace_right_expr to clear variables and the table.");
+        assert_eq!(
+            existing_table.len(),
+            0,
+            "Memory read table should be cleared before running assign_memory_read_variables. Use replace_right_expr to clear variables and the table."
+        );
 
-        // Now, we want to traverse the expression to get a list of all memory reads
-        // This won't generate coherent read_ids or value_variable_ids yet, but we handle that later
+        // Traverse the expression to build one table entry per memory-read occurrence.
+        // Read IDs and value variables are assigned afterward in depth order.
 
-        /// traverse_expr - recursive helper function to recurse the function and generate a skeleton memory_read_table
-        fn traverse_expr(expr: &Expr, depth: u8, next_read_id: &mut u32, memory_read_table: &mut Vec<MemoryRead>) {
+        /// Recursively collects memory reads into a skeleton memory-read table.
+        fn traverse_expr(
+            expr: &Expr,
+            depth: u8,
+            next_read_id: &mut u32,
+            memory_read_table: &mut Vec<MemoryRead>,
+        ) {
             match expr {
                 Expr::ReadMemory { address, width } => {
-                    traverse_expr(
-                        address,
-                        depth + 1,
-                        next_read_id,
-                        memory_read_table
-                    );
-                    memory_read_table.push(
-                        MemoryRead::Unlowered(UnloweredMemoryRead {
-                            // Copy next_read_id
+                    traverse_expr(address, depth + 1, next_read_id, memory_read_table);
+                    // Equivalent reads share one entry, kept at their greatest
+                    // observed depth so address dependencies are ordered first.
+                    if let Some(read) = memory_read_table
+                        .iter_mut()
+                        .find(|read| read.address_expr == **address && read.width == *width)
+                    {
+                        read.depth = read.depth.max(depth);
+                    } else {
+                        memory_read_table.push(MemoryRead {
                             read_id: *next_read_id,
                             depth,
-                            width: *width,
                             address_expr: *address.clone(),
-                            value: BddWord { bits: vec![] }
-                        })
-                    );
-                    *next_read_id += 1;
-                },
+                            lowered_address: None,
+                            width: *width,
+                            value: BddWord { bits: vec![] },
+                        });
+                        *next_read_id += 1;
+                    }
+                }
                 any_expr => {
-                    any_expr.visit_children(|child| traverse_expr(child, depth, next_read_id, memory_read_table));
+                    any_expr.visit_children(|child| {
+                        traverse_expr(child, depth, next_read_id, memory_read_table)
+                    });
                 }
             }
         }
@@ -363,19 +374,10 @@ impl BddManager {
             traverse_expr(&self.right_expr, 0, &mut next_read_id, &mut table);
         }
 
-
-        // Now `table` should be filled. We need to use depth to assign read_ids and variable_ids
-        // In general, we will take the highest depth to be the lowest read_id
-        // TThe ordering for variables is as following: high depth before low depth, then bit slicing/interleaving
-        // at each depth level.
-        let Some(max_depth) = table
-            .iter()
-            .filter_map(|read| match read {
-                MemoryRead::Unlowered(read) => Some(read.depth),
-                MemoryRead::Lowered(_) => None,
-            })
-            .max()
-        else {
+        // Assign lower read IDs to deeper reads so address dependencies are
+        // processed before the reads that use them. Variables are ordered by
+        // descending depth and then interleaved by bit within each depth.
+        let Some(max_depth) = table.iter().map(|read| read.depth).max() else {
             return;
         };
         let mut next_read_id: ReadId = 0;
@@ -384,18 +386,12 @@ impl BddManager {
             let read_indices: Vec<usize> = table
                 .iter()
                 .enumerate()
-                .filter_map(|(index, read)| match read {
-                    MemoryRead::Unlowered(read) if read.depth == depth_level => Some(index),
-                    _ => None,
-                })
+                .filter_map(|(index, read)| (read.depth == depth_level).then_some(index))
                 .collect();
-
 
             // Assign read IDs before creating their bit variables.
             for &index in &read_indices {
-                let MemoryRead::Unlowered(read) = &mut table[index] else {
-                    unreachable!();
-                };
+                let read = &mut table[index];
 
                 read.read_id = next_read_id;
                 next_read_id += 1;
@@ -406,13 +402,7 @@ impl BddManager {
             // Get maximum read bit-width
             let maximum_read_width = read_indices
                 .iter()
-                .map(|&index| {
-                    let MemoryRead::Unlowered(read) = &table[index] else {
-                        unreachable!();
-                    };
-
-                    read.width
-                })
+                .map(|&index| table[index].width)
                 .max()
                 .unwrap_or(0);
             // Now we want to iterate through each read at this depth, and update `value.bits`
@@ -426,27 +416,20 @@ impl BddManager {
             // ...
             for bit in 0..maximum_read_width {
                 for &index in &read_indices {
-                    let MemoryRead::Unlowered(read) = &table[index] else {
-                        unreachable!();
-                    };
+                    let read = &table[index];
 
                     if bit >= read.width {
                         continue;
                     }
 
                     let read_id = read.read_id;
-                    let function = self.new_variable(
-                        VariableDescription::MemoryReadValueBit {
-                            read_id,
-                            left,
-                            bit: bit as usize,
-                        },
-                    );
+                    let function = self.new_variable(VariableDescription::MemoryReadValueBit {
+                        read_id,
+                        left,
+                        bit: bit as usize,
+                    });
 
-                    let MemoryRead::Unlowered(read) = &mut table[index] else {
-                        unreachable!();
-                    };
-                    read.value.bits.push(function);
+                    table[index].value.bits.push(function);
                 }
             }
         }
@@ -472,7 +455,9 @@ impl BddManager {
             .expect("Width of existing expression should be defined");
 
         assert_eq!(
-            new_expr.expr_width().expect("Width of new_expr should be defined"),
+            new_expr
+                .expr_width()
+                .expect("Width of new_expr should be defined"),
             expected_width,
             "new_expr width should match existing expression widths"
         );
@@ -505,6 +490,330 @@ impl BddManager {
 
         self.assign_memory_read_variables(RIGHT_EXPR);
     }
+
+    /// Lowers an expression
+    pub fn lower_expression(&self, expr: &Expr, left: bool) -> BddWord {
+        self.try_lower_expression(expr, left)
+            .expect("BCDD node allocation failed")
+    }
+
+    fn try_lower_expression(&self, expr: &Expr, left: bool) -> AllocResult<BddWord> {
+        match expr {
+            Expr::Const { value, width } => Ok(self.lower_constant(*value, *width)),
+
+            Expr::ReadRegister { register, width } => {
+                let selector = self.try_lower_expression(register, left)?;
+                self.lower_register_read(selector, *width)
+            }
+
+            // This is the only valid Operand
+            // Other Operands involve references to fields
+            // This should collapse to the register identifier
+            Expr::Operand(OperandRef::RegisterField(RegisterRef::Fixed {
+                register,
+                identifier_width,
+            })) => Ok(self.lower_constant(register.0 as u128, *identifier_width)),
+
+            Expr::ReadMemory { address, width } => {
+                let table = if left {
+                    &self.left_memory_read_table
+                } else {
+                    &self.right_memory_read_table
+                };
+
+                let read = table
+                    .iter()
+                    .find(|read| read.address_expr == **address && read.width == *width)
+                    .unwrap_or_else(|| {
+                        panic!("memory read missing from table: address={address:?}, width={width}")
+                    });
+
+                Ok(read.value.clone())
+            }
+
+            Expr::Add(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_add(op1_lowered, op2_lowered)
+            }
+
+            Expr::Mul(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_mul(op1_lowered, op2_lowered)
+            }
+
+            Expr::And(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_and(op1_lowered, op2_lowered)
+            }
+
+            Expr::Not(op) => {
+                let op_lowered = self.try_lower_expression(op, left)?;
+                self.lower_not(op_lowered)
+            }
+
+            Expr::ShiftLeft(value, amount) => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                let amount_lowered = self.try_lower_expression(amount, left)?;
+                self.lower_shift_left(value_lowered, amount_lowered)
+            }
+
+            Expr::LogicalShiftRight(value, amount) => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                let amount_lowered = self.try_lower_expression(amount, left)?;
+                self.lower_logical_shift_right(value_lowered, amount_lowered)
+            }
+
+            Expr::ArithmeticShiftRight(value, amount) => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                let amount_lowered = self.try_lower_expression(amount, left)?;
+                self.lower_arithmetic_shift_right(value_lowered, amount_lowered)
+            }
+
+            Expr::RotateRight(value, amount) => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                let amount_lowered = self.try_lower_expression(amount, left)?;
+                self.lower_rotate_right(value_lowered, amount_lowered)
+            }
+
+            Expr::Equal(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_equal(op1_lowered, op2_lowered)
+            }
+
+            Expr::UnsignedLessThan(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_unsigned_lt(op1_lowered, op2_lowered)
+            }
+
+            Expr::SignedLessThan(op1, op2) => {
+                let op1_lowered = self.try_lower_expression(op1, left)?;
+                let op2_lowered = self.try_lower_expression(op2, left)?;
+                self.lower_signed_lt(op1_lowered, op2_lowered)
+            }
+
+            Expr::Extract { value, high, low } => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                self.lower_extract(value_lowered, *high, *low)
+            }
+
+            Expr::Concat(exprs) => {
+                let exprs_lowered = exprs
+                    .iter()
+                    .map(|e| self.try_lower_expression(e, left))
+                    .collect::<AllocResult<Vec<BddWord>>>()?;
+                self.lower_concat(exprs_lowered)
+            }
+
+            Expr::ZeroExtend { value, to_width } => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                self.lower_zero_extend(value_lowered, *to_width)
+            }
+
+            Expr::SignExtend { value, to_width } => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                self.lower_sign_extend(value_lowered, *to_width)
+            }
+
+            Expr::CountOnes(value) => {
+                let value_lowered = self.try_lower_expression(value, left)?;
+                self.lower_count_ones(value_lowered)
+            }
+
+            Expr::AddCarryOut {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => {
+                let lhs_lowered = self.try_lower_expression(lhs, left)?;
+                let rhs_lowered = self.try_lower_expression(rhs, left)?;
+                let cin_lowered = self.try_lower_expression(carry_in, left)?;
+                self.lower_add_cout(lhs_lowered, rhs_lowered, cin_lowered, *width)
+            }
+
+            Expr::AddOverflow {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => {
+                let lhs_lowered = self.try_lower_expression(lhs, left)?;
+                let rhs_lowered = self.try_lower_expression(rhs, left)?;
+                let cin_lowered = self.try_lower_expression(carry_in, left)?;
+                self.lower_add_overflow(lhs_lowered, rhs_lowered, cin_lowered, *width)
+            }
+            // Anything else should not show up in properly canonicalied expressions
+            expr => {
+                unreachable!("encountered Expr which should not appear in canonical form: {expr:?}")
+            }
+        }
+    }
+
+    fn lower_constant(&self, value: u128, width: u16) -> BddWord {
+        assert!(width <= 128);
+
+        let bits = (0..width)
+            .map(|bit| {
+                if ((value >> bit) & 1) != 0 {
+                    self.true_fn.clone()
+                } else {
+                    self.false_fn.clone()
+                }
+            })
+            .collect();
+
+        BddWord { bits }
+    }
+
+    fn lower_bitwise_binary<F>(
+        &self,
+        lhs: BddWord,
+        rhs: BddWord,
+        operation: F,
+    ) -> AllocResult<BddWord>
+    where
+        F: Fn(
+            &BCDDFunction,
+            &BCDDFunction,
+        ) -> AllocResult<BCDDFunction>,
+    {
+        assert_eq!(lhs.bits.len(), rhs.bits.len());
+
+        let bits = lhs
+            .bits
+            .iter()
+            .zip(&rhs.bits)
+            .map(|(lhs, rhs)| operation(lhs, rhs))
+            .collect::<AllocResult<Vec<_>>>()?;
+
+        Ok(BddWord { bits })
+    }
+
+    /// Lowers a register read and builds a register mux to select the register contents
+    fn lower_register_read(&self, selector: BddWord, width: u16) -> AllocResult<BddWord> {
+        todo!("register-read lowering is not implemented")
+    }
+
+    /// Lowers an addition expression
+    fn lower_add(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers a multiplication expression
+    fn lower_mul(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers a bitwise and expression
+    fn lower_and(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        self.lower_bitwise_binary(
+            op1,
+            op2,
+            |lhs_bit, rhs_bit| lhs_bit.and(rhs_bit),
+        )
+    }
+
+    /// Lowers bitwise not
+    fn lower_not(&self, op: BddWord) -> AllocResult<BddWord> {
+        let bits = op
+            .bits
+            .iter()
+            .map(|bit| bit.not())
+            .collect::<AllocResult<Vec<_>>>()?;
+
+        Ok(BddWord { bits })
+    }
+
+    /// Lowers shift left
+    fn lower_shift_left(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
+        todo!("not implementated")
+    }
+
+    /// Lowers logical shift right
+    fn lower_logical_shift_right(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
+        todo!("not implementated")
+    }
+
+    /// Lowers arithmetic shift right
+    fn lower_arithmetic_shift_right(
+        &self,
+        value: BddWord,
+        amount: BddWord,
+    ) -> AllocResult<BddWord> {
+        todo!("not implementated")
+    }
+
+    /// Lowers rotate right
+    fn lower_rotate_right(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
+        todo!("not implementated")
+    }
+
+    /// Lowers bitwise equals operation
+    fn lower_equal(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers unsigned less than
+    fn lower_unsigned_lt(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers signed less than
+    fn lower_signed_lt(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers bit extraction
+    fn lower_extract(&self, value: BddWord, high: u16, low: u16) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers concatenation
+    fn lower_concat(&self, values: Vec<BddWord>) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers zero extension
+    fn lower_zero_extend(&self, value: BddWord, to_width: u16) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers sign extension
+    fn lower_sign_extend(&self, value: BddWord, to_width: u16) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers counting ones
+    fn lower_count_ones(&self, value: BddWord) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers add carry out
+    fn lower_add_cout(
+        &self,
+        lhs: BddWord,
+        rhs: BddWord,
+        carry_in: BddWord,
+        width: u16,
+    ) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
+
+    /// Lowers add overflow flag bit
+    fn lower_add_overflow(
+        &self,
+        lhs: BddWord,
+        rhs: BddWord,
+        carry_in: BddWord,
+        width: u16,
+    ) -> AllocResult<BddWord> {
+        todo!("not implemented")
+    }
 }
 
 /// A word which is created by a vector of BCDDs
@@ -518,10 +827,7 @@ pub struct BddWord {
 /// Given some sequence of instructions, create a list of all Effects of the sequence in terms of the initial state
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
-pub fn instruction_seq_to_effects(
-    instructions: &[DecodedInstruction],
-    isa: &ISA,
-) -> Vec<Effect> {
+pub fn instruction_seq_to_effects(instructions: &[DecodedInstruction], isa: &ISA) -> Vec<Effect> {
     let mut seq_effects = vec![];
     for instruction in instructions.iter() {
         let lowered_effects = instruction_to_lowered_effects(instruction, isa, &seq_effects);
@@ -924,13 +1230,47 @@ mod tests {
         let reads: Vec<_> = manager
             .left_memory_read_table
             .iter()
-            .map(|read| match read {
-                MemoryRead::Unlowered(read) => (read.read_id, read.depth, read.width),
-                MemoryRead::Lowered(_) => unreachable!(),
-            })
+            .map(|read| (read.read_id, read.depth, read.width))
             .collect();
 
         assert_eq!(reads, vec![(0, 1, 32), (1, 0, 8)]);
+    }
+
+    #[test]
+    fn duplicate_memory_read_keeps_greatest_observed_depth() {
+        let shared_read = read_memory(constant(0x100, 32), 32);
+        let manager = BddManager::from_exprs(
+            concat([shared_read.clone(), read_memory(shared_read.clone(), 8)]),
+            constant(0, 40),
+            &bdd_test_isa(),
+        );
+
+        let shared_entry = manager
+            .left_memory_read_table
+            .iter()
+            .find(|read| read.address_expr == constant(0x100, 32) && read.width == 32)
+            .expect("expected deduplicated shared memory read");
+
+        assert_eq!(shared_entry.depth, 1);
+        assert_eq!(
+            manager
+                .left_memory_read_table
+                .iter()
+                .filter(|read| { read.address_expr == constant(0x100, 32) && read.width == 32 })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lower_memory_read_returns_the_assigned_value_word() {
+        let memory_read = read_memory(constant(0x100, 32), 8);
+        let manager = BddManager::from_exprs(memory_read.clone(), constant(0, 8), &bdd_test_isa());
+
+        assert!(
+            manager.lower_expression(&memory_read, LEFT_EXPR)
+                == manager.left_memory_read_table[0].value
+        );
     }
 
     #[test]
@@ -997,7 +1337,10 @@ mod tests {
             })
             .expect("expected right memory variable");
 
-        manager.left.bits.push(manager.variables[variable_index].1.clone());
+        manager
+            .left
+            .bits
+            .push(manager.variables[variable_index].1.clone());
         manager.release_variable(variable_index);
     }
 
@@ -1020,7 +1363,7 @@ mod tests {
                     vec![Effect::write_register(reg(1), read_reg(0))],
                 ),
             ],
-            registers: vec![]
+            registers: vec![],
         };
         let sequence = vec![decoded("ADD_R0_R0_R0"), decoded("MOV_R1_R0")];
 
@@ -1040,7 +1383,7 @@ mod tests {
                 "STORE32",
                 vec![Effect::write_memory(address.clone(), value.clone(), 32)],
             )],
-            registers: vec![]
+            registers: vec![],
         };
         let sequence = vec![decoded("STORE32")];
 
@@ -1087,7 +1430,7 @@ mod tests {
                     )],
                 ),
             ],
-            registers: vec![]
+            registers: vec![],
         };
         let sequence = vec![decoded("STORE32"), decoded("LOAD32_R0")];
 

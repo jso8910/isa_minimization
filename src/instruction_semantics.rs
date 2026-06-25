@@ -957,16 +957,10 @@ impl Expr {
                 }
             }
             Expr::AddCarryOut {
-                lhs,
-                rhs,
-                carry_in,
-                ..
+                lhs, rhs, carry_in, ..
             }
             | Expr::AddOverflow {
-                lhs,
-                rhs,
-                carry_in,
-                ..
+                lhs, rhs, carry_in, ..
             } => {
                 visit(lhs);
                 visit(rhs);
@@ -1630,13 +1624,26 @@ impl Expr {
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, FlagOp::SubCarryOut),
+            } => Self::canonicalize_flag_expr(
+                *lhs,
+                not_expr(*rhs),
+                not_expr(*borrow_in),
+                width,
+                FlagOp::AddCarryOut,
+            ),
+
             Expr::SubOverflow {
                 lhs,
                 rhs,
                 borrow_in,
                 width,
-            } => Self::canonicalize_flag_expr(*lhs, *rhs, *borrow_in, width, FlagOp::SubOverflow),
+            } => Self::canonicalize_flag_expr(
+                *lhs,
+                not_expr(*rhs),
+                not_expr(*borrow_in),
+                width,
+                FlagOp::AddOverflow,
+            ),
             Expr::Select {
                 condition,
                 when_true,
@@ -2492,6 +2499,81 @@ mod tests {
     }
 
     #[test]
+    fn canonicalized_subtraction_flags_match_original_semantics_exhaustively() {
+        let instruction = empty_instruction();
+
+        // Exhaust every possible lhs, rhs, and borrow input for small widths.
+        // The original subtraction helpers and their canonicalized addition
+        // forms use separate constant evaluators, so this compares behavior
+        // rather than merely checking that a particular AST rewrite occurred.
+        for width in 1..=8 {
+            let value_count = 1u128 << width;
+            for lhs in 0..value_count {
+                for rhs in 0..value_count {
+                    for borrow_in in [false, true] {
+                        let lhs = constant(lhs, width);
+                        let rhs = constant(rhs, width);
+                        let borrow_in = bool_const(borrow_in);
+
+                        let sub_carry =
+                            sub_carry_out(lhs.clone(), rhs.clone(), borrow_in.clone(), width);
+                        assert_eq!(
+                            sub_carry.clone().collapse(&instruction),
+                            sub_carry.canonicalize().collapse(&instruction),
+                            "SubCarryOut conversion failed for width={width}, lhs={lhs:?}, rhs={rhs:?}, borrow_in={borrow_in:?}"
+                        );
+
+                        let sub_overflow =
+                            sub_overflow(lhs.clone(), rhs.clone(), borrow_in.clone(), width);
+                        assert_eq!(
+                            sub_overflow.clone().collapse(&instruction),
+                            sub_overflow.canonicalize().collapse(&instruction),
+                            "SubOverflow conversion failed for width={width}, lhs={lhs:?}, rhs={rhs:?}, borrow_in={borrow_in:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalized_subtraction_flags_match_original_semantics_at_wide_boundaries() {
+        let instruction = empty_instruction();
+
+        for width in [16, 32, 64, 127, 128] {
+            let mask = Expr::bit_mask(width);
+            let sign_bit = Expr::sign_bit(width);
+            let values = [0, 1, sign_bit - 1, sign_bit, sign_bit + 1, mask - 1, mask];
+
+            for lhs in values {
+                for rhs in values {
+                    for borrow_in in [false, true] {
+                        let lhs = constant(lhs, width);
+                        let rhs = constant(rhs, width);
+                        let borrow_in = bool_const(borrow_in);
+
+                        let sub_carry =
+                            sub_carry_out(lhs.clone(), rhs.clone(), borrow_in.clone(), width);
+                        assert_eq!(
+                            sub_carry.clone().collapse(&instruction),
+                            sub_carry.canonicalize().collapse(&instruction),
+                            "wide SubCarryOut conversion failed for width={width}, lhs={lhs:?}, rhs={rhs:?}, borrow_in={borrow_in:?}"
+                        );
+
+                        let sub_overflow =
+                            sub_overflow(lhs.clone(), rhs.clone(), borrow_in.clone(), width);
+                        assert_eq!(
+                            sub_overflow.clone().collapse(&instruction),
+                            sub_overflow.canonicalize().collapse(&instruction),
+                            "wide SubOverflow conversion failed for width={width}, lhs={lhs:?}, rhs={rhs:?}, borrow_in={borrow_in:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn collapse_decoded_instruction_fields_and_derived_values() {
         let instruction = decoded_fixture_instruction();
 
@@ -3209,7 +3291,7 @@ mod tests {
                 8
             )
             .canonicalize(),
-            sub_overflow(x, constant(0x80, 8), bool_const(false), 8)
+            add_overflow(x, constant(0x7f, 8), bool_const(true), 8)
         );
     }
 
