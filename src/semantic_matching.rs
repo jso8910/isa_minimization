@@ -4,15 +4,27 @@
 //  2. Random testing to attempt to see if the Exprs are obviously different
 //  3. Z3 (easier to program) or Bitwuzla (potentially faster) SMT solver to authoritatively check if the two Exprs are equivalent
 
+
+// potential constraint for synthesis: never read from a register or memory address unless
+//      1. the original instruction read from it (eg if ReadMemory(R4 + 4) is present, you can read from there)
+//      2. the new program has already written to it
+
 // TODO multiple threads perchance? command line option
 const THREAD_COUNT: u32 = 1;
+const INNER_NODE_CAPACITY: usize = 4096;
+const APPLY_CACHE_CAPACITY: usize = 2048;
 
-use oxidd::bcdd::BCDDFunction;
+const LEFT_EXPR: bool = true;
+const RIGHT_EXPR: bool = false;
+
+use std::{cmp::Reverse, collections::BTreeMap};
+
+use oxidd::{BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef, bcdd::{BCDDFunction, BCDDManagerRef}, util::AllocResult};
 
 use crate::{
     instruction_semantics::{
         Effect, Expr, add, concat, constant, extract, or_expr, read_memory, select,
-    }, isa_specification::{DecodedInstruction, ISA, Instruction},
+    }, isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
 };
 
 pub type InstructionIdx = u32;
@@ -38,12 +50,46 @@ pub enum StateDestination {
     MemoryByte(u32),
 }
 
-/// Representation of a variable for the purposes of creating a BDD
-pub enum BddVariable {
-    Memory(Expr),
-    Register(Expr)
+#[derive(Clone, PartialEq, Eq)]
+pub enum MemoryRead {
+    Lowered(LoweredMemoryRead),
+    Unlowered(UnloweredMemoryRead)
 }
 
+/// Memory read before loweirng address_expr to a BDD
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnloweredMemoryRead {
+    read_id: ReadId,
+    /// If a memory read is used as the address or destination for another memory read,
+    /// then it has a depth of 1. If it is a top level memory read it has a depth of 0. etc.
+    depth: u8,
+    address_expr: Expr,
+    width: u16,
+    value: BddWord,
+}
+
+/// Memory read with actual reference to Bdd variables for value, and Bdd functions for address
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoweredMemoryRead {
+    read_id: ReadId,
+    address: BddWord,
+    value: BddWord,
+}
+
+type VariableId = u32;
+type ReadId = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariableDescription {
+    Unallocated,
+    RegisterBit { register: ArchitecturalRegister, bit: usize },
+    MemoryReadValueBit { read_id: ReadId, left: bool, bit: usize },
+}
+
+//NOTE: should probably put this in some other file
+// this file should be exclusively for expr matching imo
+// should probably also move the instruction to expr function
+// or maybe move the bddmanager?
 // impl StateUseTable {
 //     pub fn from_program(program: &Vec<DecodedInstruction>, isa: &Vec<Instruction>) -> Self {
 //         for instruction in program.iter() {
@@ -53,9 +99,417 @@ pub enum BddVariable {
 //     }
 // }
 
+// Cloning is not allowed to enforce exclusive ownership of the manager
+// Similarly, manager_ref should never be accessed from outside the struct and
+// all BCDDFunctions must be stored in BddManager.
+#[derive(PartialEq, Eq)]
+pub struct BddManager {
+    manager_ref: BCDDManagerRef,
+
+    left_memory_read_table: Vec<MemoryRead>,
+    right_memory_read_table: Vec<MemoryRead>,
+    variables: Vec<(VariableDescription, BCDDFunction)>,
+    left: BddWord,
+    right: BddWord,
+    constraint: BCDDFunction,
+
+    left_expr: Expr,
+    right_expr: Expr,
+    registers: Vec<ArchitecturalRegister>,
+
+    true_fn: BCDDFunction,
+    false_fn: BCDDFunction
+}
+
+impl BddManager {
+    fn new_variable(&mut self, description: VariableDescription) -> BCDDFunction {
+        if let Some((existing_description, function)) = self
+            .variables
+            .iter_mut()
+            .find(|(description, _)| *description == VariableDescription::Unallocated)
+        {
+            *existing_description = description;
+            return function.clone();
+        }
+
+        let function = self.manager_ref.with_manager_exclusive(|manager| {
+            let variable_number = manager
+                .add_vars(1)
+                .next()
+                .expect("Expected one new BCDD variable");
+
+            BCDDFunction::var(&*manager, variable_number)
+                .expect("Failed to create BCDD variable")
+        });
+
+        self.variables.push((description, function.clone()));
+        function
+    }
+
+    fn function_uses_variable(
+        function: &BCDDFunction,
+        variable: &BCDDFunction,
+        false_fn: &BCDDFunction,
+    ) -> bool {
+        function
+            .unique(variable)
+            .expect("Failed to check whether a BCDD function uses a variable")
+            != *false_fn
+    }
+
+    fn word_uses_variable(
+        word: &BddWord,
+        variable: &BCDDFunction,
+        false_fn: &BCDDFunction,
+    ) -> bool {
+        word.bits
+            .iter()
+            .any(|function| Self::function_uses_variable(function, variable, false_fn))
+    }
+
+    fn table_uses_variable(
+        table: &[MemoryRead],
+        variable: &BCDDFunction,
+        false_fn: &BCDDFunction,
+    ) -> bool {
+        table.iter().any(|read| match read {
+            MemoryRead::Unlowered(read) => {
+                Self::word_uses_variable(&read.value, variable, false_fn)
+            }
+            MemoryRead::Lowered(read) => {
+                Self::word_uses_variable(&read.address, variable, false_fn)
+                    || Self::word_uses_variable(&read.value, variable, false_fn)
+            }
+        })
+    }
+
+    fn release_variable(&mut self, variable_index: usize) {
+        assert!(
+            variable_index < self.variables.len(),
+            "Variable index is outside the variable pool"
+        );
+        assert!(
+            self.variables[variable_index].0 != VariableDescription::Unallocated,
+            "Variable is already unallocated"
+        );
+
+        let variable = self.variables[variable_index].1.clone();
+        let false_fn = &self.false_fn;
+
+        let used = Self::word_uses_variable(&self.left, &variable, false_fn)
+            || Self::word_uses_variable(&self.right, &variable, false_fn)
+            || Self::function_uses_variable(&self.constraint, &variable, false_fn)
+            || Self::table_uses_variable(
+                &self.left_memory_read_table,
+                &variable,
+                false_fn,
+            )
+            || Self::table_uses_variable(
+                &self.right_memory_read_table,
+                &variable,
+                false_fn,
+            )
+            || Self::function_uses_variable(&self.true_fn, &variable, false_fn)
+            || Self::function_uses_variable(&self.false_fn, &variable, false_fn)
+            || self.variables.iter().enumerate().any(
+                |(index, (_, function))| {
+                    index != variable_index
+                        && Self::function_uses_variable(function, &variable, false_fn)
+                },
+            );
+
+        assert!(
+            !used,
+            "Cannot release a variable that is still used by a live BCDD function"
+        );
+
+        self.variables[variable_index].0 = VariableDescription::Unallocated;
+    }
+
+    pub fn from_exprs(left_expr: Expr, right_expr: Expr, isa: &ISA) -> Self {
+        let manager_ref = oxidd::bcdd::new_manager(INNER_NODE_CAPACITY, APPLY_CACHE_CAPACITY, THREAD_COUNT);
+        let (true_fn, false_fn) = manager_ref.with_manager_shared(|manager| {
+            (BCDDFunction::t(manager), BCDDFunction::f(manager))
+        });
+
+        let left_width = left_expr.expr_width();
+        let right_width = right_expr.expr_width();
+
+        assert_eq!(left_width, right_width, "Expression widths must match");
+
+        let width = left_width.expect("Width of expressions must be defined!");
+
+        // Initialize left and right words
+        let left = BddWord {
+            bits: Vec::with_capacity(width as usize)
+        };
+        let right = BddWord {
+            bits: Vec::with_capacity(width as usize)
+        };
+
+        // Initialize constraint as true_fn
+        let constraint = true_fn.clone();
+
+        // Iniitalize variables as vector with capacity equal to the length of the register file
+        let registers = isa.registers.clone();
+        // let mut variables = Vec::with_capacity(registers.iter().map(|r| r.width as usize).sum::<usize>() as usize);
+
+        // We also want to initialize the register variables
+        // This relatively trivial, because we just interleave them
+        // First find the maximum register width
+        let mut maximum_register_width = 0;
+        for register in registers.iter() {
+            if register.width > maximum_register_width {
+                maximum_register_width = register.width;
+            }
+        }
+
+        let variables = manager_ref.with_manager_exclusive(|manager| {
+            let mut variables = Vec::new();
+
+            for bit in 0..maximum_register_width {
+                for register in &registers {
+                    // In this case, we have already finished adding the variables for the register
+                    // eg if width = 8, bit = 8, we have already added 8 bits (0..=7)
+                    if register.width <= bit {
+                        continue;
+                    }
+
+                    let variable_number = manager
+                        .add_vars(1)
+                        .next()
+                        .expect("Expected one variable");
+
+                    let function = BCDDFunction::var(&*manager, variable_number)
+                        .expect("Failed to allocate BCDD variable");
+
+                    variables.push((
+                        VariableDescription::RegisterBit {
+                            register: *register,
+                            bit: bit.into(),
+                        },
+                        function,
+                    ));
+                }
+            }
+
+            variables
+        });
+
+        let left_memory_read_table = vec![];
+        let right_memory_read_table = vec![];
+
+        let mut inst = Self { manager_ref, left_memory_read_table, right_memory_read_table, variables, left, right, constraint, left_expr, right_expr, registers, true_fn, false_fn };
+        inst.assign_memory_read_variables(LEFT_EXPR);
+        // Right memory read variables should be at the end of the
+        // variable pool, because the left variables are static,
+        // but the right variables will be periodically cleared and potentially
+        // expanded
+        inst.assign_memory_read_variables(RIGHT_EXPR);
+        inst
+    }
+
+
+    /// Creates the memory read table and creates variables for one expression
+    /// If left is true, it creates the memory read table for the left expression
+    /// Otherwise, the right expression.
+    /// Generally left = true should be run first, and then left = false should
+    /// be run repeatedly as different RHS are tried.
+    fn assign_memory_read_variables(&mut self, left: bool) {
+        let existing_table = if left {
+            &self.left_memory_read_table
+        } else {
+            &self.right_memory_read_table
+        };
+
+        assert_eq!(existing_table.len(), 0, "Memory read table should be cleared before running assign_memory_read_variables. Use replace_right_expr to clear variables and the table.");
+
+        // Now, we want to traverse the expression to get a list of all memory reads
+        // This won't generate coherent read_ids or value_variable_ids yet, but we handle that later
+
+        /// traverse_expr - recursive helper function to recurse the function and generate a skeleton memory_read_table
+        fn traverse_expr(expr: &Expr, depth: u8, next_read_id: &mut u32, memory_read_table: &mut Vec<MemoryRead>) {
+            match expr {
+                Expr::ReadMemory { address, width } => {
+                    traverse_expr(
+                        address,
+                        depth + 1,
+                        next_read_id,
+                        memory_read_table
+                    );
+                    memory_read_table.push(
+                        MemoryRead::Unlowered(UnloweredMemoryRead {
+                            // Copy next_read_id
+                            read_id: *next_read_id,
+                            depth,
+                            width: *width,
+                            address_expr: *address.clone(),
+                            value: BddWord { bits: vec![] }
+                        })
+                    );
+                    *next_read_id += 1;
+                },
+                any_expr => {
+                    any_expr.visit_children(|child| traverse_expr(child, depth, next_read_id, memory_read_table));
+                }
+            }
+        }
+
+        let mut table = Vec::new();
+        let mut next_read_id = 0;
+        if left {
+            traverse_expr(&self.left_expr, 0, &mut next_read_id, &mut table);
+        } else {
+            traverse_expr(&self.right_expr, 0, &mut next_read_id, &mut table);
+        }
+
+
+        // Now `table` should be filled. We need to use depth to assign read_ids and variable_ids
+        // In general, we will take the highest depth to be the lowest read_id
+        // TThe ordering for variables is as following: high depth before low depth, then bit slicing/interleaving
+        // at each depth level.
+        let Some(max_depth) = table
+            .iter()
+            .filter_map(|read| match read {
+                MemoryRead::Unlowered(read) => Some(read.depth),
+                MemoryRead::Lowered(_) => None,
+            })
+            .max()
+        else {
+            return;
+        };
+        let mut next_read_id: ReadId = 0;
+        for depth_level in (0..=max_depth).rev() {
+            // Preserve table order within this depth.
+            let read_indices: Vec<usize> = table
+                .iter()
+                .enumerate()
+                .filter_map(|(index, read)| match read {
+                    MemoryRead::Unlowered(read) if read.depth == depth_level => Some(index),
+                    _ => None,
+                })
+                .collect();
+
+
+            // Assign read IDs before creating their bit variables.
+            for &index in &read_indices {
+                let MemoryRead::Unlowered(read) = &mut table[index] else {
+                    unreachable!();
+                };
+
+                read.read_id = next_read_id;
+                next_read_id += 1;
+
+                read.value.bits.reserve(read.width as usize);
+            }
+
+            // Get maximum read bit-width
+            let maximum_read_width = read_indices
+                .iter()
+                .map(|&index| {
+                    let MemoryRead::Unlowered(read) = &table[index] else {
+                        unreachable!();
+                    };
+
+                    read.width
+                })
+                .max()
+                .unwrap_or(0);
+            // Now we want to iterate through each read at this depth, and update `value.bits`
+            // We also want to go bit by bit just like constructing the registers
+            // Bit-major ordering creates the desired interleaving:
+            //
+            // read A bit 0
+            // read B bit 0
+            // read A bit 1
+            // read B bit 1
+            // ...
+            for bit in 0..maximum_read_width {
+                for &index in &read_indices {
+                    let MemoryRead::Unlowered(read) = &table[index] else {
+                        unreachable!();
+                    };
+
+                    if bit >= read.width {
+                        continue;
+                    }
+
+                    let read_id = read.read_id;
+                    let function = self.new_variable(
+                        VariableDescription::MemoryReadValueBit {
+                            read_id,
+                            left,
+                            bit: bit as usize,
+                        },
+                    );
+
+                    let MemoryRead::Unlowered(read) = &mut table[index] else {
+                        unreachable!();
+                    };
+                    read.value.bits.push(function);
+                }
+            }
+        }
+
+        if left {
+            self.left_memory_read_table = table;
+        } else {
+            self.right_memory_read_table = table;
+        }
+    }
+
+    /// Removes the `right` expression along with variables,
+    /// and replaces it with another expr
+    /// Effectively, it should act like running from_exprs, but saves computation
+    /// by only replacing the one which needs to be replaced
+    /// After this, constraints are also gone and need to be rebuilt.
+    /// The only thing that doesn't need to be rebuilt is the other Expr
+    /// which was not replaced.
+    pub fn replace_right_expr(&mut self, new_expr: Expr) {
+        let expected_width = self
+            .left_expr
+            .expr_width()
+            .expect("Width of existing expression should be defined");
+
+        assert_eq!(
+            new_expr.expr_width().expect("Width of new_expr should be defined"),
+            expected_width,
+            "new_expr width should match existing expression widths"
+        );
+
+        self.right.bits.clear();
+        self.right_memory_read_table.clear();
+        self.constraint = self.true_fn.clone();
+        self.right_expr = new_expr;
+
+        let right_variable_indices: Vec<usize> = self
+            .variables
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (description, _))| {
+                matches!(
+                    description,
+                    VariableDescription::MemoryReadValueBit { left: false, .. }
+                )
+                .then_some(index)
+            })
+            .collect();
+
+        for variable_index in right_variable_indices {
+            self.release_variable(variable_index);
+        }
+
+        self.manager_ref.with_manager_shared(|manager| {
+            manager.gc();
+        });
+
+        self.assign_memory_read_variables(RIGHT_EXPR);
+    }
+}
+
 /// A word which is created by a vector of BCDDs
 /// So, each bit is defined by some function.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BddWord {
     /// bits[0] is the least-significant bit.
     pub bits: Vec<BCDDFunction>,
@@ -406,6 +860,145 @@ mod tests {
                 _ => None,
             })
             .expect("expected register write")
+    }
+
+    fn bdd_test_isa() -> ISA {
+        ISA {
+            registers: vec![ArchitecturalRegister {
+                identifier: 0,
+                identifier_width: 1,
+                width: 1,
+            }],
+            instructions: vec![],
+        }
+    }
+
+    fn manager_variable_count(manager: &BddManager) -> u32 {
+        manager
+            .manager_ref
+            .with_manager_shared(|manager| manager.num_vars())
+    }
+
+    #[test]
+    fn bdd_manager_interleaves_memory_read_variables_by_bit() {
+        let left_expr = concat([
+            read_memory(constant(0x100, 32), 8),
+            read_memory(constant(0x200, 32), 16),
+        ]);
+        let manager = BddManager::from_exprs(left_expr, constant(0, 24), &bdd_test_isa());
+
+        let descriptions: Vec<_> = manager
+            .variables
+            .iter()
+            .filter_map(|(description, _)| match description {
+                VariableDescription::MemoryReadValueBit {
+                    read_id,
+                    left: true,
+                    bit,
+                } => Some((*read_id, *bit)),
+                _ => None,
+            })
+            .collect();
+
+        let mut expected = Vec::new();
+        for bit in 0..8 {
+            expected.push((0, bit));
+            expected.push((1, bit));
+        }
+        for bit in 8..16 {
+            expected.push((1, bit));
+        }
+
+        assert_eq!(descriptions, expected);
+    }
+
+    #[test]
+    fn bdd_manager_assigns_nested_memory_reads_deepest_first() {
+        let nested_address = read_memory(constant(0x100, 32), 32);
+        let manager = BddManager::from_exprs(
+            read_memory(nested_address, 8),
+            constant(0, 8),
+            &bdd_test_isa(),
+        );
+
+        let reads: Vec<_> = manager
+            .left_memory_read_table
+            .iter()
+            .map(|read| match read {
+                MemoryRead::Unlowered(read) => (read.read_id, read.depth, read.width),
+                MemoryRead::Lowered(_) => unreachable!(),
+            })
+            .collect();
+
+        assert_eq!(reads, vec![(0, 1, 32), (1, 0, 8)]);
+    }
+
+    #[test]
+    fn replace_right_expr_reuses_variables_and_preserves_left_state() {
+        let mut manager = BddManager::from_exprs(
+            constant(0, 16),
+            concat([
+                read_memory(constant(0x100, 32), 8),
+                read_memory(constant(0x200, 32), 8),
+            ]),
+            &bdd_test_isa(),
+        );
+
+        let register_variable = manager
+            .variables
+            .iter()
+            .find_map(|(description, function)| {
+                matches!(description, VariableDescription::RegisterBit { .. })
+                    .then(|| function.clone())
+            })
+            .expect("expected register variable");
+        manager.left.bits.push(register_variable.clone());
+        manager.constraint = manager
+            .variables
+            .iter()
+            .find_map(|(description, function)| {
+                matches!(
+                    description,
+                    VariableDescription::MemoryReadValueBit { left: false, .. }
+                )
+                .then(|| function.clone())
+            })
+            .expect("expected right memory variable");
+
+        let initial_variable_count = manager_variable_count(&manager);
+
+        for address in 0x300..0x310 {
+            manager.replace_right_expr(read_memory(constant(address, 32), 16));
+
+            assert_eq!(manager_variable_count(&manager), initial_variable_count);
+            assert!(manager.left.bits == vec![register_variable.clone()]);
+            assert!(manager.constraint == manager.true_fn);
+            assert_eq!(manager.right_expr, read_memory(constant(address, 32), 16));
+            assert_eq!(manager.right_memory_read_table.len(), 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "still used by a live BCDD function")]
+    fn release_variable_rejects_a_variable_used_by_any_owned_root() {
+        let mut manager = BddManager::from_exprs(
+            constant(0, 8),
+            read_memory(constant(0x100, 32), 8),
+            &bdd_test_isa(),
+        );
+        let variable_index = manager
+            .variables
+            .iter()
+            .position(|(description, _)| {
+                matches!(
+                    description,
+                    VariableDescription::MemoryReadValueBit { left: false, .. }
+                )
+            })
+            .expect("expected right memory variable");
+
+        manager.left.bits.push(manager.variables[variable_index].1.clone());
+        manager.release_variable(variable_index);
     }
 
     #[test]

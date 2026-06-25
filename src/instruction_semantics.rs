@@ -926,6 +926,80 @@ impl Expr {
         }
     }
 
+    pub(crate) fn visit_children(&self, mut visit: impl FnMut(&Expr)) {
+        match self {
+            Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => {}
+            Expr::ReadRegister { register, .. } => visit(register),
+            Expr::ReadMemory { address, .. } => visit(address),
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Xor(lhs, rhs)
+            | Expr::ShiftLeft(lhs, rhs)
+            | Expr::LogicalShiftRight(lhs, rhs)
+            | Expr::ArithmeticShiftRight(lhs, rhs)
+            | Expr::RotateRight(lhs, rhs)
+            | Expr::Equal(lhs, rhs)
+            | Expr::UnsignedLessThan(lhs, rhs)
+            | Expr::SignedLessThan(lhs, rhs) => {
+                visit(lhs);
+                visit(rhs);
+            }
+            Expr::Not(value) | Expr::CountOnes(value) => visit(value),
+            Expr::Extract { value, .. }
+            | Expr::ZeroExtend { value, .. }
+            | Expr::SignExtend { value, .. } => visit(value),
+            Expr::Concat(values) => {
+                for value in values {
+                    visit(value);
+                }
+            }
+            Expr::AddCarryOut {
+                lhs,
+                rhs,
+                carry_in,
+                ..
+            }
+            | Expr::AddOverflow {
+                lhs,
+                rhs,
+                carry_in,
+                ..
+            } => {
+                visit(lhs);
+                visit(rhs);
+                visit(carry_in);
+            }
+            Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in,
+                ..
+            }
+            | Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in,
+                ..
+            } => {
+                visit(lhs);
+                visit(rhs);
+                visit(borrow_in);
+            }
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                visit(condition);
+                visit(when_true);
+                visit(when_false);
+            }
+        }
+    }
+
     /// Rebuilds this node after applying `map` to each immediate child.
     ///
     /// This is a one-level traversal: `map` decides whether and how to recurse.
