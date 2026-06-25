@@ -13,6 +13,32 @@ pub struct ISA {
     pub instructions: Vec<Instruction>,
 }
 
+/// Definition of a register in the architecture.
+/// You can set the identifier, the identifier width,
+/// and the width of the register.
+/// Identifiers should never overlap regardless of width.
+///
+/// Thus, for some architectures (eg those with floating point registers)
+/// you may need to have identifiers differ slightly (eg adding an extra bit to denote
+/// the type of register).
+///
+/// Importantly, however, you need to make sure that if a certain `width` and
+/// `identifier_width` does not have 2^identifier_width registers (ie the identifiers are sparse)
+/// with that identifier width, it is not possible for any instruction to
+/// ever request any register which is undefined using a given selector width.
+///     Notice the nuance that the register `width` also matters.
+///     If R0-R14 are all 32 bits but R15 is 16 bits, and you create something
+///     which indexes from a field to get a 16 bit register, and that field takes any
+///     value other than 15, there will be issues which will manifest
+///     in the form of bugs, rather than the form of a program panic.
+///
+/// Eg if you define R18 as the only 5 bit identifier_width,
+/// you should only select other registers (eg R0-R15) using
+/// a 4 bit identifier_width.
+///
+/// As such, you likely shouldn't mess with identifier width and sparsely
+/// defining register identifiers unless you're using fixed register identifiers.
+/// Register identifiers should never be sparse at an accessible level from the ISA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchitecturalRegister {
     pub identifier: u8,

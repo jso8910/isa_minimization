@@ -677,10 +677,7 @@ impl BddManager {
         operation: F,
     ) -> AllocResult<BddWord>
     where
-        F: Fn(
-            &BCDDFunction,
-            &BCDDFunction,
-        ) -> AllocResult<BCDDFunction>,
+        F: Fn(&BCDDFunction, &BCDDFunction) -> AllocResult<BCDDFunction>,
     {
         assert_eq!(lhs.bits.len(), rhs.bits.len());
 
@@ -694,28 +691,171 @@ impl BddManager {
         Ok(BddWord { bits })
     }
 
+    /// Simple 2-1 mux
+    fn mux_word(
+        &self,
+        condition: &BCDDFunction,
+        when_true: &BddWord,
+        when_false: &BddWord,
+    ) -> AllocResult<BddWord> {
+        assert_eq!(when_true.bits.len(), when_false.bits.len());
+
+        let bits = when_true
+            .bits
+            .iter()
+            .zip(&when_false.bits)
+            .map(|(true_bit, false_bit)| condition.ite(true_bit, false_bit))
+            .collect::<AllocResult<Vec<_>>>()?;
+
+        Ok(BddWord { bits })
+    }
+
     /// Lowers a register read and builds a register mux to select the register contents
+    /// Selects from all registers of width `width` and `identifier_width == selector.bits.len()`
     fn lower_register_read(&self, selector: BddWord, width: u16) -> AllocResult<BddWord> {
-        todo!("register-read lowering is not implemented")
+        assert!(
+            selector.bits.len() <= 8,
+            "register selector exceeds u8 identifier width"
+        );
+        let ident_width = selector.bits.len() as u8;
+        // Temporarily initialize registers as all low
+        // Technically it is not guaranteed that all bits are overriden.
+        // As such, it is possible for these bits to "poison" the output
+        // if the `selector` isn't selecting a valid register for the given `selector_width` and width
+        let mut registers = vec![
+            BddWord {
+                bits: vec![self.false_fn.clone(); width as usize]
+            };
+            1usize << ident_width
+        ];
+        for (description, variable) in self.variables.iter() {
+            let VariableDescription::RegisterBit { register, bit } = description else {
+                // This isn't the right type of read!
+                continue;
+            };
+            if register.width != width as u8 {
+                continue;
+            }
+            if register.identifier_width != ident_width {
+                continue;
+            }
+
+            if register.identifier as usize >= (1usize << register.identifier_width) {
+                panic!("Register identifier too large for its identifier width!");
+            }
+
+            // This is safe because we have a guarantee on the length of the registers vec
+            let reg_mut = &mut registers[register.identifier as usize];
+            reg_mut.bits[*bit] = variable.clone();
+        }
+
+        // First layer: LSB selection bit (0 = even registers, 1 = odd)
+        // Second layer: second LSB (0 = multiple of 4, 1 = multiple of 4 + 2)
+        // and so on
+        for selector_bit in &selector.bits {
+            let mut next = Vec::with_capacity(registers.len() / 2);
+
+            for pair in registers.chunks_exact(2) {
+                let selected = self.mux_word(
+                    selector_bit,
+                    &pair[1], // selector bit = 1
+                    &pair[0], // selector bit = 0
+                )?;
+
+                next.push(selected);
+            }
+
+            registers = next;
+        }
+        assert_eq!(registers.len(), 1);
+        Ok(registers.pop().unwrap())
+    }
+
+    fn full_adder(
+        a: &BCDDFunction,
+        b: &BCDDFunction,
+        carry_in: &BCDDFunction,
+    ) -> AllocResult<(BCDDFunction, BCDDFunction)> {
+        let a_xor_b = a.xor(b)?;
+
+        let sum = a_xor_b.xor(carry_in)?;
+
+        let generated = a.and(b)?;
+        let propagated = a_xor_b.and(carry_in)?;
+        let carry_out = generated.or(&propagated)?;
+
+        Ok((sum, carry_out))
     }
 
     /// Lowers an addition expression
     fn lower_add(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(op1.bits.len(), op2.bits.len());
+        let width = op1.bits.len();
+
+        let mut result = Vec::with_capacity(width);
+        let mut carry = self.false_fn.clone();
+
+        for bit in 0..width {
+            let (sum, next_carry) = Self::full_adder(&op1.bits[bit], &op2.bits[bit], &carry)?;
+
+            result.push(sum);
+            carry = next_carry;
+        }
+
+        Ok(BddWord { bits: result })
+    }
+
+    /// Helper function to shift left by a constant
+    fn shift_left_const(&self, value: &BddWord, amount: usize) -> BddWord {
+        let width = value.bits.len();
+        let mut result = vec![self.false_fn.clone(); width];
+        for source in 0..value.bits.len() {
+            let destination = source + amount;
+
+            if destination < width {
+                result[destination] = value.bits[source].clone();
+            }
+        }
+
+        BddWord { bits: result }
+    }
+
+    /// Helper function to mask a word by a single bit (eg 0b101 & 0b0 = 0b000)
+    fn mask_word(&self, condition: &BCDDFunction, value: &BddWord) -> AllocResult<BddWord> {
+        let bits = value
+            .bits
+            .iter()
+            .map(|bit| bit.and(condition))
+            .collect::<AllocResult<Vec<_>>>()?;
+
+        Ok(BddWord { bits })
     }
 
     /// Lowers a multiplication expression
+    /// Takes two operands of some `width` and returns a BddWord of `width`
     fn lower_mul(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(op1.bits.len(), op2.bits.len());
+        let width = op1.bits.len();
+        let mut result = BddWord {
+            bits: vec![self.false_fn.clone(); width],
+        };
+
+        // Shift and add combinatorial multiplier
+        // a*b = sum(bi * (a << i))
+        for multiplier_bit in 0..width {
+            let shifted = self.shift_left_const(&op1, multiplier_bit);
+
+            let partial_product = self.mask_word(&op2.bits[multiplier_bit], &shifted)?;
+
+            result = self.lower_add(result, partial_product)?;
+        }
+
+        Ok(result)
     }
 
     /// Lowers a bitwise and expression
     fn lower_and(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        self.lower_bitwise_binary(
-            op1,
-            op2,
-            |lhs_bit, rhs_bit| lhs_bit.and(rhs_bit),
-        )
+        self.lower_bitwise_binary(op1, op2, |lhs_bit, rhs_bit| lhs_bit.and(rhs_bit))
     }
 
     /// Lowers bitwise not
@@ -1183,6 +1323,298 @@ mod tests {
         manager
             .manager_ref
             .with_manager_shared(|manager| manager.num_vars())
+    }
+
+    fn bdd_manager_for_width(width: u16) -> BddManager {
+        BddManager::from_exprs(
+            constant(0, width),
+            constant(0, width),
+            &ISA {
+                registers: vec![],
+                instructions: vec![],
+            },
+        )
+    }
+
+    fn constant_bdd_word_value(manager: &BddManager, word: &BddWord) -> u128 {
+        word.bits
+            .iter()
+            .enumerate()
+            .map(|(bit, function)| {
+                if *function == manager.true_fn {
+                    1u128 << bit
+                } else {
+                    assert!(
+                        *function == manager.false_fn,
+                        "expected a constant BCDD bit"
+                    );
+                    0
+                }
+            })
+            .sum()
+    }
+
+    fn eval_bdd_word(word: &BddWord, assignment: &[(u32, bool)]) -> u128 {
+        word.bits
+            .iter()
+            .enumerate()
+            .map(|(bit, function)| {
+                if function.eval(assignment.iter().copied()) {
+                    1u128 << bit
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn lower_constant_uses_little_endian_bits_and_truncates_to_width() {
+        let manager = bdd_manager_for_width(8);
+
+        let word = manager.lower_constant(0b1_1010_0101, 8);
+
+        assert_eq!(constant_bdd_word_value(&manager, &word), 0b1010_0101);
+        assert_eq!(word.bits.len(), 8);
+    }
+
+    #[test]
+    fn mux_word_selects_the_requested_word() {
+        let manager = bdd_manager_for_width(4);
+        let when_true = manager.lower_constant(0b1010, 4);
+        let when_false = manager.lower_constant(0b0101, 4);
+
+        let selected_true = manager
+            .mux_word(&manager.true_fn, &when_true, &when_false)
+            .unwrap();
+        let selected_false = manager
+            .mux_word(&manager.false_fn, &when_true, &when_false)
+            .unwrap();
+
+        assert_eq!(constant_bdd_word_value(&manager, &selected_true), 0b1010);
+        assert_eq!(constant_bdd_word_value(&manager, &selected_false), 0b0101);
+    }
+
+    #[test]
+    fn full_adder_matches_all_truth_table_rows() {
+        let manager = bdd_manager_for_width(1);
+
+        for a in [false, true] {
+            for b in [false, true] {
+                for carry_in in [false, true] {
+                    let a_fn = if a {
+                        &manager.true_fn
+                    } else {
+                        &manager.false_fn
+                    };
+                    let b_fn = if b {
+                        &manager.true_fn
+                    } else {
+                        &manager.false_fn
+                    };
+                    let carry_fn = if carry_in {
+                        &manager.true_fn
+                    } else {
+                        &manager.false_fn
+                    };
+
+                    let (sum, carry_out) = BddManager::full_adder(a_fn, b_fn, carry_fn).unwrap();
+                    let total = a as u8 + b as u8 + carry_in as u8;
+
+                    assert_eq!(sum == manager.true_fn, total & 1 != 0);
+                    assert_eq!(carry_out == manager.true_fn, total >= 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_add_matches_wrapping_addition_exhaustively() {
+        for width in 1..=6 {
+            let manager = bdd_manager_for_width(width);
+            let limit = 1u128 << width;
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    let result = manager
+                        .lower_add(
+                            manager.lower_constant(lhs, width),
+                            manager.lower_constant(rhs, width),
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        constant_bdd_word_value(&manager, &result),
+                        (lhs + rhs) & (limit - 1),
+                        "width={width}, lhs={lhs}, rhs={rhs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shift_left_const_matches_wrapping_bitvector_shift() {
+        let width = 6;
+        let manager = bdd_manager_for_width(width);
+        let mask = (1u128 << width) - 1;
+
+        for value in 0..=mask {
+            for amount in 0..=(width as usize + 1) {
+                let shifted =
+                    manager.shift_left_const(&manager.lower_constant(value, width), amount);
+
+                assert_eq!(
+                    constant_bdd_word_value(&manager, &shifted),
+                    (value << amount) & mask,
+                    "value={value}, amount={amount}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mask_word_selects_value_or_zero() {
+        let manager = bdd_manager_for_width(5);
+
+        for value in 0..32 {
+            let value_word = manager.lower_constant(value, 5);
+            let included = manager.mask_word(&manager.true_fn, &value_word).unwrap();
+            let excluded = manager.mask_word(&manager.false_fn, &value_word).unwrap();
+
+            assert_eq!(constant_bdd_word_value(&manager, &included), value);
+            assert_eq!(constant_bdd_word_value(&manager, &excluded), 0);
+        }
+    }
+
+    #[test]
+    fn lower_mul_matches_wrapping_multiplication_exhaustively() {
+        for width in 1..=6 {
+            let manager = bdd_manager_for_width(width);
+            let limit = 1u128 << width;
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    let result = manager
+                        .lower_mul(
+                            manager.lower_constant(lhs, width),
+                            manager.lower_constant(rhs, width),
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        constant_bdd_word_value(&manager, &result),
+                        (lhs * rhs) & (limit - 1),
+                        "width={width}, lhs={lhs}, rhs={rhs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_mul_matches_64_bit_wrapping_multiplication() {
+        let manager = bdd_manager_for_width(64);
+        let cases = [
+            (0, u64::MAX),
+            (1, u64::MAX),
+            (u64::MAX, u64::MAX),
+            (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+            (1u64 << 63, 2),
+        ];
+
+        for (lhs, rhs) in cases {
+            let result = manager
+                .lower_mul(
+                    manager.lower_constant(lhs as u128, 64),
+                    manager.lower_constant(rhs as u128, 64),
+                )
+                .unwrap();
+            let result_value = constant_bdd_word_value(&manager, &result);
+
+            assert_eq!(
+                result_value,
+                lhs.wrapping_mul(rhs) as u128,
+                "lhs={lhs:#018x}, rhs={rhs:#018x}"
+            );
+            println!("opa={lhs:#018x}, opb={rhs:#018x}, result={result_value:#018x}");
+        }
+    }
+
+    #[test]
+    fn lower_and_and_not_match_bitwise_semantics_exhaustively() {
+        let width = 5;
+        let manager = bdd_manager_for_width(width);
+        let mask = (1u128 << width) - 1;
+
+        for lhs in 0..=mask {
+            let not_result = manager
+                .lower_not(manager.lower_constant(lhs, width))
+                .unwrap();
+            assert_eq!(
+                constant_bdd_word_value(&manager, &not_result),
+                (!lhs) & mask
+            );
+
+            for rhs in 0..=mask {
+                let and_result = manager
+                    .lower_and(
+                        manager.lower_constant(lhs, width),
+                        manager.lower_constant(rhs, width),
+                    )
+                    .unwrap();
+                assert_eq!(constant_bdd_word_value(&manager, &and_result), lhs & rhs);
+            }
+        }
+    }
+
+    #[test]
+    fn lower_register_read_muxes_symbolic_selectors() {
+        let registers = (0..4)
+            .map(|identifier| ArchitecturalRegister {
+                identifier,
+                identifier_width: 2,
+                width: 3,
+            })
+            .collect();
+        let selector_expr = read_memory(constant(0x100, 32), 2);
+        let manager = BddManager::from_exprs(
+            selector_expr,
+            constant(0, 2),
+            &ISA {
+                registers,
+                instructions: vec![],
+            },
+        );
+        let selector = manager.left_memory_read_table[0].value.clone();
+        let result = manager.lower_register_read(selector, 3).unwrap();
+        let register_values = [0b001u128, 0b010, 0b100, 0b111];
+
+        for selected_register in 0..4 {
+            let assignment: Vec<_> = manager
+                .variables
+                .iter()
+                .enumerate()
+                .map(|(variable, (description, _))| {
+                    let value = match description {
+                        VariableDescription::RegisterBit { register, bit } => {
+                            (register_values[register.identifier as usize] >> bit) & 1 != 0
+                        }
+                        VariableDescription::MemoryReadValueBit {
+                            left: true, bit, ..
+                        } => (selected_register >> bit) & 1 != 0,
+                        _ => false,
+                    };
+                    (variable as u32, value)
+                })
+                .collect();
+
+            assert_eq!(
+                eval_bdd_word(&result, &assignment),
+                register_values[selected_register],
+                "selected_register={selected_register}"
+            );
+        }
     }
 
     #[test]

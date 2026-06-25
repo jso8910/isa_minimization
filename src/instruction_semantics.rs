@@ -1984,8 +1984,9 @@ pub enum RegisterRef {
     ///
     /// `identifier_width` is the width of the register identifier expression, not
     /// the width of the register's stored value.
-    /// `identifier_width` must be consistent. The boolean equivalence
-    /// will see Fixed(0, 2) as different from Fixed(0, 4).
+    /// `identifier_width` must be consistent the ISA's ArchitecturalRegisters
+    /// If it is not, the boolean equivalence for the Expr will fail to find
+    /// the register.
     Fixed {
         register: Register,
         identifier_width: u16,
