@@ -16,8 +16,14 @@ const APPLY_CACHE_CAPACITY: usize = 2048;
 const LEFT_EXPR: bool = true;
 const RIGHT_EXPR: bool = false;
 
-use std::{cmp::Reverse, collections::BTreeMap};
+use std::{
+    cmp::Reverse,
+    collections::BTreeMap,
+    fmt::Binary,
+    ops::{BitAnd, BitOr},
+};
 
+use liberty_db::{cell::CurrentInternalNodeValue::L, expression::Bdd};
 use oxidd::{
     BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef,
     bcdd::{BCDDFunction, BCDDManagerRef},
@@ -670,27 +676,6 @@ impl BddManager {
         BddWord { bits }
     }
 
-    fn lower_bitwise_binary<F>(
-        &self,
-        lhs: BddWord,
-        rhs: BddWord,
-        operation: F,
-    ) -> AllocResult<BddWord>
-    where
-        F: Fn(&BCDDFunction, &BCDDFunction) -> AllocResult<BCDDFunction>,
-    {
-        assert_eq!(lhs.bits.len(), rhs.bits.len());
-
-        let bits = lhs
-            .bits
-            .iter()
-            .zip(&rhs.bits)
-            .map(|(lhs, rhs)| operation(lhs, rhs))
-            .collect::<AllocResult<Vec<_>>>()?;
-
-        Ok(BddWord { bits })
-    }
-
     /// Simple 2-1 mux
     fn mux_word(
         &self,
@@ -787,13 +772,16 @@ impl BddManager {
         Ok((sum, carry_out))
     }
 
-    /// Lowers an addition expression
-    fn lower_add(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        assert_eq!(op1.bits.len(), op2.bits.len());
-        let width = op1.bits.len();
-
+    /// Helper function with an adder, which returns a result and the carry bit
+    fn adder(
+        &self,
+        op1: &BddWord,
+        op2: &BddWord,
+        carry_in: BCDDFunction,
+        width: usize,
+    ) -> AllocResult<(BddWord, BCDDFunction)> {
         let mut result = Vec::with_capacity(width);
-        let mut carry = self.false_fn.clone();
+        let mut carry = carry_in;
 
         for bit in 0..width {
             let (sum, next_carry) = Self::full_adder(&op1.bits[bit], &op2.bits[bit], &carry)?;
@@ -802,7 +790,19 @@ impl BddManager {
             carry = next_carry;
         }
 
-        Ok(BddWord { bits: result })
+        let result = BddWord { bits: result };
+
+        Ok((result, carry))
+    }
+
+    /// Lowers an addition expression
+    fn lower_add(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
+        assert_eq!(op1.bits.len(), op2.bits.len());
+        let width = op1.bits.len();
+
+        let (result, ..) = self.adder(&op1, &op2, self.false_fn.clone(), width)?;
+
+        Ok(result)
     }
 
     /// Helper function to shift left by a constant
@@ -818,6 +818,68 @@ impl BddManager {
         }
 
         BddWord { bits: result }
+    }
+
+    /// Helper function to shift right (logical) by a constant
+    fn shift_logical_right_const(&self, value: &BddWord, amount: usize) -> BddWord {
+        let width = value.bits.len();
+        let mut result = vec![self.false_fn.clone(); width];
+        for source in 0..value.bits.len() {
+            // This bit underflows
+            if source < amount {
+                continue;
+            }
+            let destination = source - amount;
+
+            // If destination < 0, then the value has been shifted out
+            if destination >= 0 {
+                result[destination] = value.bits[source].clone();
+            }
+        }
+
+        BddWord { bits: result }
+    }
+
+    /// Helper function to shift right (arithmetic) by a constant
+    fn shift_arith_right_const(&self, value: &BddWord, amount: usize) -> BddWord {
+        let width = value.bits.len();
+        let sign_bit = value.bits.last().expect("Width should be greater than 0!");
+
+        // Only change is we fill with the sign bit rather than 0
+        let mut result = vec![sign_bit.clone(); width];
+        for source in 0..value.bits.len() {
+            // This bit underflows
+            if source < amount {
+                continue;
+            }
+            let destination = source - amount;
+
+            // If destination < 0, then the value has been shifted out
+            if destination >= 0 {
+                result[destination] = value.bits[source].clone();
+            }
+        }
+
+        BddWord { bits: result }
+    }
+
+    /// Helper function to rotate right by a constant
+    fn rotate_right_const(&self, value: &BddWord, amount: usize) -> BddWord {
+        let width = value.bits.len();
+
+        // ROR is mod width
+        // Eg ROR 0b101 by 3 is euqivalent to ROR by 0
+        let amount = amount % width;
+
+        // Take the bit at destination + amount and shift it by amount bits to destination
+        let bits = (0..width)
+            .map(|destination| {
+                let source = (destination + amount) % width;
+                value.bits[source].clone()
+            })
+            .collect();
+
+        BddWord { bits }
     }
 
     /// Helper function to mask a word by a single bit (eg 0b101 & 0b0 = 0b000)
@@ -855,7 +917,7 @@ impl BddManager {
 
     /// Lowers a bitwise and expression
     fn lower_and(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        self.lower_bitwise_binary(op1, op2, |lhs_bit, rhs_bit| lhs_bit.and(rhs_bit))
+        op1 & op2
     }
 
     /// Lowers bitwise not
@@ -869,14 +931,57 @@ impl BddManager {
         Ok(BddWord { bits })
     }
 
+    fn barrel_shifter<F>(
+        &self,
+        mut value: BddWord,
+        amount: BddWord,
+        shift_const: F,
+    ) -> AllocResult<BddWord>
+    where
+        F: Fn(&BddWord, usize) -> BddWord,
+    {
+        let width = value.bits.len();
+
+        // Barrel shifter -- looks at each amount bit at position n, and creates a mux
+        // shifting the result by 2^n if that bit is set
+        for (bit_index, amount_bit) in amount.bits.iter().enumerate() {
+            let shift = 1usize.checked_shl(bit_index as u32).unwrap_or(width);
+
+            let shifted = shift_const(&value, shift);
+
+            // Select: amount_bit ? shifted : result
+            // if amount_bit is 1, shift by this amount, otherwise don't shift
+            value = self.mux_word(amount_bit, &shifted, &value)?;
+        }
+
+        Ok(value)
+    }
+
+    fn rotate_right_shift_for_bit(width: usize, bit_index: usize) -> usize {
+        assert!(width > 0);
+
+        let mut shift = 1 % width;
+        for _ in 0..bit_index {
+            shift = (shift * 2) % width;
+        }
+        shift
+    }
+
+    /// Helper function to return if BddWord is all true
+    fn all_true(&self, values: &[BCDDFunction]) -> AllocResult<BCDDFunction> {
+        values
+            .iter()
+            .try_fold(self.true_fn.clone(), |result, value| result.and(value))
+    }
+
     /// Lowers shift left
     fn lower_shift_left(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
-        todo!("not implementated")
+        self.barrel_shifter(value, amount, |v, a| self.shift_left_const(&v, a))
     }
 
     /// Lowers logical shift right
     fn lower_logical_shift_right(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
-        todo!("not implementated")
+        self.barrel_shifter(value, amount, |v, a| self.shift_logical_right_const(&v, a))
     }
 
     /// Lowers arithmetic shift right
@@ -885,52 +990,167 @@ impl BddManager {
         value: BddWord,
         amount: BddWord,
     ) -> AllocResult<BddWord> {
-        todo!("not implementated")
+        self.barrel_shifter(value, amount, |v, a| self.shift_arith_right_const(&v, a))
     }
 
     /// Lowers rotate right
-    fn lower_rotate_right(&self, value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
-        todo!("not implementated")
+    fn lower_rotate_right(&self, mut value: BddWord, amount: BddWord) -> AllocResult<BddWord> {
+        let width = value.bits.len();
+
+        for (bit_index, amount_bit) in amount.bits.iter().enumerate() {
+            // The rotate amount can't be calculated easily as 2^n, because it can overflow
+            // With shifts, when the value overflows, we simply clamp it to width, because
+            // the bit is discarded anyways.
+            // However, with shift, the bit is not discarded.
+            // So instead, we take shift mod width at every step.
+            let shift = Self::rotate_right_shift_for_bit(width, bit_index);
+            if shift == 0 {
+                continue;
+            }
+
+            let shifted = self.rotate_right_const(&value, shift);
+            value = self.mux_word(amount_bit, &shifted, &value)?;
+        }
+
+        Ok(value)
     }
 
-    /// Lowers bitwise equals operation
+    /// Lowers equals operation - returns single bit in a Word
     fn lower_equal(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        let bits = vec![
+            self.all_true(
+                &op1.lower_bitwise_binary(op2, |op1_b, op2_b| op1_b.equiv(op2_b))?
+                    .bits,
+            )?,
+        ];
+
+        Ok(BddWord { bits })
     }
 
-    /// Lowers unsigned less than
+    /// Lowers unsigned less than. op1 < op2
     fn lower_unsigned_lt(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(op1.bits.len(), op2.bits.len());
+        let width = op1.bits.len();
+
+        // Iterate from MSB to LSB
+        // If op1[i] == op2[i], inconclusive
+        // if op1[i] < op2[i], true
+        // if op1[i] > op2[i], false
+        // if everything has been inconclusive so far, and op1[0] == op2[0], false
+        // true and false are both locking states
+        // so we need 2 bits: one to represent whether we have determined that op1 != op2 yet
+        // one to represent whether we have determined that op1 < op2 yet
+        let mut equal_so_far = self.true_fn.clone();
+        let mut less_so_far = self.false_fn.clone();
+        for bit_idx in (0..width).rev() {
+            let a = &op1.bits[bit_idx];
+            let b = &op2.bits[bit_idx];
+
+            // a < b iff a == 0 & b == 1 & equal_so_far
+            let bit_less = a.not()?.and(b)?;
+            less_so_far = less_so_far.or(&bit_less.and(&equal_so_far)?)?;
+
+            let equal = a.equiv(b)?;
+            equal_so_far = equal_so_far.and(&equal)?;
+        }
+        Ok(BddWord {
+            bits: vec![less_so_far],
+        })
     }
 
     /// Lowers signed less than
     fn lower_signed_lt(&self, op1: BddWord, op2: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(op1.bits.len(), op2.bits.len());
+        let width = op1.bits.len();
+
+        assert!(width > 0);
+
+        // Iterate from MSB to LSB, except treat the MSB different
+        // If op1[i] == op2[i], inconclusive
+        // if op1[i] < op2[i], true
+        // if op1[i] > op2[i], false
+        // if everything has been inconclusive so far, and op1[0] == op2[0], false
+        // true and false are both locking states
+        // so we need 2 bits: one to represent whether we have determined that op1 != op2 yet
+        // one to represent whether we have determined that op1 < op2 yet
+
+        let a_msb = &op1.bits[width - 1];
+        let b_msb = &op2.bits[width - 1];
+        let mut equal_so_far = a_msb.equiv(b_msb)?;
+
+        // a < b if sign(a) == 1 and sign(b) == 0
+        let mut less_so_far = a_msb.and(&b_msb.not()?)?;
+        for bit_idx in (0..(width - 1)).rev() {
+            let a = &op1.bits[bit_idx];
+            let b = &op2.bits[bit_idx];
+
+            // a < b iff a == 0 & b == 1 & equal_so_far
+            let bit_less = a.not()?.and(b)?;
+            less_so_far = less_so_far.or(&bit_less.and(&equal_so_far)?)?;
+
+            let equal = a.equiv(b)?;
+            equal_so_far = equal_so_far.and(&equal)?;
+        }
+        Ok(BddWord {
+            bits: vec![less_so_far],
+        })
     }
 
     /// Lowers bit extraction
     fn lower_extract(&self, value: BddWord, high: u16, low: u16) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        Ok(BddWord {
+            bits: value.bits[low as usize..=high as usize].to_vec(),
+        })
     }
 
     /// Lowers concatenation
     fn lower_concat(&self, values: Vec<BddWord>) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        let bits = values
+            .into_iter()
+            .rev() // eg if [[1, 1], [0, 0]], result should be [0, 0, 1, 1] with 1, 1 as MSB
+            .flat_map(|e| e.bits)
+            .collect();
+        Ok(BddWord { bits })
     }
 
     /// Lowers zero extension
-    fn lower_zero_extend(&self, value: BddWord, to_width: u16) -> AllocResult<BddWord> {
-        todo!("not implemented")
+    fn lower_zero_extend(&self, mut value: BddWord, to_width: u16) -> AllocResult<BddWord> {
+        let width = value.bits.len();
+        if width > to_width as usize {
+            panic!("width must be less than to_width!");
+        }
+        value.bits.resize(to_width as usize, self.false_fn.clone());
+        Ok(value)
     }
 
     /// Lowers sign extension
-    fn lower_sign_extend(&self, value: BddWord, to_width: u16) -> AllocResult<BddWord> {
-        todo!("not implemented")
+    fn lower_sign_extend(&self, mut value: BddWord, to_width: u16) -> AllocResult<BddWord> {
+        let width = value.bits.len();
+        if width > to_width as usize {
+            panic!("width must be less than to_width!");
+        }
+
+        let sign = &value.bits[width - 1];
+        value.bits.resize(to_width as usize, sign.clone());
+        Ok(value)
     }
 
     /// Lowers counting ones
     fn lower_count_ones(&self, value: BddWord) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        let width = value.bits.len();
+        // Initialize the count as 0
+        let mut count = BddWord {
+            bits: vec![self.false_fn.clone(); width],
+        };
+
+        for idx in 0..width {
+            let mut bit = BddWord {
+                bits: vec![value.bits[idx].clone()],
+            };
+            bit.bits.resize(width, self.false_fn.clone());
+            count = self.lower_add(count, bit)?;
+        }
+        Ok(count)
     }
 
     /// Lowers add carry out
@@ -941,7 +1161,11 @@ impl BddManager {
         carry_in: BddWord,
         width: u16,
     ) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(carry_in.bits.len(), 1);
+
+        let (.., cout) = self.adder(&lhs, &rhs, carry_in.bits[0].clone(), width as usize)?;
+
+        Ok(BddWord { bits: vec![cout] })
     }
 
     /// Lowers add overflow flag bit
@@ -952,7 +1176,19 @@ impl BddManager {
         carry_in: BddWord,
         width: u16,
     ) -> AllocResult<BddWord> {
-        todo!("not implemented")
+        assert_eq!(carry_in.bits.len(), 1);
+
+        let (res, ..) = self.adder(&lhs, &rhs, carry_in.bits[0].clone(), width as usize)?;
+
+        // Overflow occurs when: lhs and rhs have same sign, but res has a different sign
+        let lmsb = &lhs.bits[width as usize - 1];
+        let rmsb = &rhs.bits[width as usize - 1];
+        let res_msb = &res.bits[width as usize - 1];
+        let overflow = lmsb.equiv(rmsb)?.and(&lmsb.equiv(res_msb)?.not()?)?;
+
+        Ok(BddWord {
+            bits: vec![overflow],
+        })
     }
 }
 
@@ -962,6 +1198,38 @@ impl BddManager {
 pub struct BddWord {
     /// bits[0] is the least-significant bit.
     pub bits: Vec<BCDDFunction>,
+}
+
+impl BddWord {
+    pub fn lower_bitwise_binary<F>(self, rhs: BddWord, operation: F) -> AllocResult<BddWord>
+    where
+        F: Fn(&BCDDFunction, &BCDDFunction) -> AllocResult<BCDDFunction>,
+    {
+        assert_eq!(self.bits.len(), rhs.bits.len());
+
+        let bits = self
+            .bits
+            .iter()
+            .zip(&rhs.bits)
+            .map(|(lhs, rhs)| operation(lhs, rhs))
+            .collect::<AllocResult<Vec<_>>>()?;
+
+        Ok(BddWord { bits })
+    }
+}
+
+impl BitOr for BddWord {
+    type Output = AllocResult<Self>;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.lower_bitwise_binary(rhs, |lhs_bit, rhs_bit| lhs_bit.or(rhs_bit))
+    }
+}
+
+impl BitAnd for BddWord {
+    type Output = AllocResult<Self>;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        self.lower_bitwise_binary(rhs, |lhs_bit, rhs_bit| lhs_bit.and(rhs_bit))
+    }
 }
 
 /// Given some sequence of instructions, create a list of all Effects of the sequence in terms of the initial state
@@ -1267,7 +1535,12 @@ fn combine_effects(effect_1: &Effect, effect_2: &Effect) -> Option<Effect> {
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::{Register, bool_const, fixed_register, read_memory, read_register},
+        instruction_semantics::{
+            Register, add_carry_out, add_overflow, and_expr, arithmetic_shift_right, bool_const,
+            count_ones, equal, fixed_register, logical_shift_right, mul, not_expr, read_memory,
+            read_register, rotate_right, shift_left, sign_extend, signed_less_than,
+            unsigned_less_than, zero_extend,
+        },
         isa_specification::InstructionForm,
     };
 
@@ -1336,6 +1609,67 @@ mod tests {
         )
     }
 
+    fn bit_mask(width: u16) -> u128 {
+        if width == 128 {
+            !0
+        } else {
+            (1u128 << width) - 1
+        }
+    }
+
+    fn signed_value(value: u128, width: u16) -> i128 {
+        let value = value & bit_mask(width);
+        if width == 128 {
+            value as i128
+        } else {
+            let sign = 1u128 << (width - 1);
+            if value & sign == 0 {
+                value as i128
+            } else {
+                (value as i128) - (1i128 << width as u32)
+            }
+        }
+    }
+
+    fn const_expr_oracle(expr: Expr) -> (u128, u16) {
+        match expr
+            .clone()
+            .collapse_and_canonicalize(&decoded("CONST_ORACLE"))
+        {
+            Expr::Const { value, width } => (value & bit_mask(width), width),
+            lowered => panic!("constant-only expression did not collapse to const: {lowered:?}"),
+        }
+    }
+
+    fn assert_const_expr_lowering_with_manager(
+        manager: &BddManager,
+        expr: Expr,
+        expected_value: u128,
+        expected_width: u16,
+    ) {
+        let (oracle_value, oracle_width) = const_expr_oracle(expr.clone());
+        assert_eq!(oracle_width, expected_width, "oracle width for {expr:?}");
+        assert_eq!(
+            oracle_value,
+            expected_value & bit_mask(expected_width),
+            "manual expectation disagrees with const oracle for {expr:?}"
+        );
+
+        let lowered = manager.lower_expression(&expr, LEFT_EXPR);
+
+        assert_eq!(lowered.bits.len(), oracle_width as usize);
+        assert_eq!(
+            constant_bdd_word_value(&manager, &lowered),
+            oracle_value,
+            "BDD lowering disagrees with const oracle for {expr:?}"
+        );
+    }
+
+    fn assert_const_expr_lowering(expr: Expr, expected_value: u128, expected_width: u16) {
+        let manager = bdd_manager_for_width(expected_width);
+        assert_const_expr_lowering_with_manager(&manager, expr, expected_value, expected_width);
+    }
+
     fn constant_bdd_word_value(manager: &BddManager, word: &BddWord) -> u128 {
         word.bits
             .iter()
@@ -1369,13 +1703,580 @@ mod tests {
     }
 
     #[test]
+    fn new_variable_reuses_released_slots() {
+        let mut manager = bdd_manager_for_width(1);
+        let first = manager.new_variable(VariableDescription::RegisterBit {
+            register: ArchitecturalRegister {
+                identifier: 0,
+                identifier_width: 1,
+                width: 1,
+            },
+            bit: 0,
+        });
+
+        manager.release_variable(0);
+        let second = manager.new_variable(VariableDescription::MemoryReadValueBit {
+            read_id: 0,
+            left: true,
+            bit: 0,
+        });
+
+        assert_eq!(manager.variables.len(), 1);
+        assert!(first == second);
+        assert!(matches!(
+            manager.variables[0].0,
+            VariableDescription::MemoryReadValueBit {
+                read_id: 0,
+                left: true,
+                bit: 0
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Variable index is outside the variable pool")]
+    fn release_variable_rejects_out_of_range_indices() {
+        let mut manager = bdd_manager_for_width(1);
+
+        manager.release_variable(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Variable is already unallocated")]
+    fn release_variable_rejects_already_released_slots() {
+        let mut manager = bdd_manager_for_width(1);
+        manager.new_variable(VariableDescription::RegisterBit {
+            register: ArchitecturalRegister {
+                identifier: 0,
+                identifier_width: 1,
+                width: 1,
+            },
+            bit: 0,
+        });
+
+        manager.release_variable(0);
+        manager.release_variable(0);
+    }
+
+    #[test]
+    fn variable_usage_helpers_find_variables_in_functions_words_and_tables() {
+        let mut manager = bdd_manager_for_width(1);
+        let variable = manager.new_variable(VariableDescription::RegisterBit {
+            register: ArchitecturalRegister {
+                identifier: 0,
+                identifier_width: 1,
+                width: 1,
+            },
+            bit: 0,
+        });
+        let word = BddWord {
+            bits: vec![variable.clone()],
+        };
+        let table = vec![MemoryRead {
+            read_id: 0,
+            depth: 0,
+            address_expr: constant(0x100, 32),
+            lowered_address: Some(word.clone()),
+            width: 1,
+            value: BddWord {
+                bits: vec![manager.false_fn.clone()],
+            },
+        }];
+
+        assert!(BddManager::function_uses_variable(
+            &variable,
+            &variable,
+            &manager.false_fn
+        ));
+        assert!(!BddManager::function_uses_variable(
+            &manager.true_fn,
+            &variable,
+            &manager.false_fn
+        ));
+        assert!(BddManager::word_uses_variable(
+            &word,
+            &variable,
+            &manager.false_fn
+        ));
+        assert!(BddManager::table_uses_variable(
+            &table,
+            &variable,
+            &manager.false_fn
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Expression widths must match")]
+    fn from_exprs_rejects_mismatched_expression_widths() {
+        BddManager::from_exprs(
+            constant(0, 1),
+            constant(0, 2),
+            &ISA {
+                registers: vec![],
+                instructions: vec![],
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "new_expr width should match existing expression widths")]
+    fn replace_right_expr_rejects_mismatched_widths() {
+        let mut manager = bdd_manager_for_width(8);
+
+        manager.replace_right_expr(constant(0, 16));
+    }
+
+    #[test]
+    fn lower_constant_handles_128_bit_edges() {
+        assert_const_expr_lowering(constant(u128::MAX, 128), u128::MAX, 128);
+        assert_const_expr_lowering(constant(1u128 << 127, 128), 1u128 << 127, 128);
+    }
+
+    #[test]
+    fn mux_word_uses_symbolic_condition() {
+        let condition_expr = read_memory(constant(0x100, 32), 1);
+        let manager = BddManager::from_exprs(condition_expr, constant(0, 1), &bdd_test_isa());
+        let condition = manager.left_memory_read_table[0].value.bits[0].clone();
+        let result = manager
+            .mux_word(
+                &condition,
+                &manager.lower_constant(0b1010, 4),
+                &manager.lower_constant(0b0101, 4),
+            )
+            .unwrap();
+        let condition_variable = manager
+            .variables
+            .iter()
+            .position(|(description, _)| {
+                matches!(
+                    description,
+                    VariableDescription::MemoryReadValueBit {
+                        left: true,
+                        bit: 0,
+                        ..
+                    }
+                )
+            })
+            .expect("expected condition memory variable") as u32;
+
+        assert_eq!(
+            eval_bdd_word(&result, &[(condition_variable, false)]),
+            0b0101
+        );
+        assert_eq!(
+            eval_bdd_word(&result, &[(condition_variable, true)]),
+            0b1010
+        );
+    }
+
+    #[test]
+    fn lower_expression_lowers_fixed_register_operands_to_identifiers() {
+        let manager = bdd_manager_for_width(3);
+        let lowered = manager.lower_expression(&fixed_register(Register(5), 3), LEFT_EXPR);
+
+        assert_eq!(constant_bdd_word_value(&manager, &lowered), 5);
+        assert_eq!(lowered.bits.len(), 3);
+    }
+
+    #[test]
+    fn lower_expression_lowers_read_register_through_fixed_selector() {
+        let registers = (0..4)
+            .map(|identifier| ArchitecturalRegister {
+                identifier,
+                identifier_width: 2,
+                width: 4,
+            })
+            .collect();
+        let read = read_register(fixed_register(Register(2), 2), 4);
+        let manager = BddManager::from_exprs(
+            read.clone(),
+            constant(0, 4),
+            &ISA {
+                registers,
+                instructions: vec![],
+            },
+        );
+        let result = manager.lower_expression(&read, LEFT_EXPR);
+        let register_values = [0b0001u128, 0b0010, 0b0100, 0b1000];
+        let assignment: Vec<_> = manager
+            .variables
+            .iter()
+            .enumerate()
+            .map(|(variable, (description, _))| {
+                let value = match description {
+                    VariableDescription::RegisterBit { register, bit } => {
+                        (register_values[register.identifier as usize] >> bit) & 1 != 0
+                    }
+                    _ => false,
+                };
+                (variable as u32, value)
+            })
+            .collect();
+
+        assert_eq!(eval_bdd_word(&result, &assignment), register_values[2]);
+    }
+
+    #[test]
+    fn lower_expression_uses_the_requested_side_memory_read_table() {
+        let left_read = read_memory(constant(0x100, 32), 8);
+        let right_read = read_memory(constant(0x200, 32), 8);
+        let manager =
+            BddManager::from_exprs(left_read.clone(), right_read.clone(), &bdd_test_isa());
+
+        assert!(
+            manager.lower_expression(&left_read, LEFT_EXPR)
+                == manager.left_memory_read_table[0].value
+        );
+        assert!(
+            manager.lower_expression(&right_read, RIGHT_EXPR)
+                == manager.right_memory_read_table[0].value
+        );
+        assert!(
+            manager.lower_expression(&right_read, RIGHT_EXPR)
+                != manager.left_memory_read_table[0].value
+        );
+    }
+
+    #[test]
+    fn lower_register_read_defaults_missing_register_ids_to_zero() {
+        let registers = [0, 2]
+            .into_iter()
+            .map(|identifier| ArchitecturalRegister {
+                identifier,
+                identifier_width: 2,
+                width: 3,
+            })
+            .collect();
+        let selector_expr = read_memory(constant(0x100, 32), 2);
+        let manager = BddManager::from_exprs(
+            selector_expr,
+            constant(0, 2),
+            &ISA {
+                registers,
+                instructions: vec![],
+            },
+        );
+        let selector = manager.left_memory_read_table[0].value.clone();
+        let result = manager.lower_register_read(selector, 3).unwrap();
+        let register_values = [0b101u128, 0, 0b011, 0];
+
+        for selected_register in 0..4 {
+            let assignment: Vec<_> = manager
+                .variables
+                .iter()
+                .enumerate()
+                .map(|(variable, (description, _))| {
+                    let value = match description {
+                        VariableDescription::RegisterBit { register, bit } => {
+                            (register_values[register.identifier as usize] >> bit) & 1 != 0
+                        }
+                        VariableDescription::MemoryReadValueBit {
+                            left: true, bit, ..
+                        } => (selected_register >> bit) & 1 != 0,
+                        _ => false,
+                    };
+                    (variable as u32, value)
+                })
+                .collect();
+
+            assert_eq!(
+                eval_bdd_word(&result, &assignment),
+                register_values[selected_register],
+                "selected_register={selected_register}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Register identifier too large for its identifier width")]
+    fn lower_register_read_rejects_register_ids_outside_selector_space() {
+        let manager = BddManager::from_exprs(
+            constant(0, 2),
+            constant(0, 2),
+            &ISA {
+                registers: vec![ArchitecturalRegister {
+                    identifier: 4,
+                    identifier_width: 2,
+                    width: 1,
+                }],
+                instructions: vec![],
+            },
+        );
+
+        manager
+            .lower_register_read(manager.lower_constant(0, 2), 1)
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "register selector exceeds u8 identifier width")]
+    fn lower_register_read_rejects_too_wide_selectors() {
+        let manager = bdd_manager_for_width(1);
+
+        manager
+            .lower_register_read(manager.lower_constant(0, 9), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_shift_helpers_handle_zero_width_and_oversized_amount_edges() {
+        let manager = bdd_manager_for_width(4);
+        let value = manager.lower_constant(0b1001, 4);
+        let negative = manager.lower_constant(0b1000, 4);
+        let empty = BddWord { bits: vec![] };
+
+        assert_eq!(
+            constant_bdd_word_value(&manager, &manager.shift_left_const(&value, 0)),
+            0b1001
+        );
+        assert_eq!(
+            constant_bdd_word_value(&manager, &manager.shift_left_const(&value, 5)),
+            0
+        );
+        assert_eq!(
+            constant_bdd_word_value(&manager, &manager.shift_logical_right_const(&value, 5)),
+            0
+        );
+        assert_eq!(
+            constant_bdd_word_value(&manager, &manager.shift_arith_right_const(&negative, 5)),
+            0b1111
+        );
+        assert_eq!(manager.shift_left_const(&empty, 3).bits.len(), 0);
+        assert_eq!(manager.shift_logical_right_const(&empty, 3).bits.len(), 0);
+    }
+
+    #[test]
+    fn rotate_right_const_and_shift_steps_reduce_amounts_modulo_width() {
+        let manager = bdd_manager_for_width(5);
+        let value = manager.lower_constant(0b10011, 5);
+
+        assert_eq!(BddManager::rotate_right_shift_for_bit(65, 64), 16);
+        assert_eq!(BddManager::rotate_right_shift_for_bit(64, 64), 0);
+        assert_eq!(BddManager::rotate_right_shift_for_bit(1, 127), 0);
+        assert_eq!(
+            constant_bdd_word_value(&manager, &manager.rotate_right_const(&value, 7)),
+            0b11100
+        );
+    }
+
+    #[test]
+    fn all_true_handles_empty_all_true_and_mixed_inputs() {
+        let manager = bdd_manager_for_width(1);
+
+        assert!(manager.all_true(&[]).unwrap() == manager.true_fn);
+        assert!(
+            manager
+                .all_true(&[manager.true_fn.clone(), manager.true_fn.clone()])
+                .unwrap()
+                == manager.true_fn
+        );
+        assert!(
+            manager
+                .all_true(&[manager.true_fn.clone(), manager.false_fn.clone()])
+                .unwrap()
+                == manager.false_fn
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn lower_bitwise_binary_rejects_mismatched_widths() {
+        let manager = bdd_manager_for_width(2);
+
+        manager
+            .lower_constant(0, 1)
+            .lower_bitwise_binary(manager.lower_constant(0, 2), |lhs, rhs| lhs.and(rhs))
+            .unwrap();
+    }
+
+    #[test]
+    fn lower_concat_handles_empty_inputs() {
+        let manager = bdd_manager_for_width(1);
+        let result = manager.lower_concat(Vec::new()).unwrap();
+
+        assert!(result.bits.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "width must be less than to_width")]
+    fn lower_zero_extend_rejects_shrinking() {
+        let manager = bdd_manager_for_width(2);
+
+        manager
+            .lower_zero_extend(manager.lower_constant(0, 2), 1)
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "width must be less than to_width")]
+    fn lower_sign_extend_rejects_shrinking() {
+        let manager = bdd_manager_for_width(2);
+
+        manager
+            .lower_sign_extend(manager.lower_constant(0, 2), 1)
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn lower_sign_extend_rejects_empty_words() {
+        let manager = bdd_manager_for_width(1);
+
+        manager
+            .lower_sign_extend(BddWord { bits: vec![] }, 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn high_amount_bits_saturate_non_rotate_shifts() {
+        let width = 128;
+        let manager = bdd_manager_for_width(width);
+        let huge_amount = constant(1u128 << 127, width);
+
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            shift_left(constant(1, width), huge_amount.clone()),
+            0,
+            width,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            logical_shift_right(constant(1u128 << 127, width), huge_amount.clone()),
+            0,
+            width,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            arithmetic_shift_right(constant(1u128 << 127, width), huge_amount),
+            u128::MAX,
+            width,
+        );
+    }
+
+    #[test]
+    fn lower_comparisons_handle_128_bit_signed_and_unsigned_edges() {
+        let manager = bdd_manager_for_width(1);
+
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            equal(constant(u128::MAX, 128), constant(u128::MAX, 128)),
+            1,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            equal(constant(u128::MAX, 128), constant(0, 128)),
+            0,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            unsigned_less_than(constant(0, 128), constant(u128::MAX, 128)),
+            1,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            signed_less_than(constant(u128::MAX, 128), constant(0, 128)),
+            1,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            signed_less_than(constant(1u128 << 127, 128), constant(u128::MAX, 128)),
+            1,
+            1,
+        );
+    }
+
+    #[test]
+    fn lower_extract_handles_128_bit_boundaries() {
+        assert_const_expr_lowering(extract(constant(1u128 << 127, 128), 127, 127), 1, 1);
+        assert_const_expr_lowering(
+            extract(constant(1u128 << 127, 128), 127, 120),
+            0b1000_0000,
+            8,
+        );
+        assert_const_expr_lowering(
+            extract(constant(0xfeed_beef_dead_cafe, 128), 15, 0),
+            0xcafe,
+            16,
+        );
+    }
+
+    #[test]
+    fn lower_count_ones_handles_128_bit_edges() {
+        assert_const_expr_lowering(count_ones(constant(u128::MAX, 128)), 128, 128);
+        assert_const_expr_lowering(count_ones(constant(1u128 << 127, 128)), 1, 128);
+    }
+
+    #[test]
+    fn lower_add_flags_handle_more_128_bit_boundaries() {
+        let manager = bdd_manager_for_width(1);
+
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            add_carry_out(constant(0, 128), constant(0, 128), bool_const(false), 128),
+            0,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            add_carry_out(
+                constant(u128::MAX, 128),
+                constant(u128::MAX, 128),
+                bool_const(true),
+                128,
+            ),
+            1,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            add_overflow(
+                constant((1u128 << 127) - 1, 128),
+                constant(1, 128),
+                bool_const(false),
+                128,
+            ),
+            1,
+            1,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn lower_add_carry_out_rejects_multi_bit_carry_inputs() {
+        let manager = bdd_manager_for_width(2);
+
+        manager
+            .lower_add_cout(
+                manager.lower_constant(0, 2),
+                manager.lower_constant(0, 2),
+                manager.lower_constant(0, 2),
+                2,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn lower_add_overflow_rejects_multi_bit_carry_inputs() {
+        let manager = bdd_manager_for_width(2);
+
+        manager
+            .lower_add_overflow(
+                manager.lower_constant(0, 2),
+                manager.lower_constant(0, 2),
+                manager.lower_constant(0, 2),
+                2,
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn lower_constant_uses_little_endian_bits_and_truncates_to_width() {
-        let manager = bdd_manager_for_width(8);
-
-        let word = manager.lower_constant(0b1_1010_0101, 8);
-
-        assert_eq!(constant_bdd_word_value(&manager, &word), 0b1010_0101);
-        assert_eq!(word.bits.len(), 8);
+        assert_const_expr_lowering(constant(0b1_1010_0101, 8), 0b1010_0101, 8);
     }
 
     #[test]
@@ -1436,17 +2337,11 @@ mod tests {
 
             for lhs in 0..limit {
                 for rhs in 0..limit {
-                    let result = manager
-                        .lower_add(
-                            manager.lower_constant(lhs, width),
-                            manager.lower_constant(rhs, width),
-                        )
-                        .unwrap();
-
-                    assert_eq!(
-                        constant_bdd_word_value(&manager, &result),
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        add(constant(lhs, width), constant(rhs, width)),
                         (lhs + rhs) & (limit - 1),
-                        "width={width}, lhs={lhs}, rhs={rhs}"
+                        width,
                     );
                 }
             }
@@ -1454,20 +2349,18 @@ mod tests {
     }
 
     #[test]
-    fn shift_left_const_matches_wrapping_bitvector_shift() {
+    fn lower_shift_left_matches_const_oracle_exhaustively() {
         let width = 6;
         let manager = bdd_manager_for_width(width);
         let mask = (1u128 << width) - 1;
 
         for value in 0..=mask {
-            for amount in 0..=(width as usize + 1) {
-                let shifted =
-                    manager.shift_left_const(&manager.lower_constant(value, width), amount);
-
-                assert_eq!(
-                    constant_bdd_word_value(&manager, &shifted),
-                    (value << amount) & mask,
-                    "value={value}, amount={amount}"
+            for amount in 0..=mask {
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    shift_left(constant(value, width), constant(amount, width)),
+                    (value << amount as u32) & mask,
+                    width,
                 );
             }
         }
@@ -1495,17 +2388,11 @@ mod tests {
 
             for lhs in 0..limit {
                 for rhs in 0..limit {
-                    let result = manager
-                        .lower_mul(
-                            manager.lower_constant(lhs, width),
-                            manager.lower_constant(rhs, width),
-                        )
-                        .unwrap();
-
-                    assert_eq!(
-                        constant_bdd_word_value(&manager, &result),
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        mul(constant(lhs, width), constant(rhs, width)),
                         (lhs * rhs) & (limit - 1),
-                        "width={width}, lhs={lhs}, rhs={rhs}"
+                        width,
                     );
                 }
             }
@@ -1524,20 +2411,12 @@ mod tests {
         ];
 
         for (lhs, rhs) in cases {
-            let result = manager
-                .lower_mul(
-                    manager.lower_constant(lhs as u128, 64),
-                    manager.lower_constant(rhs as u128, 64),
-                )
-                .unwrap();
-            let result_value = constant_bdd_word_value(&manager, &result);
-
-            assert_eq!(
-                result_value,
+            assert_const_expr_lowering_with_manager(
+                &manager,
+                mul(constant(lhs as u128, 64), constant(rhs as u128, 64)),
                 lhs.wrapping_mul(rhs) as u128,
-                "lhs={lhs:#018x}, rhs={rhs:#018x}"
+                64,
             );
-            println!("opa={lhs:#018x}, opb={rhs:#018x}, result={result_value:#018x}");
         }
     }
 
@@ -1548,24 +2427,378 @@ mod tests {
         let mask = (1u128 << width) - 1;
 
         for lhs in 0..=mask {
-            let not_result = manager
-                .lower_not(manager.lower_constant(lhs, width))
-                .unwrap();
-            assert_eq!(
-                constant_bdd_word_value(&manager, &not_result),
-                (!lhs) & mask
+            assert_const_expr_lowering_with_manager(
+                &manager,
+                not_expr(constant(lhs, width)),
+                (!lhs) & mask,
+                width,
             );
 
             for rhs in 0..=mask {
-                let and_result = manager
-                    .lower_and(
-                        manager.lower_constant(lhs, width),
-                        manager.lower_constant(rhs, width),
-                    )
-                    .unwrap();
-                assert_eq!(constant_bdd_word_value(&manager, &and_result), lhs & rhs);
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    and_expr(constant(lhs, width), constant(rhs, width)),
+                    lhs & rhs,
+                    width,
+                );
             }
         }
+    }
+
+    #[test]
+    fn bdd_word_bitor_matches_bitwise_or_exhaustively() {
+        let width = 5;
+        let manager = bdd_manager_for_width(width);
+        let mask = bit_mask(width);
+
+        for lhs in 0..=mask {
+            for rhs in 0..=mask {
+                let result = (manager.lower_constant(lhs, width)
+                    | manager.lower_constant(rhs, width))
+                .unwrap();
+
+                assert_eq!(constant_bdd_word_value(&manager, &result), lhs | rhs);
+            }
+        }
+    }
+
+    #[test]
+    fn lower_logical_shift_right_matches_const_oracle_exhaustively() {
+        let width = 6;
+        let manager = bdd_manager_for_width(width);
+        let mask = bit_mask(width);
+
+        for value in 0..=mask {
+            for amount in 0..=mask {
+                let expected = if amount >= width as u128 {
+                    0
+                } else {
+                    value >> amount as u32
+                };
+
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    logical_shift_right(constant(value, width), constant(amount, width)),
+                    expected,
+                    width,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_arithmetic_shift_right_matches_const_oracle_exhaustively() {
+        let width = 6;
+        let manager = bdd_manager_for_width(width);
+        let mask = bit_mask(width);
+        let sign = 1u128 << (width - 1);
+
+        for value in 0..=mask {
+            for amount in 0..=mask {
+                let expected = if amount >= width as u128 {
+                    if value & sign == 0 { 0 } else { mask }
+                } else {
+                    (signed_value(value, width) >> amount as u32) as u128
+                };
+
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    arithmetic_shift_right(constant(value, width), constant(amount, width)),
+                    expected,
+                    width,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_rotate_right_matches_const_oracle_exhaustively() {
+        let width = 5;
+        let manager = bdd_manager_for_width(width);
+        let mask = bit_mask(width);
+
+        for value in 0..=mask {
+            for amount in 0..=mask {
+                let shift = (amount % width as u128) as u32;
+                let expected = if shift == 0 {
+                    value
+                } else {
+                    (value >> shift) | ((value << (width as u32 - shift)) & mask)
+                };
+
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    rotate_right(constant(value, width), constant(amount, width)),
+                    expected,
+                    width,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_rotate_right_handles_wide_non_power_of_two_amount_bits() {
+        let manager = bdd_manager_for_width(65);
+        let width = 65;
+        let value = 0x1_2345_6789_abcd_ef01u128;
+        let amount = 1u128 << 64;
+        let shift = (amount % width as u128) as u32;
+        let expected = (value >> shift) | ((value << (width as u32 - shift)) & bit_mask(width));
+
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            rotate_right(constant(value, width), constant(amount, width)),
+            expected,
+            width,
+        );
+    }
+
+    #[test]
+    fn lower_equal_matches_const_oracle_exhaustively() {
+        for width in 1..=6 {
+            let manager = bdd_manager_for_width(1);
+            let limit = 1u128 << width;
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        equal(constant(lhs, width), constant(rhs, width)),
+                        (lhs == rhs) as u128,
+                        1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_unsigned_less_than_matches_const_oracle_exhaustively() {
+        for width in 1..=6 {
+            let manager = bdd_manager_for_width(1);
+            let limit = 1u128 << width;
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        unsigned_less_than(constant(lhs, width), constant(rhs, width)),
+                        (lhs < rhs) as u128,
+                        1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_signed_less_than_matches_const_oracle_exhaustively() {
+        for width in 1..=6 {
+            let manager = bdd_manager_for_width(1);
+            let limit = 1u128 << width;
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        signed_less_than(constant(lhs, width), constant(rhs, width)),
+                        (signed_value(lhs, width) < signed_value(rhs, width)) as u128,
+                        1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_extract_matches_const_oracle_for_all_ranges() {
+        let width = 8;
+        let manager = bdd_manager_for_width(width);
+        let values = [0, 1, 0b1000_0000, 0b1011_0101, 0xff];
+
+        for value in values {
+            for low in 0..width {
+                for high in low..width {
+                    let out_width = high - low + 1;
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        extract(constant(value, width), high, low),
+                        (value >> low) & bit_mask(out_width),
+                        out_width,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_concat_matches_const_oracle_for_mixed_width_chunks() {
+        let manager = bdd_manager_for_width(1);
+        let cases = [
+            vec![(0b1010, 4), (0b0101, 4)],
+            vec![(0b1, 1), (0b10, 2), (0b011, 3)],
+            vec![(0xab, 8), (0xc, 4), (0x123, 12)],
+        ];
+
+        for chunks in cases {
+            let mut expected = 0;
+            let mut total_width = 0;
+            let exprs = chunks.iter().map(|&(value, width)| {
+                expected = (expected << width as u32) | (value & bit_mask(width));
+                total_width += width;
+                constant(value, width)
+            });
+
+            assert_const_expr_lowering_with_manager(&manager, concat(exprs), expected, total_width);
+        }
+    }
+
+    #[test]
+    fn lower_zero_extend_matches_const_oracle_for_equal_and_wider_widths() {
+        let manager = bdd_manager_for_width(1);
+        for from_width in 1..=6 {
+            let input_mask = bit_mask(from_width);
+            for value in 0..=input_mask {
+                for to_width in from_width..=8 {
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        zero_extend(constant(value, from_width), to_width),
+                        value,
+                        to_width,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_sign_extend_matches_const_oracle_for_equal_and_wider_widths() {
+        let manager = bdd_manager_for_width(1);
+        for from_width in 1..=6 {
+            let input_mask = bit_mask(from_width);
+            let sign = 1u128 << (from_width - 1);
+
+            for value in 0..=input_mask {
+                for to_width in from_width..=8 {
+                    let expected = if value & sign == 0 {
+                        value
+                    } else {
+                        value | (bit_mask(to_width) ^ bit_mask(from_width))
+                    };
+
+                    assert_const_expr_lowering_with_manager(
+                        &manager,
+                        sign_extend(constant(value, from_width), to_width),
+                        expected,
+                        to_width,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_count_ones_matches_const_oracle_exhaustively() {
+        for width in 1..=8 {
+            let manager = bdd_manager_for_width(width);
+            let limit = 1u128 << width;
+
+            for value in 0..limit {
+                assert_const_expr_lowering_with_manager(
+                    &manager,
+                    count_ones(constant(value, width)),
+                    value.count_ones() as u128,
+                    width,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_add_carry_out_matches_const_oracle_exhaustively() {
+        let manager = bdd_manager_for_width(1);
+        for width in 1..=6 {
+            let limit = 1u128 << width;
+            let mask = bit_mask(width);
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    for carry_in in 0..=1 {
+                        assert_const_expr_lowering_with_manager(
+                            &manager,
+                            add_carry_out(
+                                constant(lhs, width),
+                                constant(rhs, width),
+                                constant(carry_in, 1),
+                                width,
+                            ),
+                            (lhs + rhs + carry_in > mask) as u128,
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_add_overflow_matches_const_oracle_exhaustively() {
+        let manager = bdd_manager_for_width(1);
+        for width in 1..=6 {
+            let limit = 1u128 << width;
+            let sign = 1u128 << (width - 1);
+            let mask = bit_mask(width);
+
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    for carry_in in 0..=1 {
+                        let result = (lhs + rhs + carry_in) & mask;
+                        let expected =
+                            ((lhs ^ rhs) & sign == 0 && (lhs ^ result) & sign != 0) as u128;
+
+                        assert_const_expr_lowering_with_manager(
+                            &manager,
+                            add_overflow(
+                                constant(lhs, width),
+                                constant(rhs, width),
+                                constant(carry_in, 1),
+                                width,
+                            ),
+                            expected,
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_add_flags_match_const_oracle_for_wide_edges() {
+        let manager = bdd_manager_for_width(1);
+
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            add_carry_out(
+                constant(u128::MAX, 128),
+                constant(0, 128),
+                bool_const(true),
+                128,
+            ),
+            1,
+            1,
+        );
+        assert_const_expr_lowering_with_manager(
+            &manager,
+            add_overflow(
+                constant(1u128 << 127, 128),
+                constant(u128::MAX, 128),
+                bool_const(false),
+                128,
+            ),
+            1,
+            1,
+        );
     }
 
     #[test]
@@ -1896,6 +3129,16 @@ mod tests {
     }
 
     #[test]
+    fn lower_memory_reads_leaves_single_byte_reads_unchanged() {
+        let address = constant(0x100, 32);
+
+        assert_eq!(
+            lower_memory_reads(read_memory(address.clone(), 8)),
+            read_memory(address, 8)
+        );
+    }
+
+    #[test]
     fn lower_memory_reads_recurses_through_other_expressions() {
         let address = constant(0x100, 32);
 
@@ -1908,6 +3151,17 @@ mod tests {
                 ]),
                 constant(1, 16),
             )
+        );
+    }
+
+    #[test]
+    fn byte_address_preserves_base_for_zero_and_adds_byte_offsets() {
+        let address = constant(0x100, 32);
+
+        assert_eq!(byte_address(&address, 0, 32), address);
+        assert_eq!(
+            byte_address(&constant(0x100, 32), 7, 32),
+            add(constant(0x100, 32), constant(7, 32))
         );
     }
 
@@ -1925,6 +3179,15 @@ mod tests {
         let second = Effect::write_register(reg(1), constant(2, 32));
 
         assert_eq!(combine_effects(&first, &second), None);
+    }
+
+    #[test]
+    fn combine_effects_returns_none_for_different_effect_kinds() {
+        let register_write = Effect::write_register(reg(0), constant(1, 32));
+        let memory_write = Effect::write_memory(constant(0x100, 32), constant(2, 32), 32);
+
+        assert_eq!(combine_effects(&register_write, &memory_write), None);
+        assert_eq!(combine_effects(&memory_write, &register_write), None);
     }
 
     #[test]
@@ -1952,5 +3215,27 @@ mod tests {
         let second = Effect::write_register_if(bool_const(false), reg(0), constant(2, 32));
 
         assert_eq!(combine_effects(&first, &second), Some(first));
+    }
+
+    #[test]
+    fn combine_effects_handles_memory_write_edges() {
+        let address = constant(0x100, 32);
+        let guard = read_register(reg(10), 1);
+        let first = Effect::write_memory_if(guard.clone(), address.clone(), constant(1, 32), 32);
+        let same_guard_second =
+            Effect::write_memory_if(guard.clone(), address.clone(), constant(2, 32), 32);
+        let true_second = Effect::write_memory(address.clone(), constant(3, 32), 32);
+        let false_second =
+            Effect::write_memory_if(bool_const(false), address.clone(), constant(4, 32), 32);
+        let different_address =
+            Effect::write_memory_if(guard.clone(), constant(0x200, 32), constant(5, 32), 32);
+
+        assert_eq!(
+            combine_effects(&first, &same_guard_second),
+            Some(same_guard_second)
+        );
+        assert_eq!(combine_effects(&first, &true_second), Some(true_second));
+        assert_eq!(combine_effects(&first, &false_second), Some(first.clone()));
+        assert_eq!(combine_effects(&first, &different_address), None);
     }
 }
