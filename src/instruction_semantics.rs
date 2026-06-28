@@ -1320,47 +1320,56 @@ impl Expr {
             .canonicalize()
     }
 
-    /// Replaces register/memory reads with matching prior guarded writes.
+    /// Replaces register/memory reads with guarded forwarding from prior writes.
     ///
-    /// The first matching effect produces `select(guard, written_value,
-    /// original_read)`. Newly inserted values are not recursively substituted.
-    /// All other AST children are traversed recursively. Run this once per
-    /// instruction-composition step; applying it repeatedly to the same prior
-    /// effects can repeatedly wrap the fallback read.
+    /// Each read becomes a latest-write-wins select chain. A previous write is
+    /// visible only when its guard is true and its destination identifier equals
+    /// the read identifier. Newly inserted values are not recursively
+    /// substituted. Run this once per instruction-composition step; applying it
+    /// repeatedly to the same prior effects can repeatedly wrap the fallback
+    /// read.
     pub fn substitute(self, previous_effects: &[Effect]) -> Self {
         match self {
-            Expr::ReadRegister { ref register, .. } => {
+            Expr::ReadRegister { register, width } => {
+                let register = register.substitute(previous_effects);
+                let mut forwarded = read_register(register.clone(), width);
                 for effect in previous_effects {
                     if let Effect::WriteRegister {
                         guard,
-                        register: reg_addr,
+                        register: write_register,
                         value,
                     } = effect
-                        && **register == *reg_addr
+                        && value.expr_width() == Some(width)
                     {
-                        return select(guard.clone(), value.clone(), self);
+                        forwarded = select(
+                            and_expr(guard.clone(), equal(register.clone(), write_register.clone())),
+                            value.clone(),
+                            forwarded,
+                        );
                     }
                 }
-                self
+                forwarded
             }
-            Expr::ReadMemory {
-                ref address,
-                ref width,
-            } => {
+            Expr::ReadMemory { address, width } => {
+                let address = address.substitute(previous_effects);
+                let mut forwarded = read_memory(address.clone(), width);
                 for effect in previous_effects {
                     if let Effect::WriteMemory {
                         guard,
-                        address: address_mem,
+                        address: write_address,
                         value,
-                        width: width_mem,
+                        width: write_width,
                     } = effect
-                        && **address == *address_mem
-                        && width == width_mem
+                        && width == *write_width
                     {
-                        return select(guard.clone(), value.clone(), self);
+                        forwarded = select(
+                            and_expr(guard.clone(), equal(address.clone(), write_address.clone())),
+                            value.clone(),
+                            forwarded,
+                        );
                     }
                 }
-                self
+                forwarded
             }
             expr => expr.map_children(|child| child.substitute(previous_effects)),
         }
@@ -2705,6 +2714,84 @@ mod tests {
             expression.substitute(&[]),
             Expr::SignedLessThan(_, _)
         ));
+    }
+
+    #[test]
+    fn substitute_builds_register_forwarding_chain_in_latest_write_order() {
+        let selector = read_fixed_register(Register(9), 4, 4);
+        let guard_1 = read_fixed_register(Register(10), 4, 1);
+        let guard_2 = read_fixed_register(Register(11), 4, 1);
+        let guard_3 = read_fixed_register(Register(12), 4, 1);
+        let reg_1 = fixed_register(Register(1), 4);
+        let reg_2 = fixed_register(Register(2), 4);
+        let reg_3 = fixed_register(Register(3), 4);
+        let original_read = read_register(selector.clone(), 8);
+        let previous_effects = vec![
+            Effect::write_register_if(guard_1.clone(), reg_1.clone(), constant(0x11, 8)),
+            Effect::write_register_if(guard_2.clone(), reg_2.clone(), constant(0x22, 8)),
+            Effect::write_register_if(guard_3.clone(), reg_3.clone(), constant(0x33, 8)),
+        ];
+
+        assert_eq!(
+            original_read.clone().substitute(&previous_effects),
+            select(
+                and_expr(guard_3, equal(selector.clone(), reg_3)),
+                constant(0x33, 8),
+                select(
+                    and_expr(guard_2, equal(selector.clone(), reg_2)),
+                    constant(0x22, 8),
+                    select(
+                        and_expr(guard_1, equal(selector, reg_1)),
+                        constant(0x11, 8),
+                        original_read,
+                    ),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn substitute_builds_memory_forwarding_chain_and_ignores_wrong_kind_or_width() {
+        let address = read_fixed_register(Register(9), 4, 32);
+        let guard_1 = read_fixed_register(Register(10), 4, 1);
+        let guard_2 = read_fixed_register(Register(11), 4, 1);
+        let address_1 = constant(0x100, 32);
+        let address_2 = constant(0x200, 32);
+        let original_read = read_memory(address.clone(), 8);
+        let previous_effects = vec![
+            Effect::write_register(address_1.clone(), constant(0xff, 8)),
+            Effect::write_memory(address_1.clone(), constant(0xabcd, 16), 16),
+            Effect::write_memory_if(guard_1.clone(), address_1.clone(), constant(0x11, 8), 8),
+            Effect::write_memory_if(guard_2.clone(), address_2.clone(), constant(0x22, 8), 8),
+        ];
+
+        assert_eq!(
+            original_read.clone().substitute(&previous_effects),
+            select(
+                and_expr(guard_2, equal(address.clone(), address_2)),
+                constant(0x22, 8),
+                select(
+                    and_expr(guard_1, equal(address, address_1)),
+                    constant(0x11, 8),
+                    original_read,
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn substitute_forwards_through_identifiers_before_matching_memory_writes() {
+        let previous_effects = vec![
+            Effect::write_register(fixed_register(Register(0), 8), constant(0x200, 32)),
+            Effect::write_memory(constant(0x200, 32), constant(0xaa, 8), 8),
+        ];
+
+        assert_eq!(
+            read_memory(read_fixed_register(Register(0), 8, 32), 8)
+                .substitute(&previous_effects)
+                .canonicalize(),
+            constant(0xaa, 8)
+        );
     }
 
     #[test]

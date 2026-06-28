@@ -11,6 +11,30 @@ use super::bit::{Bit, BitPattern};
 pub struct ISA {
     pub registers: Vec<ArchitecturalRegister>,
     pub instructions: Vec<Instruction>,
+    /// Register used as stack pointer
+    pub sp: StackPointer,
+    /// Register used as program counter (even if the ISA
+    /// does not literally use a GPR as the PC, it should be
+    /// defined as an ArchitecturalRegister)
+    pub pc: ArchitecturalRegister,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackPointer {
+    /// Which register is used as the stack pointer
+    pub register: ArchitecturalRegister,
+    /// How many bytes the symbolic solver can assume will be free above/below the current stack pointer
+    /// Set to a conservative value to avoid accidental overwrites of real data.
+    /// Either way, writing to the stack will be avoided, so it is unlikely a large value is needed.
+    pub stack_size: u32,
+    /// Direction the stack grows
+    pub direction: StackDirection
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackDirection {
+    Upwards,
+    Downwards
 }
 
 /// Definition of a register in the architecture.
@@ -55,6 +79,8 @@ pub struct Instruction {
     pub forms: Vec<InstructionForm>,
     pub constraints: Vec<Predicate>,
 
+    /// Each instruction has a set of effects which occur. An instruction should never
+    /// have two effects which could possibly write to the same location.
     pub effects: Vec<Effect>,
 }
 

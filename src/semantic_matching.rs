@@ -32,10 +32,8 @@ use oxidd::{
 
 use crate::{
     instruction_semantics::{
-        Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr,
-        read_memory, select,
-    },
-    isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
+        Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr, read_memory, read_register, select,
+    }, isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
 };
 
 pub type InstructionIdx = u32;
@@ -73,7 +71,6 @@ pub struct MemoryRead {
     value: BddWord,
 }
 
-type VariableId = u32;
 type ReadId = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +87,113 @@ enum VariableDescription {
     },
 }
 
+/// Checks the equivalence between two instruction sequences
+pub struct EquivalenceManager {
+    left_effects: Vec<Effect>,
+    right_effects: Vec<Effect>,
+
+    /// BddManager for each `Effect` of `left` (parallel array)
+    effect_managers: Vec<BddManager>,
+
+    /// BddManager for the address or register of each `Effect` of `left`
+    identifier_managers: Vec<BddManager>,
+
+    /// List of locations which cannot be used for scratch work (ie cannot be incidental side effect)
+    /// because of read after write dependency
+    protected_state: Vec<StateDestination>
+}
+
+
+/*
+
+
+
+
+currently, the way im matching two sets of instructions is by comparing them effect by effect
+
+which has a few issues
+1. need to compare the identifier of the effects. if that's not possible, that's an issue
+2. when creating each Effect value in instruction_seq_to_effects, when substituting values in (eg if a later effect says Read(R0), but R0 now has the value that R1 had earlier)
+   it's important to prevent there EVER being a case where that relation is missed because the Effect identifier expr somehow looks different from the identifier in the value expr.
+        - and the issue is im pretty sure there may be multiple ways to set register identifiers? not sure, would need to check
+
+i really dont know what to do about the issue of sometimes equivalent writes
+
+because i might have eg
+MEM[r0] = 1
+r1 = mem[r1]
+
+but if r1 == r0, then that messed up the value in r1
+
+i guess maybe the solutuion is actually to never allow memory writes other than to absolute addresses? because there is the case, even without the second line
+where r5 == r0, and MEM[r5] is protected
+
+and then perhaps what i can do is have a separate exemption for the stack pointer? where the programmer defines "this register is the stack pointer, the stack grows
+downwards, and there is a guarantee that there are at least N free bytes on the stack" and it is simply assumed that the memory used by the stack is never read
+before being written to at any other point in the program. and then any other arbitrary memory writes are not allowed
+
+because without the potential of writes to random registers (ie it is guaranteed that the only memory addresses written to are in the simple form R12 - n)
+then it's much easier to distinguish where an Expr::MemoryRead corresponds with an effect. because the canonical form should match
+    - most importantly for EquivalenceManager, that means the Expr for WriteMemory should EXACTLY match between the two
+            - tbh i think the easiest thing is enforcing that
+
+
+then the next thing to handle is register identifiers. so far ive been offering the freedom for very arbitrary register identifiers (eg R[extract(R0 * R1, 3, 0))])
+which complicates things somewhat.
+        - it seems not many ISAs do this other than obselete ones which memory mapped their registers (which is already something that can't be supported, unless you remove
+          all register reads/write from your isa specification and implement it as memory writes) so perhaps it's a difficulty which I don't need to bother with?
+        - just assuming that all register write effects will collapse to a fixed register makes things a lot easier imo
+
+either way regardless of what i do i need to do much more thinking about where the current method of "compare exprs, see if equal, if equal, substitute value" doesnt work
+and more thinking about other things
+
+i think in an ideal world, i would just be able to compare effect.identifier == effect.identifier and any reads in effect1.value == effect2.identifier
+        - i really dont like this though because it feels like im just trusting that this will work
+
+*/
+impl EquivalenceManager {
+    pub fn from_instructions(left: &Vec<DecodedInstruction>, right: &Vec<DecodedInstruction>, protected_state: Vec<StateDestination>, isa: &ISA) -> Self {
+        let left_effects = instruction_seq_to_effects(left, isa);
+        let right_effects = instruction_seq_to_effects(right, isa);
+
+        let mut effect_managers = vec![];
+        let mut identifier_managers = vec![];
+        for effect in left_effects.clone() {
+            // We can't yet add right effects, because adding a right effect is contingent on the identifier being checked
+            match effect {
+                Effect::WriteMemory { guard, address, value, width } => {
+                    assert_eq!(width, 8, "Memory reads should be 1 byte!");
+                    identifier_managers.push(BddManager::from_left_expr(address.clone(), isa));
+
+                    // We want to also remove the guard from the effect
+                    // This can be achieved by changing value to
+                    // select(guard, value, read_memory(address))
+
+                    let value = select(guard, value, read_memory(address, width)).canonicalize();
+                    effect_managers.push(BddManager::from_left_expr(value, isa));
+                }
+
+                Effect::WriteRegister { guard, register, value } => {
+                    identifier_managers.push(BddManager::from_left_expr(register.clone(), isa));
+
+                    // We want to also remove the guard from the effect
+                    // This can be achieved by changing value to
+                    // select(guard, value, read_register(register))
+
+                    let width = value.expr_width().expect("Effect value must have width!");
+
+                    let value = select(guard, value, read_register(register, width)).canonicalize();
+                    effect_managers.push(BddManager::from_left_expr(value, isa));
+                }
+            }
+        }
+        EquivalenceManager { left_effects, right_effects, effect_managers, identifier_managers, protected_state }
+    }
+
+    // /// Finds which effects correspond with each other by comparing 
+    // fn pair_effects
+}
+
 //NOTE: should probably put this in some other file
 // this file should be exclusively for expr matching imo
 // should probably also move the instruction to expr function
@@ -103,6 +207,9 @@ enum VariableDescription {
 //     }
 // }
 
+// wait how on earth am i meant to handle the state uses? i completely forgot that branching was possible
+// do i need to follow every branch?
+
 // Cloning is not allowed to enforce exclusive ownership of the manager
 // Similarly, manager_ref should never be accessed from outside the struct and
 // all BCDDFunctions must be stored in BddManager.
@@ -113,8 +220,8 @@ pub struct BddManager {
     left_memory_read_table: Vec<MemoryRead>,
     right_memory_read_table: Vec<MemoryRead>,
     variables: Vec<(VariableDescription, BCDDFunction)>,
-    left: BddWord,
-    right: BddWord,
+    left: Option<BddWord>,
+    right: Option<BddWord>,
     constraint: BCDDFunction,
 
     left_expr: Expr,
@@ -160,6 +267,20 @@ impl BddManager {
             != *false_fn
     }
 
+    fn optional_word_uses_variable(
+        word: &Option<BddWord>,
+        variable: &BCDDFunction,
+        false_fn: &BCDDFunction,
+    ) -> bool {
+        let Some(word) = word else {
+            // If the word isn't Some, it doesn't use the variable!
+            return false;
+        };
+        word.bits
+            .iter()
+            .any(|function| Self::function_uses_variable(function, variable, false_fn))
+    }
+
     fn word_uses_variable(
         word: &BddWord,
         variable: &BCDDFunction,
@@ -176,9 +297,7 @@ impl BddManager {
         false_fn: &BCDDFunction,
     ) -> bool {
         table.iter().any(|read| {
-            read.lowered_address
-                .as_ref()
-                .is_some_and(|address| Self::word_uses_variable(address, variable, false_fn))
+            Self::optional_word_uses_variable(&read.lowered_address, variable, false_fn)
                 || Self::word_uses_variable(&read.value, variable, false_fn)
         })
     }
@@ -196,8 +315,8 @@ impl BddManager {
         let variable = self.variables[variable_index].1.clone();
         let false_fn = &self.false_fn;
 
-        let used = Self::word_uses_variable(&self.left, &variable, false_fn)
-            || Self::word_uses_variable(&self.right, &variable, false_fn)
+        let used = Self::optional_word_uses_variable(&self.left, &variable, false_fn)
+            || Self::optional_word_uses_variable(&self.right, &variable, false_fn)
             || Self::function_uses_variable(&self.constraint, &variable, false_fn)
             || Self::table_uses_variable(&self.left_memory_read_table, &variable, false_fn)
             || Self::table_uses_variable(&self.right_memory_read_table, &variable, false_fn)
@@ -226,21 +345,10 @@ impl BddManager {
         let (true_fn, false_fn) = manager_ref
             .with_manager_shared(|manager| (BCDDFunction::t(manager), BCDDFunction::f(manager)));
 
-        let left_width = left_expr.expr_width();
-        let right_width = right_expr.expr_width();
+        let left_width = left_expr.expr_width().expect("Width of instructions must be defined!");
+        let right_width = right_expr.expr_width().expect("Width of instructions must be defined!");
 
         assert_eq!(left_width, right_width, "Expression widths must match");
-
-        let width = left_width.expect("Width of expressions must be defined!");
-
-        // Initialize left and right words
-        let left = BddWord {
-            bits: Vec::with_capacity(width as usize),
-        };
-        let right = BddWord {
-            bits: Vec::with_capacity(width as usize),
-        };
-
         // Initialize constraint as true_fn
         let constraint = true_fn.clone();
 
@@ -296,8 +404,8 @@ impl BddManager {
             left_memory_read_table,
             right_memory_read_table,
             variables,
-            left,
-            right,
+            left: None,
+            right: None,
             constraint,
             left_expr,
             right_expr,
@@ -312,6 +420,10 @@ impl BddManager {
         // expanded
         inst.assign_memory_read_variables(RIGHT_EXPR);
         inst
+    }
+
+    pub fn from_left_expr(left_expr: Expr, isa: &ISA) -> Self {
+        Self::from_exprs(left_expr.clone(), left_expr, isa)
     }
 
     /// Creates the memory read table and creates variables for one expression
@@ -468,7 +580,7 @@ impl BddManager {
             "new_expr width should match existing expression widths"
         );
 
-        self.right.bits.clear();
+        self.right = None;
         self.right_memory_read_table.clear();
         self.constraint = self.true_fn.clone();
         self.right_expr = new_expr;
@@ -497,8 +609,68 @@ impl BddManager {
         self.assign_memory_read_variables(RIGHT_EXPR);
     }
 
+    /// Lowers memory addresses of the left or right expression
+    fn lower_memory(&mut self, left: bool) {
+        let len = if left {
+            self.left_memory_read_table.len()
+        } else {
+            self.right_memory_read_table.len()
+        };
+
+        for i in 0..len {
+            let address_lowered = {
+                let table = if left {
+                    &mut self.left_memory_read_table
+                } else {
+                    &mut self.right_memory_read_table
+                };
+
+                // Only lower the address if it isn't already lowered
+                if table[i].lowered_address.is_some() {
+                    continue;
+                }
+
+                let address_expr = table[i].address_expr.clone();
+                self.lower_expression(&address_expr, left)
+            };
+
+            
+
+            let table = if left {
+                &mut self.left_memory_read_table
+            } else {
+                &mut self.right_memory_read_table
+            };
+            table[i].lowered_address = Some(address_lowered);
+        }
+    }
+
+    /// Checks if the memory reads of all expressions are lowered
+    fn memory_is_lowered(&self) -> bool {
+        for read in &self.left_memory_read_table {
+            if let None = read.lowered_address {
+                return false;
+            }
+        }
+
+        for read in &self.right_memory_read_table {
+            if let None = read.lowered_address {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Compares the equality of the left and right expressions using a BDD
+    fn compare(&mut self) -> bool {
+        self.lower_memory(LEFT_EXPR);
+        self.lower_memory(RIGHT_EXPR);
+
+        true
+    }
+
     /// Lowers an expression
-    pub fn lower_expression(&self, expr: &Expr, left: bool) -> BddWord {
+    fn lower_expression(&self, expr: &Expr, left: bool) -> BddWord {
         self.try_lower_expression(expr, left)
             .expect("BCDD node allocation failed")
     }
@@ -1541,7 +1713,7 @@ mod tests {
             read_register, rotate_right, shift_left, sign_extend, signed_less_than,
             unsigned_less_than, zero_extend,
         },
-        isa_specification::InstructionForm,
+        isa_specification::{InstructionForm, StackDirection, StackPointer},
     };
 
     fn decoded(name: &str) -> DecodedInstruction {
@@ -1581,15 +1753,34 @@ mod tests {
             .expect("expected register write")
     }
 
-    fn bdd_test_isa() -> ISA {
-        ISA {
-            registers: vec![ArchitecturalRegister {
-                identifier: 0,
-                identifier_width: 1,
-                width: 1,
-            }],
-            instructions: vec![],
+    fn forwarding_condition(guard: Expr, read_identifier: Expr, write_identifier: Expr) -> Expr {
+        and_expr(guard, equal(read_identifier, write_identifier))
+    }
+
+    fn test_arch_register(identifier: u8, identifier_width: u8, width: u8) -> ArchitecturalRegister {
+        ArchitecturalRegister {
+            identifier,
+            identifier_width,
+            width,
         }
+    }
+
+    fn test_isa(registers: Vec<ArchitecturalRegister>, instructions: Vec<Instruction>) -> ISA {
+        let sp = test_arch_register(254, 8, 32);
+        ISA {
+            registers,
+            instructions,
+            sp: StackPointer {
+                register: sp,
+                stack_size: 16,
+                direction: StackDirection::Downwards,
+            },
+            pc: test_arch_register(253, 8, 32),
+        }
+    }
+
+    fn bdd_test_isa() -> ISA {
+        test_isa(vec![test_arch_register(0, 1, 1)], vec![])
     }
 
     fn manager_variable_count(manager: &BddManager) -> u32 {
@@ -1602,10 +1793,7 @@ mod tests {
         BddManager::from_exprs(
             constant(0, width),
             constant(0, width),
-            &ISA {
-                registers: vec![],
-                instructions: vec![],
-            },
+            &test_isa(vec![], vec![]),
         )
     }
 
@@ -1811,10 +1999,7 @@ mod tests {
         BddManager::from_exprs(
             constant(0, 1),
             constant(0, 2),
-            &ISA {
-                registers: vec![],
-                instructions: vec![],
-            },
+            &test_isa(vec![], vec![]),
         );
     }
 
@@ -1891,10 +2076,7 @@ mod tests {
         let manager = BddManager::from_exprs(
             read.clone(),
             constant(0, 4),
-            &ISA {
-                registers,
-                instructions: vec![],
-            },
+            &test_isa(registers, vec![]),
         );
         let result = manager.lower_expression(&read, LEFT_EXPR);
         let register_values = [0b0001u128, 0b0010, 0b0100, 0b1000];
@@ -1951,10 +2133,7 @@ mod tests {
         let manager = BddManager::from_exprs(
             selector_expr,
             constant(0, 2),
-            &ISA {
-                registers,
-                instructions: vec![],
-            },
+            &test_isa(registers, vec![]),
         );
         let selector = manager.left_memory_read_table[0].value.clone();
         let result = manager.lower_register_read(selector, 3).unwrap();
@@ -1993,14 +2172,14 @@ mod tests {
         let manager = BddManager::from_exprs(
             constant(0, 2),
             constant(0, 2),
-            &ISA {
-                registers: vec![ArchitecturalRegister {
+            &test_isa(
+                vec![ArchitecturalRegister {
                     identifier: 4,
                     identifier_width: 2,
                     width: 1,
                 }],
-                instructions: vec![],
-            },
+                vec![],
+            ),
         );
 
         manager
@@ -2814,10 +2993,7 @@ mod tests {
         let manager = BddManager::from_exprs(
             selector_expr,
             constant(0, 2),
-            &ISA {
-                registers,
-                instructions: vec![],
-            },
+            &test_isa(registers, vec![]),
         );
         let selector = manager.left_memory_read_table[0].value.clone();
         let result = manager.lower_register_read(selector, 3).unwrap();
@@ -2957,7 +3133,9 @@ mod tests {
                     .then(|| function.clone())
             })
             .expect("expected register variable");
-        manager.left.bits.push(register_variable.clone());
+        manager.left = Some(BddWord {
+            bits: vec![register_variable.clone()],
+        });
         manager.constraint = manager
             .variables
             .iter()
@@ -2976,7 +3154,14 @@ mod tests {
             manager.replace_right_expr(read_memory(constant(address, 32), 16));
 
             assert_eq!(manager_variable_count(&manager), initial_variable_count);
-            assert!(manager.left.bits == vec![register_variable.clone()]);
+            assert!(
+                manager
+                    .left
+                    .as_ref()
+                    .expect("expected preserved left word")
+                    .bits
+                    == vec![register_variable.clone()]
+            );
             assert!(manager.constraint == manager.true_fn);
             assert_eq!(manager.right_expr, read_memory(constant(address, 32), 16));
             assert_eq!(manager.right_memory_read_table.len(), 1);
@@ -3002,10 +3187,9 @@ mod tests {
             })
             .expect("expected right memory variable");
 
-        manager
-            .left
-            .bits
-            .push(manager.variables[variable_index].1.clone());
+        manager.left = Some(BddWord {
+            bits: vec![manager.variables[variable_index].1.clone()],
+        });
         manager.release_variable(variable_index);
     }
 
@@ -3014,8 +3198,9 @@ mod tests {
         let r0 = read_reg(0);
         let single_add = add(r0.clone(), r0).canonicalize();
         let double_substituted = add(single_add.clone(), single_add.clone()).canonicalize();
-        let isa = ISA {
-            instructions: vec![
+        let isa = test_isa(
+            vec![],
+            vec![
                 isa_instruction(
                     "ADD_R0_R0_R0",
                     vec![Effect::write_register(
@@ -3028,8 +3213,7 @@ mod tests {
                     vec![Effect::write_register(reg(1), read_reg(0))],
                 ),
             ],
-            registers: vec![],
-        };
+        );
         let sequence = vec![decoded("ADD_R0_R0_R0"), decoded("MOV_R1_R0")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
@@ -3043,13 +3227,13 @@ mod tests {
     fn instruction_seq_to_effects_lowers_memory_writes_to_bytes() {
         let address = constant(0x100, 32);
         let value = constant(0xaabb_ccdd, 32);
-        let isa = ISA {
-            instructions: vec![isa_instruction(
+        let isa = test_isa(
+            vec![],
+            vec![isa_instruction(
                 "STORE32",
                 vec![Effect::write_memory(address.clone(), value.clone(), 32)],
             )],
-            registers: vec![],
-        };
+        );
         let sequence = vec![decoded("STORE32")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
@@ -3081,8 +3265,9 @@ mod tests {
     fn instruction_seq_to_effects_lowers_memory_reads_before_substitution() {
         let address = constant(0x100, 32);
         let value = constant(0xaabb_ccdd, 32);
-        let isa = ISA {
-            instructions: vec![
+        let isa = test_isa(
+            vec![],
+            vec![
                 isa_instruction(
                     "STORE32",
                     vec![Effect::write_memory(address.clone(), value.clone(), 32)],
@@ -3095,20 +3280,206 @@ mod tests {
                     )],
                 ),
             ],
-            registers: vec![],
-        };
+        );
         let sequence = vec![decoded("STORE32"), decoded("LOAD32_R0")];
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
+        let byte_addresses = [
+            address.clone(),
+            add(address.clone(), constant(1, 32)),
+            add(address.clone(), constant(2, 32)),
+            add(address.clone(), constant(3, 32)),
+        ];
+        let byte_values = [
+            extract(value.clone(), 7, 0),
+            extract(value.clone(), 15, 8),
+            extract(value.clone(), 23, 16),
+            extract(value.clone(), 31, 24),
+        ];
+        let forwarded_byte = |read_address: Expr| {
+            byte_addresses
+                .iter()
+                .cloned()
+                .zip(byte_values.iter().cloned())
+                .fold(read_memory(read_address.clone(), 8), |fallback, (address, value)| {
+                    select(
+                        forwarding_condition(bool_const(true), read_address.clone(), address),
+                        value,
+                        fallback,
+                    )
+                })
+        };
+
         assert_eq!(
             register_write_value(&effects, 0),
             &concat([
-                extract(value.clone(), 31, 24),
-                extract(value.clone(), 23, 16),
-                extract(value.clone(), 15, 8),
-                extract(value, 7, 0),
+                forwarded_byte(add(address.clone(), constant(3, 32))),
+                forwarded_byte(add(address.clone(), constant(2, 32))),
+                forwarded_byte(add(address.clone(), constant(1, 32))),
+                forwarded_byte(address),
             ])
+            .canonicalize()
+        );
+    }
+
+    #[test]
+    fn instruction_seq_to_effects_forwards_symbolic_memory_aliases() {
+        let write_address = read_reg(0);
+        let read_address = read_reg(1);
+        let write_value = constant(0x5a, 8);
+        let isa = test_isa(
+            vec![],
+            vec![
+                isa_instruction(
+                    "STORE_R0",
+                    vec![Effect::write_memory(
+                        write_address.clone(),
+                        write_value.clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "LOAD_R2_FROM_R1",
+                    vec![Effect::write_register(
+                        reg(2),
+                        read_memory(read_address.clone(), 8),
+                    )],
+                ),
+            ],
+        );
+        let sequence = vec![decoded("STORE_R0"), decoded("LOAD_R2_FROM_R1")];
+
+        let effects = instruction_seq_to_effects(&sequence, &isa);
+
+        assert_eq!(
+            register_write_value(&effects, 2),
+            &select(
+                forwarding_condition(bool_const(true), read_address.clone(), write_address),
+                write_value,
+                read_memory(read_address, 8),
+            )
+            .canonicalize()
+        );
+    }
+
+    #[test]
+    fn instruction_seq_to_effects_applies_many_memory_forwards_in_latest_write_order() {
+        let write_addresses = [read_reg(0), read_reg(1), read_reg(2), read_reg(3)];
+        let read_address = read_reg(4);
+        let write_values = [
+            constant(0x10, 8),
+            constant(0x20, 8),
+            constant(0x30, 8),
+            constant(0x40, 8),
+        ];
+        let isa = test_isa(
+            vec![],
+            vec![
+                isa_instruction(
+                    "STORE_R0",
+                    vec![Effect::write_memory(
+                        write_addresses[0].clone(),
+                        write_values[0].clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE_R1",
+                    vec![Effect::write_memory(
+                        write_addresses[1].clone(),
+                        write_values[1].clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE_R2",
+                    vec![Effect::write_memory(
+                        write_addresses[2].clone(),
+                        write_values[2].clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE_R3",
+                    vec![Effect::write_memory(
+                        write_addresses[3].clone(),
+                        write_values[3].clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "LOAD_R5_FROM_R4",
+                    vec![Effect::write_register(
+                        reg(5),
+                        read_memory(read_address.clone(), 8),
+                    )],
+                ),
+            ],
+        );
+        let sequence = vec![
+            decoded("STORE_R0"),
+            decoded("STORE_R1"),
+            decoded("STORE_R2"),
+            decoded("STORE_R3"),
+            decoded("LOAD_R5_FROM_R4"),
+        ];
+        let expected = write_addresses
+            .iter()
+            .cloned()
+            .zip(write_values.iter().cloned())
+            .fold(read_memory(read_address.clone(), 8), |fallback, (address, value)| {
+                select(
+                    forwarding_condition(bool_const(true), read_address.clone(), address),
+                    value,
+                    fallback,
+                )
+            })
+            .canonicalize();
+
+        let effects = instruction_seq_to_effects(&sequence, &isa);
+
+        assert_eq!(register_write_value(&effects, 5), &expected);
+    }
+
+    #[test]
+    fn instruction_seq_to_effects_preserves_guards_in_symbolic_memory_forwarding() {
+        let guard = read_register(reg(7), 1);
+        let write_address = read_reg(0);
+        let read_address = read_reg(1);
+        let write_value = constant(0xa5, 8);
+        let isa = test_isa(
+            vec![],
+            vec![
+                isa_instruction(
+                    "GUARDED_STORE_R0",
+                    vec![Effect::write_memory_if(
+                        guard.clone(),
+                        write_address.clone(),
+                        write_value.clone(),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "LOAD_R2_FROM_R1",
+                    vec![Effect::write_register(
+                        reg(2),
+                        read_memory(read_address.clone(), 8),
+                    )],
+                ),
+            ],
+        );
+        let sequence = vec![decoded("GUARDED_STORE_R0"), decoded("LOAD_R2_FROM_R1")];
+
+        let effects = instruction_seq_to_effects(&sequence, &isa);
+
+        assert_eq!(
+            register_write_value(&effects, 2),
+            &select(
+                forwarding_condition(guard, read_address.clone(), write_address),
+                write_value,
+                read_memory(read_address, 8),
+            )
             .canonicalize()
         );
     }
