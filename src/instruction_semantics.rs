@@ -1342,7 +1342,10 @@ impl Expr {
                         && value.expr_width() == Some(width)
                     {
                         forwarded = select(
-                            and_expr(guard.clone(), equal(register.clone(), write_register.clone())),
+                            and_expr(
+                                guard.clone(),
+                                equal(register.clone(), write_register.clone()),
+                            ),
                             value.clone(),
                             forwarded,
                         );
@@ -2051,21 +2054,26 @@ pub enum Effect {
 impl Effect {
     pub fn canonicalize(self) -> Self {
         match self {
-            Effect::WriteRegister { guard, register, value } => {
-                Effect::WriteRegister {
-                    guard: guard.canonicalize(),
-                    register: register.canonicalize(),
-                    value: value.canonicalize(),
-                }
-            }
-            Effect::WriteMemory { guard, address, value, width } => {
-                Effect::WriteMemory {
-                    guard: guard.canonicalize(),
-                    address: address.canonicalize(),
-                    value: value.canonicalize(),
-                    width,
-                }
-            }
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } => Effect::WriteRegister {
+                guard: guard.canonicalize(),
+                register: register.canonicalize(),
+                value: value.canonicalize(),
+            },
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } => Effect::WriteMemory {
+                guard: guard.canonicalize(),
+                address: address.canonicalize(),
+                value: value.canonicalize(),
+                width,
+            },
         }
     }
     /// Creates an unconditional register write.

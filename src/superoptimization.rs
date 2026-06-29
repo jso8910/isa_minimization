@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::{
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
-        ArchitecturalRegister, DecodedInstruction, FieldUses, Instruction, StackDirection, ISA,
+        ArchitecturalRegister, DecodedInstruction, FieldUses, ISA, Instruction, StackDirection,
     },
     semantic_matching::instruction_seq_to_effects,
 };
@@ -17,8 +17,7 @@ use crate::{
 pub struct SuperoptimizationCtx {
     pub field_values: HashMap<FieldName, FieldUses>,
     pub isa: Vec<Instruction>,
-    // A list of already found equivalent instruction sequences (Instruction -> Multiple instructions)
-    equivalent_instruction_sequences: Vec<(Instruction, Vec<Instruction>)>,
+    // counterexamples:
 }
 
 /// Cheaply rejects generated instruction sequences that use unsupported state destinations.
@@ -26,6 +25,7 @@ pub struct SuperoptimizationCtx {
 /// This is intended for the superoptimization hot path. It performs only syntactic checks after
 /// lowering effects into the initial-state coordinate system:
 /// - register write destinations must be constants/fixed registers,
+///     - these constant registers are not protected by some form of read dependency or convention
 /// - the stack pointer register may not be written,
 /// - memory writes must either target an original memory write destination exactly or an approved
 ///   SP-relative scratch byte,
@@ -33,12 +33,18 @@ pub struct SuperoptimizationCtx {
 pub fn generated_sequence_meets_state_constraints(
     generated: &[DecodedInstruction],
     original: &[DecodedInstruction],
+    protected_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
     let original_effects = instruction_seq_to_effects(original, isa);
     let generated_effects = instruction_seq_to_effects(generated, isa);
 
-    generated_effects_meet_state_constraints(&generated_effects, &original_effects, isa)
+    generated_effects_meet_state_constraints(
+        &generated_effects,
+        &original_effects,
+        protected_registers,
+        isa,
+    )
 }
 
 /// Checks already-lowered effects against the same destination constraints as
@@ -48,8 +54,11 @@ pub fn generated_sequence_meets_state_constraints(
 pub fn generated_effects_meet_state_constraints(
     generated_effects: &[Effect],
     original_effects: &[Effect],
+    protected_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
+    let protected_register_identifiers: Vec<_> =
+        protected_registers.iter().map(|r| r.identifier).collect();
     if !original_effects.iter().all(|original_effect| {
         generated_effects
             .iter()
@@ -66,9 +75,26 @@ pub fn generated_effects_meet_state_constraints(
         })
         .collect();
 
+    let original_register_identifiers: Vec<_> = original_effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::WriteMemory { .. } => None,
+            Effect::WriteRegister { register, .. } => Some(register_destination(register)),
+        })
+        .collect();
+
     generated_effects.iter().all(|effect| match effect {
-        Effect::WriteRegister { register, .. } => register_destination(register)
-            .is_some_and(|destination| destination != isa.sp.register.identifier as u128),
+        Effect::WriteRegister { register, .. } => {
+            // Check whether write is to an illegal destination
+            register_destination(register)
+                .is_some_and(|destination| destination != isa.sp.register.identifier as u128 && !protected_register_identifiers.contains(&(destination as u8)))
+            // but the destination is legal if it was an original register identifier
+            || original_register_identifiers
+                .iter()
+                // Register must be Some, not None
+                .any(|original_ident| register_destination(register)
+                    .is_some_and(|r| Some(r) == *original_ident))
+        }
         Effect::WriteMemory { address, .. } => {
             original_memory_destinations
                 .iter()
@@ -207,7 +233,7 @@ fn bit_mask(width: u16) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::{add, constant, fixed_register, read_register, sub, Register},
+        instruction_semantics::{Register, add, constant, fixed_register, read_register, sub},
         isa_specification::{InstructionForm, StackPointer},
     };
 
@@ -292,6 +318,7 @@ mod tests {
         assert!(generated_sequence_meets_state_constraints(
             &sequence("GENERATED"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
     }
@@ -333,16 +360,19 @@ mod tests {
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("ONLY_REGISTER"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("ONLY_MEMORY"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("ONLY_STACK_SCRATCH"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
     }
@@ -365,11 +395,13 @@ mod tests {
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("NONCONST_REG_DEST"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("SP_WRITE"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
     }
@@ -412,21 +444,25 @@ mod tests {
         assert!(generated_sequence_meets_state_constraints(
             &sequence("STACK_DOWN"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("STACK_UP"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("STACK_TOO_FAR"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("ARBITRARY_MEMORY"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
     }
@@ -457,11 +493,86 @@ mod tests {
         assert!(generated_sequence_meets_state_constraints(
             &sequence("STACK_UP"),
             &sequence("ORIGINAL"),
+            &[],
             &isa
         ));
         assert!(!generated_sequence_meets_state_constraints(
             &sequence("STACK_DOWN"),
             &sequence("ORIGINAL"),
+            &[],
+            &isa
+        ));
+    }
+
+    #[test]
+    fn rejects_generated_writes_to_protected_registers() {
+        let protected_register = arch_register(1);
+        let mut isa = test_isa(StackDirection::Downwards);
+        isa.instructions = vec![
+            instruction("ORIGINAL", vec![]),
+            instruction(
+                "WRITE_UNPROTECTED_R0",
+                vec![Effect::write_register(fixed_reg(0), constant(0x12, 32))],
+            ),
+            instruction(
+                "WRITE_PROTECTED_R1",
+                vec![Effect::write_register(fixed_reg(1), constant(0x34, 32))],
+            ),
+        ];
+
+        assert!(generated_sequence_meets_state_constraints(
+            &sequence("WRITE_UNPROTECTED_R0"),
+            &sequence("ORIGINAL"),
+            &[protected_register],
+            &isa
+        ));
+        assert!(!generated_sequence_meets_state_constraints(
+            &sequence("WRITE_PROTECTED_R1"),
+            &sequence("ORIGINAL"),
+            &[protected_register],
+            &isa
+        ));
+    }
+
+    #[test]
+    fn allows_original_destination_even_when_register_is_protected() {
+        let protected_register = arch_register(1);
+        let mut isa = test_isa(StackDirection::Downwards);
+        isa.instructions = vec![
+            instruction(
+                "ORIGINAL",
+                vec![Effect::write_register(fixed_reg(1), constant(0x12, 32))],
+            ),
+            instruction(
+                "GENERATED",
+                vec![Effect::write_register(fixed_reg(1), constant(0x34, 32))],
+            ),
+        ];
+
+        assert!(generated_sequence_meets_state_constraints(
+            &sequence("GENERATED"),
+            &sequence("ORIGINAL"),
+            &[protected_register],
+            &isa
+        ));
+    }
+
+    #[test]
+    fn protected_registers_do_not_make_arbitrary_memory_writes_valid() {
+        let protected_register = arch_register(1);
+        let mut isa = test_isa(StackDirection::Downwards);
+        isa.instructions = vec![
+            instruction("ORIGINAL", vec![]),
+            instruction(
+                "ARBITRARY_MEMORY",
+                vec![Effect::write_memory(read_reg(0), constant(0xaa, 8), 8)],
+            ),
+        ];
+
+        assert!(!generated_sequence_meets_state_constraints(
+            &sequence("ARBITRARY_MEMORY"),
+            &sequence("ORIGINAL"),
+            &[protected_register],
             &isa
         ));
     }

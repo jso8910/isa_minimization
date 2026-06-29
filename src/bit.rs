@@ -336,25 +336,6 @@ impl LookupTable {
         self.evaluate(&operands_unnamed)
     }
 
-    /// Function which takes, as input, a string expression and the inputs to it (as BitTypes) and returns the result
-    /// Uses the rhai module
-    fn eval_string_expr(expr: &str, inputs: &HashMap<String, Bit>) -> Bit {
-        let mut engine = Engine::new();
-
-        // In order for operator overloading to work, "fast operators" must be set to false
-        engine.set_fast_operators(false);
-
-        // Register Bit with the rhai engine
-        engine.build_type::<Bit>();
-
-        let mut scope = Scope::new();
-        for (name, val) in inputs {
-            scope.push(name.to_string(), *val);
-        }
-
-        engine.eval_with_scope(&mut scope, expr).unwrap()
-    }
-
     /// Takes a list of operands, in the same order as `self.input_names`, and returns the result in the LUT
     pub fn evaluate(&self, operands: &[Bit]) -> Bit {
         assert_eq!(

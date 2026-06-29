@@ -17,7 +17,9 @@ use isa_minimization::instruction_semantics::{
     sub_overflow, unsigned_less_than, xor_expr, zero_extend,
 };
 use isa_minimization::isa_specification::{
-    ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA, Instruction, InstructionField, InstructionForm, MergeMode, StackPointer, StackDirection, and, bit_eq, c, field_eq, field_in, not,
+    ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA,
+    Instruction, InstructionField, InstructionForm, MergeMode, StackDirection, StackPointer, and,
+    bit_eq, c, field_eq, field_in, not,
 };
 use isa_minimization::parser::parse_netlist;
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
@@ -1772,7 +1774,7 @@ fn main() {
         sp: StackPointer {
             register: gpr(12),
             stack_size: 32,
-            direction: StackDirection::Downwards
+            direction: StackDirection::Downwards,
         },
         pc: gpr(15),
     };

@@ -17,21 +17,22 @@ const LEFT_EXPR: bool = true;
 const RIGHT_EXPR: bool = false;
 
 use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, HashMap},
-    fmt::Binary,
+    collections::HashMap,
     ops::{BitAnd, BitOr},
 };
 
-use liberty_db::{cell::CurrentInternalNodeValue::L, expression::Bdd};
 use oxidd::{
-    BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef, bcdd::{BCDDFunction, BCDDManagerRef}, util::{AllocResult, OptBool},
+    BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef,
+    bcdd::{BCDDFunction, BCDDManagerRef},
+    util::{AllocResult, OptBool},
 };
 
 use crate::{
     instruction_semantics::{
-        Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr, read_memory, read_register, select,
-    }, isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA, Instruction},
+        Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr,
+        read_memory, read_register, select,
+    },
+    isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA},
 };
 
 pub type InstructionIdx = u32;
@@ -94,10 +95,6 @@ pub struct EquivalenceManager<'a> {
     /// BddManager for each `Effect` of `left` (parallel array)
     effect_managers: Vec<BddManager>,
 
-    /// List of locations which cannot be used for scratch work (ie cannot be incidental side effect)
-    /// because of read after write dependency
-    protected_state: Vec<StateDestination>,
-
     isa: &'a ISA,
 }
 
@@ -105,7 +102,6 @@ impl<'a> EquivalenceManager<'a> {
     pub fn from_instructions(
         left: &[DecodedInstruction],
         right: &[DecodedInstruction],
-        protected_state: Vec<StateDestination>,
         isa: &'a ISA,
     ) -> Self {
         let left_effects = Self::canonical_effects(instruction_seq_to_effects(left, isa));
@@ -124,22 +120,27 @@ impl<'a> EquivalenceManager<'a> {
             {
                 effect_managers.push(BddManager::from_exprs(left_expr, right_expr, isa));
             } else {
-                panic!("Right instruction sequence is missing effect writing to {:?} present in left instruction sequence", left_ident);
+                panic!(
+                    "Right instruction sequence is missing effect writing to {:?} present in left instruction sequence",
+                    left_ident
+                );
             }
         }
-        EquivalenceManager { left_effects, right_effects, effect_managers, protected_state, isa }
+        EquivalenceManager {
+            left_effects,
+            right_effects,
+            effect_managers,
+            isa,
+        }
     }
 
-    pub fn from_left_instruction(
-        left: &[DecodedInstruction],
-        protected_state: Vec<StateDestination>,
-        isa: &'a ISA,
-    ) -> Self {
-        Self::from_instructions(left, left, protected_state, isa)
+    pub fn from_left_instruction(left: &[DecodedInstruction], isa: &'a ISA) -> Self {
+        Self::from_instructions(left, left, isa)
     }
 
     pub fn replace_right_instruction(&mut self, new_right: &[DecodedInstruction]) {
-        self.right_effects = Self::canonical_effects(instruction_seq_to_effects(new_right, self.isa));
+        self.right_effects =
+            Self::canonical_effects(instruction_seq_to_effects(new_right, self.isa));
         for (idx, effect) in self.left_effects.iter().enumerate() {
             let (left_ident, is_memory) = Self::effect_ident(effect);
 
@@ -149,7 +150,10 @@ impl<'a> EquivalenceManager<'a> {
             {
                 self.effect_managers[idx].replace_right_expr(right_expr);
             } else {
-                panic!("Right instruction sequence is missing effect writing to {:?} present in left instruction sequence", left_ident);
+                panic!(
+                    "Right instruction sequence is missing effect writing to {:?} present in left instruction sequence",
+                    left_ident
+                );
             }
         }
     }
@@ -160,7 +164,7 @@ impl<'a> EquivalenceManager<'a> {
             match result {
                 BddEquality::Equal => continue,
                 // eagerly return on failure
-                BddEquality::Unequal(..) => return Ok(result)
+                BddEquality::Unequal(..) => return Ok(result),
             }
         }
         Ok(BddEquality::Equal)
@@ -301,7 +305,10 @@ pub struct BitWord {
 
 impl BitWord {
     pub fn new(value: u128, width: u16) -> Self {
-        assert!(width > 0 && width <= 128, "BitWord width must be in 1..=128");
+        assert!(
+            width > 0 && width <= 128,
+            "BitWord width must be in 1..=128"
+        );
         Self {
             value: value & bit_mask(width),
             width,
@@ -320,7 +327,10 @@ pub struct MachineState {
 }
 
 fn bit_mask(width: u16) -> u128 {
-    assert!(width > 0 && width <= 128, "Bit-vector width must be in 1..=128");
+    assert!(
+        width > 0 && width <= 128,
+        "Bit-vector width must be in 1..=128"
+    );
     if width == 128 {
         !0
     } else {
@@ -437,7 +447,11 @@ pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
             let amount = evaluate_expr(amount, state)?;
             let width = same_width(value, amount)?;
             let shifted = if amount.value >= width as u128 {
-                if value.value & sign_bit(width) == 0 { 0 } else { bit_mask(width) }
+                if value.value & sign_bit(width) == 0 {
+                    0
+                } else {
+                    bit_mask(width)
+                }
             } else {
                 (sign_extend_to_u128(value.value, width) as i128 >> amount.value as u32) as u128
             };
@@ -553,7 +567,10 @@ pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
             if lhs.width != *width || rhs.width != *width || carry_in.width != 1 {
                 return None;
             }
-            let result = lhs.value.wrapping_add(rhs.value).wrapping_add(carry_in.value & 1)
+            let result = lhs
+                .value
+                .wrapping_add(rhs.value)
+                .wrapping_add(carry_in.value & 1)
                 & bit_mask(*width);
             Some(bool_word(
                 (!(lhs.value ^ rhs.value) & (lhs.value ^ result) & sign_bit(*width)) != 0,
@@ -589,7 +606,10 @@ pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
             if lhs.width != *width || rhs.width != *width || borrow_in.width != 1 {
                 return None;
             }
-            let result = lhs.value.wrapping_sub(rhs.value).wrapping_sub(borrow_in.value & 1)
+            let result = lhs
+                .value
+                .wrapping_sub(rhs.value)
+                .wrapping_sub(borrow_in.value & 1)
                 & bit_mask(*width);
             Some(bool_word(
                 ((lhs.value ^ rhs.value) & (lhs.value ^ result) & sign_bit(*width)) != 0,
@@ -750,8 +770,12 @@ impl BddManager {
         let (true_fn, false_fn) = manager_ref
             .with_manager_shared(|manager| (BCDDFunction::t(manager), BCDDFunction::f(manager)));
 
-        let left_width = left_expr.expr_width().expect("Width of instructions must be defined!");
-        let right_width = right_expr.expr_width().expect("Width of instructions must be defined!");
+        let left_width = left_expr
+            .expr_width()
+            .expect("Width of instructions must be defined!");
+        let right_width = right_expr
+            .expr_width()
+            .expect("Width of instructions must be defined!");
 
         assert_eq!(left_width, right_width, "Expression widths must match");
         // Initialize constraint as true_fn
@@ -1042,8 +1066,6 @@ impl BddManager {
                 self.lower_expression(&address_expr, left)
             };
 
-            
-
             let table = if left {
                 &mut self.left_memory_read_table
             } else {
@@ -1053,29 +1075,14 @@ impl BddManager {
         }
     }
 
-    /// Checks if the memory reads of all expressions are lowered
-    fn memory_is_lowered(&self) -> bool {
-        for read in &self.left_memory_read_table {
-            if let None = read.lowered_address {
-                return false;
-            }
-        }
-
-        for read in &self.right_memory_read_table {
-            if let None = read.lowered_address {
-                return false;
-            }
-        }
-        return true;
-    }
-
     /// Builds the memory constraint
     /// Which equals And_(i<j)(Ai == Aj => Vi == Vj)
     fn build_memory_constraint(&mut self) {
         let mut constraint = self.true_fn.clone();
 
         // Create a combined array of all memory reads
-        let memory_reads: Vec<&MemoryRead> = self.left_memory_read_table
+        let memory_reads: Vec<&MemoryRead> = self
+            .left_memory_read_table
             .iter()
             .chain(&self.right_memory_read_table)
             .collect();
@@ -1252,8 +1259,12 @@ impl BddManager {
             Ok(BddEquality::Equal)
         } else {
             // Now we want to return a specific counterexample
-            let cube = counterexamples.pick_cube(|_, _, _| false).expect("Function is satisfiable, so a counterexample should exist");
-            Ok(BddEquality::Unequal(self.counterexample_state_from_cube(&cube)))
+            let cube = counterexamples
+                .pick_cube(|_, _, _| false)
+                .expect("Function is satisfiable, so a counterexample should exist");
+            Ok(BddEquality::Unequal(
+                self.counterexample_state_from_cube(&cube),
+            ))
         }
     }
 
@@ -1585,16 +1596,12 @@ impl BddManager {
         let width = value.bits.len();
         let mut result = vec![self.false_fn.clone(); width];
         for source in 0..value.bits.len() {
-            // This bit underflows
+            // This bit underflows and will be fully shifted out
             if source < amount {
                 continue;
             }
             let destination = source - amount;
-
-            // If destination < 0, then the value has been shifted out
-            if destination >= 0 {
-                result[destination] = value.bits[source].clone();
-            }
+            result[destination] = value.bits[source].clone();
         }
 
         BddWord { bits: result }
@@ -1608,16 +1615,12 @@ impl BddManager {
         // Only change is we fill with the sign bit rather than 0
         let mut result = vec![sign_bit.clone(); width];
         for source in 0..value.bits.len() {
-            // This bit underflows
+            // This bit underflowsm and will be shifted out
             if source < amount {
                 continue;
             }
             let destination = source - amount;
-
-            // If destination < 0, then the value has been shifted out
-            if destination >= 0 {
-                result[destination] = value.bits[source].clone();
-            }
+            result[destination] = value.bits[source].clone();
         }
 
         BddWord { bits: result }
@@ -2301,7 +2304,7 @@ mod tests {
             read_register, rotate_right, shift_left, sign_extend, signed_less_than, sub,
             sub_carry_out, sub_overflow, unsigned_less_than, xor_expr, zero_extend,
         },
-        isa_specification::{InstructionForm, StackDirection, StackPointer},
+        isa_specification::{Instruction, InstructionForm, StackDirection, StackPointer},
     };
 
     fn decoded(name: &str) -> DecodedInstruction {
@@ -2345,7 +2348,11 @@ mod tests {
         and_expr(guard, equal(read_identifier, write_identifier))
     }
 
-    fn test_arch_register(identifier: u8, identifier_width: u8, width: u8) -> ArchitecturalRegister {
+    fn test_arch_register(
+        identifier: u8,
+        identifier_width: u8,
+        width: u8,
+    ) -> ArchitecturalRegister {
         ArchitecturalRegister {
             identifier,
             identifier_width,
@@ -2505,7 +2512,10 @@ mod tests {
     fn assert_bdd_compare_equal(left: Expr, right: Expr, isa: &ISA) {
         let mut manager = BddManager::from_exprs(left.canonicalize(), right.canonicalize(), isa);
 
-        assert_eq!(manager.compare().expect("compare should allocate"), BddEquality::Equal);
+        assert_eq!(
+            manager.compare().expect("compare should allocate"),
+            BddEquality::Equal
+        );
     }
 
     fn assert_bdd_compare_unequal_counterexample(left: Expr, right: Expr, isa: &ISA) {
@@ -2563,21 +2573,9 @@ mod tests {
         let x = read_register(reg(0), 4);
         let y = read_register(reg(1), 4);
 
-        assert_bdd_compare_equal(
-            add(x.clone(), constant(0, 4)),
-            x.clone(),
-            &isa,
-        );
-        assert_bdd_compare_equal(
-            mul(x.clone(), constant(1, 4)),
-            x.clone(),
-            &isa,
-        );
-        assert_bdd_compare_equal(
-            add(x.clone(), y.clone()),
-            add(y.clone(), x.clone()),
-            &isa,
-        );
+        assert_bdd_compare_equal(add(x.clone(), constant(0, 4)), x.clone(), &isa);
+        assert_bdd_compare_equal(mul(x.clone(), constant(1, 4)), x.clone(), &isa);
+        assert_bdd_compare_equal(add(x.clone(), y.clone()), add(y.clone(), x.clone()), &isa);
         assert_bdd_compare_equal(
             zero_extend(extract(x.clone(), 2, 0), 4),
             and_expr(x, constant(0b0111, 4)),
@@ -2638,7 +2636,11 @@ mod tests {
             ("const", constant(0b1010, 4), constant(0b1010, 4)),
             ("fixed-register operand", reg(2), constant(2, 8)),
             ("read-register", x.clone(), add(x.clone(), constant(0, 4))),
-            ("read-memory", memory_at_x.clone(), add(memory_at_x.clone(), constant(0, 4))),
+            (
+                "read-memory",
+                memory_at_x.clone(),
+                add(memory_at_x.clone(), constant(0, 4)),
+            ),
             ("add", add(x.clone(), y.clone()), add(y.clone(), x.clone())),
             ("sub", sub(x.clone(), constant(0, 4)), x.clone()),
             ("mul", mul(x.clone(), constant(1, 4)), x.clone()),
@@ -2646,14 +2648,26 @@ mod tests {
             ("or", or_expr(x.clone(), constant(0, 4)), x.clone()),
             ("xor", xor_expr(x.clone(), constant(0, 4)), x.clone()),
             ("not", not_expr(not_expr(x.clone())), x.clone()),
-            ("shift-left", shift_left(x.clone(), constant(0, 4)), x.clone()),
-            ("logical-shift-right", logical_shift_right(x.clone(), constant(0, 4)), x.clone()),
+            (
+                "shift-left",
+                shift_left(x.clone(), constant(0, 4)),
+                x.clone(),
+            ),
+            (
+                "logical-shift-right",
+                logical_shift_right(x.clone(), constant(0, 4)),
+                x.clone(),
+            ),
             (
                 "arithmetic-shift-right",
                 arithmetic_shift_right(x.clone(), constant(0, 4)),
                 x.clone(),
             ),
-            ("rotate-right", rotate_right(x.clone(), constant(0, 4)), x.clone()),
+            (
+                "rotate-right",
+                rotate_right(x.clone(), constant(0, 4)),
+                x.clone(),
+            ),
             ("equal", equal(x.clone(), x.clone()), bool_const(true)),
             (
                 "unsigned-less-than",
@@ -2676,7 +2690,11 @@ mod tests {
                 zero_extend(x.clone(), 8),
                 concat([constant(0, 4), x.clone()]),
             ),
-            ("sign-extend", sign_extend(x.clone(), 8), sign_extend(x.clone(), 8)),
+            (
+                "sign-extend",
+                sign_extend(x.clone(), 8),
+                sign_extend(x.clone(), 8),
+            ),
             ("count-ones", count_ones(x.clone()), count_ones(x.clone())),
             (
                 "add-carry-out",
@@ -2706,12 +2724,18 @@ mod tests {
             (
                 "nested primitive mix",
                 add(
-                    and_expr(read_memory(add(x.clone(), y.clone()), 4), not_expr(z.clone())),
+                    and_expr(
+                        read_memory(add(x.clone(), y.clone()), 4),
+                        not_expr(z.clone()),
+                    ),
                     count_ones(or_expr(x.clone(), y.clone())),
                 ),
                 add(
                     count_ones(or_expr(y.clone(), x.clone())),
-                    and_expr(read_memory(add(y.clone(), x.clone()), 4), not_expr(z.clone())),
+                    and_expr(
+                        read_memory(add(y.clone(), x.clone()), 4),
+                        not_expr(z.clone()),
+                    ),
                 ),
             ),
         ];
@@ -2793,7 +2817,10 @@ mod tests {
             &isa,
         );
         assert_bdd_compare_unequal_counterexample(
-            rotate_right(add(shift_left(x.clone(), constant(1, 4)), y.clone()), constant(1, 4)),
+            rotate_right(
+                add(shift_left(x.clone(), constant(1, 4)), y.clone()),
+                constant(1, 4),
+            ),
             logical_shift_right(
                 add(shift_left(x.clone(), constant(1, 4)), y.clone()),
                 constant(1, 4),
@@ -2831,8 +2858,8 @@ mod tests {
         else {
             panic!("replacement should make expressions unequal");
         };
-        let left_value =
-            evaluate_expr(&x.clone().canonicalize(), &state).expect("counterexample should evaluate left");
+        let left_value = evaluate_expr(&x.clone().canonicalize(), &state)
+            .expect("counterexample should evaluate left");
         let right_value =
             evaluate_expr(&unequal, &state).expect("counterexample should evaluate right");
         assert_ne!(left_value.value, right_value.value);
@@ -2854,17 +2881,11 @@ mod tests {
             vec![
                 isa_instruction(
                     "SUM_R0_R1_R2",
-                    vec![Effect::write_register(
-                        reg(0),
-                        add(r1.clone(), r2.clone()),
-                    )],
+                    vec![Effect::write_register(reg(0), add(r1.clone(), r2.clone()))],
                 ),
                 isa_instruction(
                     "SUM_R0_R2_R1",
-                    vec![Effect::write_register(
-                        reg(0),
-                        add(r2.clone(), r1.clone()),
-                    )],
+                    vec![Effect::write_register(reg(0), add(r2.clone(), r1.clone()))],
                 ),
                 isa_instruction(
                     "TRIPLE_R3_R0_WITH_MUL",
@@ -2885,7 +2906,7 @@ mod tests {
         let left = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
         let right = decoded_sequence(&["SUM_R0_R2_R1", "TRIPLE_R3_R0_WITH_SHIFT_ADD"]);
 
-        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
 
         assert_eq!(
             manager
@@ -2905,10 +2926,7 @@ mod tests {
             vec![
                 isa_instruction(
                     "SUM_R0_R1_R2",
-                    vec![Effect::write_register(
-                        reg(0),
-                        add(r1.clone(), r2.clone()),
-                    )],
+                    vec![Effect::write_register(reg(0), add(r1.clone(), r2.clone()))],
                 ),
                 isa_instruction(
                     "TRIPLE_R3_R0_WITH_MUL",
@@ -2929,7 +2947,7 @@ mod tests {
         let left = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
         let right = decoded_sequence(&["SUM_R0_R1_R2", "DOUBLE_R3_R0_WITH_SHIFT"]);
 
-        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
 
         let result = manager
             .compare_instructions()
@@ -2972,7 +2990,7 @@ mod tests {
         let left = decoded_sequence(&["GUARDED_WRITE_R0"]);
         let right = decoded_sequence(&["EXPLICIT_SELECT_WRITE_R0"]);
 
-        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
 
         assert_eq!(
             manager
@@ -3012,7 +3030,7 @@ mod tests {
         let left = decoded_sequence(&["LEFT_CANONICAL_DESTINATIONS"]);
         let right = decoded_sequence(&["RIGHT_CANONICAL_DESTINATIONS"]);
 
-        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
 
         assert_eq!(
             manager
@@ -3032,10 +3050,7 @@ mod tests {
             vec![
                 isa_instruction(
                     "SUM_R0_R1_R2",
-                    vec![Effect::write_register(
-                        reg(0),
-                        add(r1.clone(), r2.clone()),
-                    )],
+                    vec![Effect::write_register(reg(0), add(r1.clone(), r2.clone()))],
                 ),
                 isa_instruction(
                     "SUM_R0_R2_R1",
@@ -3067,7 +3082,7 @@ mod tests {
         let original = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
         let equivalent = decoded_sequence(&["SUM_R0_R2_R1", "TRIPLE_R3_R0_WITH_SHIFT_ADD"]);
         let different = decoded_sequence(&["SUM_R0_R1_R2", "DOUBLE_R3_R0_WITH_SHIFT"]);
-        let mut manager = EquivalenceManager::from_left_instruction(&original, vec![], &isa);
+        let mut manager = EquivalenceManager::from_left_instruction(&original, &isa);
 
         assert_eq!(
             manager
@@ -3126,7 +3141,7 @@ mod tests {
         let left = decoded_sequence(&["WRITE_R0_AND_R3"]);
         let right = decoded_sequence(&["WRITE_ONLY_R0"]);
 
-        let _ = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let _ = EquivalenceManager::from_instructions(&left, &right, &isa);
     }
 
     #[test]
@@ -3137,17 +3152,25 @@ mod tests {
             vec![
                 isa_instruction(
                     "STORE_A",
-                    vec![Effect::write_memory(constant(0x20, 8), constant(0xa5, 8), 8)],
+                    vec![Effect::write_memory(
+                        constant(0x20, 8),
+                        constant(0xa5, 8),
+                        8,
+                    )],
                 ),
                 isa_instruction(
                     "STORE_B",
-                    vec![Effect::write_memory(constant(0x30, 8), constant(0x5a, 8), 8)],
+                    vec![Effect::write_memory(
+                        constant(0x30, 8),
+                        constant(0x5a, 8),
+                        8,
+                    )],
                 ),
             ],
         );
         let left = decoded_sequence(&["STORE_A"]);
         let missing_left_effect = decoded_sequence(&["STORE_B"]);
-        let mut manager = EquivalenceManager::from_left_instruction(&left, vec![], &isa);
+        let mut manager = EquivalenceManager::from_left_instruction(&left, &isa);
 
         manager.replace_right_instruction(&missing_left_effect);
     }
@@ -3184,7 +3207,7 @@ mod tests {
         let left = decoded_sequence(&["STORE16"]);
         let right = decoded_sequence(&["STORE16_LOW_BYTE", "STORE16_HIGH_BYTE"]);
 
-        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
 
         assert_eq!(
             manager
@@ -3231,7 +3254,7 @@ mod tests {
         let left = decoded_sequence(&["STORE_A"]);
         let right_with_b = decoded_sequence(&["STORE_A", "STORE_B"]);
         let right_with_c = decoded_sequence(&["STORE_A", "STORE_C"]);
-        let mut manager = EquivalenceManager::from_instructions(&left, &right_with_b, vec![], &isa);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right_with_b, &isa);
 
         assert_eq!(
             manager
@@ -3313,7 +3336,10 @@ mod tests {
             evaluate_expr(&read_register(reg(0), 1), &state),
             Some(BitWord::new(1, 1))
         );
-        assert_eq!(evaluate_expr(&constant(0, 1), &state), Some(BitWord::new(0, 1)));
+        assert_eq!(
+            evaluate_expr(&constant(0, 1), &state),
+            Some(BitWord::new(0, 1))
+        );
     }
 
     #[test]
@@ -3410,7 +3436,10 @@ mod tests {
         let expr = read_memory(constant(0x40, 8), 8);
         let mut manager = BddManager::from_exprs(expr.clone(), expr, &bdd_test_isa());
 
-        assert_eq!(manager.compare().expect("compare should allocate"), BddEquality::Equal);
+        assert_eq!(
+            manager.compare().expect("compare should allocate"),
+            BddEquality::Equal
+        );
     }
 
     #[test]
@@ -3520,11 +3549,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Expression widths must match")]
     fn from_exprs_rejects_mismatched_expression_widths() {
-        BddManager::from_exprs(
-            constant(0, 1),
-            constant(0, 2),
-            &test_isa(vec![], vec![]),
-        );
+        BddManager::from_exprs(constant(0, 1), constant(0, 2), &test_isa(vec![], vec![]));
     }
 
     #[test]
@@ -3597,11 +3622,8 @@ mod tests {
             })
             .collect();
         let read = read_register(fixed_register(Register(2), 2), 4);
-        let manager = BddManager::from_exprs(
-            read.clone(),
-            constant(0, 4),
-            &test_isa(registers, vec![]),
-        );
+        let manager =
+            BddManager::from_exprs(read.clone(), constant(0, 4), &test_isa(registers, vec![]));
         let result = manager.lower_expression(&read, LEFT_EXPR);
         let register_values = [0b0001u128, 0b0010, 0b0100, 0b1000];
         let assignment: Vec<_> = manager
@@ -3654,11 +3676,8 @@ mod tests {
             })
             .collect();
         let selector_expr = read_memory(constant(0x100, 32), 2);
-        let manager = BddManager::from_exprs(
-            selector_expr,
-            constant(0, 2),
-            &test_isa(registers, vec![]),
-        );
+        let manager =
+            BddManager::from_exprs(selector_expr, constant(0, 2), &test_isa(registers, vec![]));
         let selector = manager.left_memory_read_table[0].value.clone();
         let result = manager.lower_register_read(selector, 3).unwrap();
         let register_values = [0b101u128, 0, 0b011, 0];
@@ -4514,11 +4533,8 @@ mod tests {
             })
             .collect();
         let selector_expr = read_memory(constant(0x100, 32), 2);
-        let manager = BddManager::from_exprs(
-            selector_expr,
-            constant(0, 2),
-            &test_isa(registers, vec![]),
-        );
+        let manager =
+            BddManager::from_exprs(selector_expr, constant(0, 2), &test_isa(registers, vec![]));
         let selector = manager.left_memory_read_table[0].value.clone();
         let result = manager.lower_register_read(selector, 3).unwrap();
         let register_values = [0b001u128, 0b010, 0b100, 0b111];
@@ -4857,13 +4873,16 @@ mod tests {
                 .iter()
                 .cloned()
                 .zip(byte_values.iter().cloned())
-                .fold(read_memory(read_address.clone(), 8), |fallback, (address, value)| {
-                    select(
-                        forwarding_condition(bool_const(true), read_address.clone(), address),
-                        value,
-                        fallback,
-                    )
-                })
+                .fold(
+                    read_memory(read_address.clone(), 8),
+                    |fallback, (address, value)| {
+                        select(
+                            forwarding_condition(bool_const(true), read_address.clone(), address),
+                            value,
+                            fallback,
+                        )
+                    },
+                )
         };
 
         assert_eq!(
@@ -4983,13 +5002,16 @@ mod tests {
             .iter()
             .cloned()
             .zip(write_values.iter().cloned())
-            .fold(read_memory(read_address.clone(), 8), |fallback, (address, value)| {
-                select(
-                    forwarding_condition(bool_const(true), read_address.clone(), address),
-                    value,
-                    fallback,
-                )
-            })
+            .fold(
+                read_memory(read_address.clone(), 8),
+                |fallback, (address, value)| {
+                    select(
+                        forwarding_condition(bool_const(true), read_address.clone(), address),
+                        value,
+                        fallback,
+                    )
+                },
+            )
             .canonicalize();
 
         let effects = instruction_seq_to_effects(&sequence, &isa);

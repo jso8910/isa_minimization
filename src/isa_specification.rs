@@ -28,13 +28,13 @@ pub struct StackPointer {
     /// Either way, writing to the stack will be avoided, so it is unlikely a large value is needed.
     pub stack_size: u32,
     /// Direction the stack grows
-    pub direction: StackDirection
+    pub direction: StackDirection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackDirection {
     Upwards,
-    Downwards
+    Downwards,
 }
 
 /// Definition of a register in the architecture.
