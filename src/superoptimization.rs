@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::{
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
-        ArchitecturalRegister, DecodedInstruction, FieldUses, ISA, Instruction, StackDirection,
+        ArchitecturalRegister, DecodedInstruction, FieldUses, Instruction, StackDirection, ISA,
     },
     semantic_matching::instruction_seq_to_effects,
 };
@@ -28,7 +28,8 @@ pub struct SuperoptimizationCtx {
 /// - register write destinations must be constants/fixed registers,
 /// - the stack pointer register may not be written,
 /// - memory writes must either target an original memory write destination exactly or an approved
-///   SP-relative scratch byte.
+///   SP-relative scratch byte,
+/// - every original write destination must have a corresponding generated write destination.
 pub fn generated_sequence_meets_state_constraints(
     generated: &[DecodedInstruction],
     original: &[DecodedInstruction],
@@ -49,6 +50,14 @@ pub fn generated_effects_meet_state_constraints(
     original_effects: &[Effect],
     isa: &ISA,
 ) -> bool {
+    if !original_effects.iter().all(|original_effect| {
+        generated_effects
+            .iter()
+            .any(|generated_effect| effect_destinations_match(original_effect, generated_effect))
+    }) {
+        return false;
+    }
+
     let original_memory_destinations: Vec<_> = original_effects
         .iter()
         .filter_map(|effect| match effect {
@@ -58,11 +67,8 @@ pub fn generated_effects_meet_state_constraints(
         .collect();
 
     generated_effects.iter().all(|effect| match effect {
-        Effect::WriteRegister { register, .. } => {
-            register_destination(register).is_some_and(|destination| {
-                destination != isa.sp.register.identifier as u128
-            })
-        }
+        Effect::WriteRegister { register, .. } => register_destination(register)
+            .is_some_and(|destination| destination != isa.sp.register.identifier as u128),
         Effect::WriteMemory { address, .. } => {
             original_memory_destinations
                 .iter()
@@ -70,6 +76,38 @@ pub fn generated_effects_meet_state_constraints(
                 || is_allowed_stack_scratch_address(address, isa)
         }
     })
+}
+
+fn effect_destinations_match(left: &Effect, right: &Effect) -> bool {
+    match (left, right) {
+        (
+            Effect::WriteRegister {
+                register: left_register,
+                ..
+            },
+            Effect::WriteRegister {
+                register: right_register,
+                ..
+            },
+        ) => register_destination(left_register)
+            .zip(register_destination(right_register))
+            .is_some_and(|(left_destination, right_destination)| {
+                left_destination == right_destination
+            }),
+        (
+            Effect::WriteMemory {
+                address: left_address,
+                width: left_width,
+                ..
+            },
+            Effect::WriteMemory {
+                address: right_address,
+                width: right_width,
+                ..
+            },
+        ) => left_address == right_address && left_width == right_width,
+        _ => false,
+    }
 }
 
 fn register_destination(register: &Expr) -> Option<u128> {
@@ -169,9 +207,7 @@ fn bit_mask(width: u16) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::{
-            Register, add, constant, fixed_register, read_register, sub,
-        },
+        instruction_semantics::{add, constant, fixed_register, read_register, sub, Register},
         isa_specification::{InstructionForm, StackPointer},
     };
 
@@ -255,6 +291,57 @@ mod tests {
 
         assert!(generated_sequence_meets_state_constraints(
             &sequence("GENERATED"),
+            &sequence("ORIGINAL"),
+            &isa
+        ));
+    }
+
+    #[test]
+    fn rejects_generated_sequences_missing_original_effect_destinations() {
+        let original_address = read_reg(0);
+        let mut isa = test_isa(StackDirection::Downwards);
+        isa.instructions = vec![
+            instruction(
+                "ORIGINAL",
+                vec![
+                    Effect::write_register(fixed_reg(1), constant(0x12, 32)),
+                    Effect::write_memory(original_address.clone(), constant(0xaa, 8), 8),
+                ],
+            ),
+            instruction(
+                "ONLY_REGISTER",
+                vec![Effect::write_register(fixed_reg(1), constant(0x34, 32))],
+            ),
+            instruction(
+                "ONLY_MEMORY",
+                vec![Effect::write_memory(
+                    original_address.clone(),
+                    constant(0xbb, 8),
+                    8,
+                )],
+            ),
+            instruction(
+                "ONLY_STACK_SCRATCH",
+                vec![Effect::write_memory(
+                    sub(sp_value(), constant(4, 32)),
+                    constant(0xcc, 8),
+                    8,
+                )],
+            ),
+        ];
+
+        assert!(!generated_sequence_meets_state_constraints(
+            &sequence("ONLY_REGISTER"),
+            &sequence("ORIGINAL"),
+            &isa
+        ));
+        assert!(!generated_sequence_meets_state_constraints(
+            &sequence("ONLY_MEMORY"),
+            &sequence("ORIGINAL"),
+            &isa
+        ));
+        assert!(!generated_sequence_meets_state_constraints(
+            &sequence("ONLY_STACK_SCRATCH"),
             &sequence("ORIGINAL"),
             &isa
         ));

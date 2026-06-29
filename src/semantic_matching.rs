@@ -18,16 +18,14 @@ const RIGHT_EXPR: bool = false;
 
 use std::{
     cmp::Reverse,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt::Binary,
     ops::{BitAnd, BitOr},
 };
 
 use liberty_db::{cell::CurrentInternalNodeValue::L, expression::Bdd};
 use oxidd::{
-    BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef,
-    bcdd::{BCDDFunction, BCDDManagerRef},
-    util::AllocResult,
+    BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef, bcdd::{BCDDFunction, BCDDManagerRef}, util::{AllocResult, OptBool},
 };
 
 use crate::{
@@ -69,6 +67,7 @@ pub struct MemoryRead {
     lowered_address: Option<BddWord>,
     width: u16,
     value: BddWord,
+    value_variables: BddWord,
 }
 
 type ReadId = u32;
@@ -88,110 +87,186 @@ enum VariableDescription {
 }
 
 /// Checks the equivalence between two instruction sequences
-pub struct EquivalenceManager {
+pub struct EquivalenceManager<'a> {
     left_effects: Vec<Effect>,
     right_effects: Vec<Effect>,
 
     /// BddManager for each `Effect` of `left` (parallel array)
     effect_managers: Vec<BddManager>,
 
-    /// BddManager for the address or register of each `Effect` of `left`
-    identifier_managers: Vec<BddManager>,
-
     /// List of locations which cannot be used for scratch work (ie cannot be incidental side effect)
     /// because of read after write dependency
-    protected_state: Vec<StateDestination>
+    protected_state: Vec<StateDestination>,
+
+    isa: &'a ISA,
 }
 
-
-/*
-
-
-
-
-currently, the way im matching two sets of instructions is by comparing them effect by effect
-
-which has a few issues
-1. need to compare the identifier of the effects. if that's not possible, that's an issue
-2. when creating each Effect value in instruction_seq_to_effects, when substituting values in (eg if a later effect says Read(R0), but R0 now has the value that R1 had earlier)
-   it's important to prevent there EVER being a case where that relation is missed because the Effect identifier expr somehow looks different from the identifier in the value expr.
-        - and the issue is im pretty sure there may be multiple ways to set register identifiers? not sure, would need to check
-
-i really dont know what to do about the issue of sometimes equivalent writes
-
-because i might have eg
-MEM[r0] = 1
-r1 = mem[r1]
-
-but if r1 == r0, then that messed up the value in r1
-
-i guess maybe the solutuion is actually to never allow memory writes other than to absolute addresses? because there is the case, even without the second line
-where r5 == r0, and MEM[r5] is protected
-
-and then perhaps what i can do is have a separate exemption for the stack pointer? where the programmer defines "this register is the stack pointer, the stack grows
-downwards, and there is a guarantee that there are at least N free bytes on the stack" and it is simply assumed that the memory used by the stack is never read
-before being written to at any other point in the program. and then any other arbitrary memory writes are not allowed
-
-because without the potential of writes to random registers (ie it is guaranteed that the only memory addresses written to are in the simple form R12 - n)
-then it's much easier to distinguish where an Expr::MemoryRead corresponds with an effect. because the canonical form should match
-    - most importantly for EquivalenceManager, that means the Expr for WriteMemory should EXACTLY match between the two
-            - tbh i think the easiest thing is enforcing that
-
-
-then the next thing to handle is register identifiers. so far ive been offering the freedom for very arbitrary register identifiers (eg R[extract(R0 * R1, 3, 0))])
-which complicates things somewhat.
-        - it seems not many ISAs do this other than obselete ones which memory mapped their registers (which is already something that can't be supported, unless you remove
-          all register reads/write from your isa specification and implement it as memory writes) so perhaps it's a difficulty which I don't need to bother with?
-        - just assuming that all register write effects will collapse to a fixed register makes things a lot easier imo
-
-either way regardless of what i do i need to do much more thinking about where the current method of "compare exprs, see if equal, if equal, substitute value" doesnt work
-and more thinking about other things
-
-i think in an ideal world, i would just be able to compare effect.identifier == effect.identifier and any reads in effect1.value == effect2.identifier
-        - i really dont like this though because it feels like im just trusting that this will work
-
-*/
-impl EquivalenceManager {
-    pub fn from_instructions(left: &Vec<DecodedInstruction>, right: &Vec<DecodedInstruction>, protected_state: Vec<StateDestination>, isa: &ISA) -> Self {
-        let left_effects = instruction_seq_to_effects(left, isa);
-        let right_effects = instruction_seq_to_effects(right, isa);
+impl<'a> EquivalenceManager<'a> {
+    pub fn from_instructions(
+        left: &[DecodedInstruction],
+        right: &[DecodedInstruction],
+        protected_state: Vec<StateDestination>,
+        isa: &'a ISA,
+    ) -> Self {
+        let left_effects = Self::canonical_effects(instruction_seq_to_effects(left, isa));
+        let right_effects = Self::canonical_effects(instruction_seq_to_effects(right, isa));
 
         let mut effect_managers = vec![];
-        let mut identifier_managers = vec![];
-        for effect in left_effects.clone() {
-            // We can't yet add right effects, because adding a right effect is contingent on the identifier being checked
-            match effect {
-                Effect::WriteMemory { guard, address, value, width } => {
-                    assert_eq!(width, 8, "Memory reads should be 1 byte!");
-                    identifier_managers.push(BddManager::from_left_expr(address.clone(), isa));
+        for effect in &left_effects {
+            let (left_expr, left_ident, is_memory) = Self::effect_comparison_parts(effect);
 
-                    // We want to also remove the guard from the effect
-                    // This can be achieved by changing value to
-                    // select(guard, value, read_memory(address))
-
-                    let value = select(guard, value, read_memory(address, width)).canonicalize();
-                    effect_managers.push(BddManager::from_left_expr(value, isa));
-                }
-
-                Effect::WriteRegister { guard, register, value } => {
-                    identifier_managers.push(BddManager::from_left_expr(register.clone(), isa));
-
-                    // We want to also remove the guard from the effect
-                    // This can be achieved by changing value to
-                    // select(guard, value, read_register(register))
-
-                    let width = value.expr_width().expect("Effect value must have width!");
-
-                    let value = select(guard, value, read_register(register, width)).canonicalize();
-                    effect_managers.push(BddManager::from_left_expr(value, isa));
-                }
+            // Now, iterate to find the right value expr, which should be guaranteed to
+            //  1. exist
+            //  2. syntactically match the left expr
+            // by generated_sequence_meets_state_constraints()/generated_effects_meet_state_constraints()
+            if let Some(right_expr) =
+                Self::matching_effect_value(&right_effects, &left_ident, is_memory)
+            {
+                effect_managers.push(BddManager::from_exprs(left_expr, right_expr, isa));
+            } else {
+                panic!("Right instruction sequence is missing effect writing to {:?} present in left instruction sequence", left_ident);
             }
         }
-        EquivalenceManager { left_effects, right_effects, effect_managers, identifier_managers, protected_state }
+        EquivalenceManager { left_effects, right_effects, effect_managers, protected_state, isa }
     }
 
-    // /// Finds which effects correspond with each other by comparing 
-    // fn pair_effects
+    pub fn from_left_instruction(
+        left: &[DecodedInstruction],
+        protected_state: Vec<StateDestination>,
+        isa: &'a ISA,
+    ) -> Self {
+        Self::from_instructions(left, left, protected_state, isa)
+    }
+
+    pub fn replace_right_instruction(&mut self, new_right: &[DecodedInstruction]) {
+        self.right_effects = Self::canonical_effects(instruction_seq_to_effects(new_right, self.isa));
+        for (idx, effect) in self.left_effects.iter().enumerate() {
+            let (left_ident, is_memory) = Self::effect_ident(effect);
+
+            // Now iterate through the right effects to find the corresponding effect
+            if let Some(right_expr) =
+                Self::matching_effect_value(&self.right_effects, &left_ident, is_memory)
+            {
+                self.effect_managers[idx].replace_right_expr(right_expr);
+            } else {
+                panic!("Right instruction sequence is missing effect writing to {:?} present in left instruction sequence", left_ident);
+            }
+        }
+    }
+
+    pub fn compare_instructions(&mut self) -> AllocResult<BddEquality> {
+        for effect_manager in self.effect_managers.iter_mut() {
+            let result = effect_manager.compare()?;
+            match result {
+                BddEquality::Equal => continue,
+                // eagerly return on failure
+                BddEquality::Unequal(..) => return Ok(result)
+            }
+        }
+        Ok(BddEquality::Equal)
+    }
+
+    fn canonical_effects(effects: Vec<Effect>) -> Vec<Effect> {
+        effects.into_iter().map(Effect::canonicalize).collect()
+    }
+
+    fn effect_comparison_parts(effect: &Effect) -> (Expr, Expr, bool) {
+        match effect {
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } => {
+                assert_eq!(*width, 8, "Memory writes should be lowered to 1 byte");
+                (
+                    Self::guarded_value_or_current_memory(
+                        guard.clone(),
+                        address.clone(),
+                        value.clone(),
+                        *width,
+                    ),
+                    address.clone(),
+                    true,
+                )
+            }
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } => {
+                let width = value.expr_width().expect("Effect value must have width!");
+                (
+                    Self::guarded_value_or_current_register(
+                        guard.clone(),
+                        register.clone(),
+                        value.clone(),
+                        width,
+                    ),
+                    register.clone(),
+                    false,
+                )
+            }
+        }
+    }
+
+    fn effect_ident(effect: &Effect) -> (Expr, bool) {
+        match effect {
+            Effect::WriteMemory { address, .. } => (address.clone(), true),
+            Effect::WriteRegister { register, .. } => (register.clone(), false),
+        }
+    }
+
+    fn matching_effect_value(effects: &[Effect], ident: &Expr, is_memory: bool) -> Option<Expr> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } if is_memory && address == ident => {
+                assert_eq!(*width, 8, "Memory writes should be lowered to 1 byte");
+                Some(Self::guarded_value_or_current_memory(
+                    guard.clone(),
+                    address.clone(),
+                    value.clone(),
+                    *width,
+                ))
+            }
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } if !is_memory && register == ident => {
+                let width = value.expr_width().expect("Effect value must have width!");
+                Some(Self::guarded_value_or_current_register(
+                    guard.clone(),
+                    register.clone(),
+                    value.clone(),
+                    width,
+                ))
+            }
+            _ => None,
+        })
+    }
+
+    fn guarded_value_or_current_memory(
+        guard: Expr,
+        address: Expr,
+        value: Expr,
+        width: u16,
+    ) -> Expr {
+        select(guard, value, read_memory(address, width)).canonicalize()
+    }
+
+    fn guarded_value_or_current_register(
+        guard: Expr,
+        register: Expr,
+        value: Expr,
+        width: u16,
+    ) -> Expr {
+        select(guard, value, read_register(register, width)).canonicalize()
+    }
 }
 
 //NOTE: should probably put this in some other file
@@ -209,6 +284,336 @@ impl EquivalenceManager {
 
 // wait how on earth am i meant to handle the state uses? i completely forgot that branching was possible
 // do i need to follow every branch?
+// maybe just assume any register not written before the next branch isnt usable?
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BddEquality {
+    Equal,
+    /// A concrete state witnessing inequality.
+    Unequal(MachineState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitWord {
+    pub value: u128,
+    pub width: u16,
+}
+
+impl BitWord {
+    pub fn new(value: u128, width: u16) -> Self {
+        assert!(width > 0 && width <= 128, "BitWord width must be in 1..=128");
+        Self {
+            value: value & bit_mask(width),
+            width,
+        }
+    }
+
+    fn bool(value: bool) -> Self {
+        Self::new(value as u128, 1)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MachineState {
+    pub registers: HashMap<u128, BitWord>,
+    pub memory: HashMap<(u128, u16), BitWord>,
+}
+
+fn bit_mask(width: u16) -> u128 {
+    assert!(width > 0 && width <= 128, "Bit-vector width must be in 1..=128");
+    if width == 128 {
+        !0
+    } else {
+        (1u128 << width) - 1
+    }
+}
+
+fn sign_bit(width: u16) -> u128 {
+    1u128 << (width - 1)
+}
+
+fn sign_extend_to_u128(value: u128, width: u16) -> u128 {
+    let value = value & bit_mask(width);
+    if value & sign_bit(width) == 0 {
+        value
+    } else {
+        value | !bit_mask(width)
+    }
+}
+
+fn signed_value(value: u128, width: u16) -> i128 {
+    sign_extend_to_u128(value, width) as i128
+}
+
+fn same_width(lhs: BitWord, rhs: BitWord) -> Option<u16> {
+    (lhs.width == rhs.width).then_some(lhs.width)
+}
+
+fn bool_word(value: bool) -> BitWord {
+    BitWord::bool(value)
+}
+
+pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
+    match expr {
+        Expr::Const { value, width } => Some(BitWord::new(*value, *width)),
+        Expr::Operand(OperandRef::RegisterField(RegisterRef::Fixed {
+            register,
+            identifier_width,
+        })) => Some(BitWord::new(register.0 as u128, *identifier_width)),
+        Expr::Operand(_) | Expr::DerivedValue(_) => None,
+        Expr::ReadRegister { register, width } => {
+            let register = evaluate_expr(register, state)?;
+            let value = state.registers.get(&register.value)?;
+            (value.width == *width).then_some(*value)
+        }
+        Expr::ReadMemory { address, width } => {
+            let address = evaluate_expr(address, state)?;
+            state.memory.get(&(address.value, *width)).copied()
+        }
+        Expr::Add(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value.wrapping_add(rhs.value), width))
+        }
+        Expr::Sub(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value.wrapping_sub(rhs.value), width))
+        }
+        Expr::Mul(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value.wrapping_mul(rhs.value), width))
+        }
+        Expr::And(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value & rhs.value, width))
+        }
+        Expr::Or(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value | rhs.value, width))
+        }
+        Expr::Xor(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(BitWord::new(lhs.value ^ rhs.value, width))
+        }
+        Expr::Not(value) => {
+            let value = evaluate_expr(value, state)?;
+            Some(BitWord::new(!value.value, value.width))
+        }
+        Expr::ShiftLeft(value, amount) => {
+            let value = evaluate_expr(value, state)?;
+            let amount = evaluate_expr(amount, state)?;
+            let width = same_width(value, amount)?;
+            let shifted = if amount.value >= width as u128 {
+                0
+            } else {
+                value.value << amount.value as u32
+            };
+            Some(BitWord::new(shifted, width))
+        }
+        Expr::LogicalShiftRight(value, amount) => {
+            let value = evaluate_expr(value, state)?;
+            let amount = evaluate_expr(amount, state)?;
+            let width = same_width(value, amount)?;
+            let shifted = if amount.value >= width as u128 {
+                0
+            } else {
+                value.value >> amount.value as u32
+            };
+            Some(BitWord::new(shifted, width))
+        }
+        Expr::ArithmeticShiftRight(value, amount) => {
+            let value = evaluate_expr(value, state)?;
+            let amount = evaluate_expr(amount, state)?;
+            let width = same_width(value, amount)?;
+            let shifted = if amount.value >= width as u128 {
+                if value.value & sign_bit(width) == 0 { 0 } else { bit_mask(width) }
+            } else {
+                (sign_extend_to_u128(value.value, width) as i128 >> amount.value as u32) as u128
+            };
+            Some(BitWord::new(shifted, width))
+        }
+        Expr::RotateRight(value, amount) => {
+            let value = evaluate_expr(value, state)?;
+            let amount = evaluate_expr(amount, state)?;
+            let width = same_width(value, amount)?;
+            let shift = (amount.value % width as u128) as u32;
+            let rotated = if shift == 0 {
+                value.value
+            } else {
+                (value.value >> shift) | (value.value << (width as u32 - shift))
+            };
+            Some(BitWord::new(rotated, width))
+        }
+        Expr::Equal(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            same_width(lhs, rhs)?;
+            Some(bool_word(lhs.value == rhs.value))
+        }
+        Expr::UnsignedLessThan(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            same_width(lhs, rhs)?;
+            Some(bool_word(lhs.value < rhs.value))
+        }
+        Expr::SignedLessThan(lhs, rhs) => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let width = same_width(lhs, rhs)?;
+            Some(bool_word(
+                signed_value(lhs.value, width) < signed_value(rhs.value, width),
+            ))
+        }
+        Expr::Extract { value, high, low } => {
+            let value = evaluate_expr(value, state)?;
+            if high < low || *high >= value.width {
+                return None;
+            }
+            let width = high - low + 1;
+            Some(BitWord::new(value.value >> *low as u32, width))
+        }
+        Expr::Concat(values) => {
+            let mut width = 0u16;
+            let mut result = 0u128;
+            for value in values {
+                let value = evaluate_expr(value, state)?;
+                width = width.checked_add(value.width)?;
+                if width > 128 {
+                    return None;
+                }
+                result = (result << value.width as u32) | value.value;
+            }
+            Some(BitWord::new(result, width))
+        }
+        Expr::ZeroExtend { value, to_width } => {
+            let value = evaluate_expr(value, state)?;
+            (value.width <= *to_width).then_some(BitWord::new(value.value, *to_width))
+        }
+        Expr::SignExtend { value, to_width } => {
+            let value = evaluate_expr(value, state)?;
+            if value.width > *to_width {
+                return None;
+            }
+            Some(BitWord::new(
+                sign_extend_to_u128(value.value, value.width),
+                *to_width,
+            ))
+        }
+        Expr::CountOnes(value) => {
+            let value = evaluate_expr(value, state)?;
+            Some(BitWord::new(
+                (value.value & bit_mask(value.width)).count_ones() as u128,
+                value.width,
+            ))
+        }
+        Expr::AddCarryOut {
+            lhs,
+            rhs,
+            carry_in,
+            width,
+        } => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let carry_in = evaluate_expr(carry_in, state)?;
+            if lhs.width != *width || rhs.width != *width || carry_in.width != 1 {
+                return None;
+            }
+            let carry = if *width == 128 {
+                let (sum, carry1) = lhs.value.overflowing_add(rhs.value);
+                let (_, carry2) = sum.overflowing_add(carry_in.value & 1);
+                carry1 || carry2
+            } else {
+                (lhs.value & bit_mask(*width))
+                    + (rhs.value & bit_mask(*width))
+                    + (carry_in.value & 1)
+                    > bit_mask(*width)
+            };
+            Some(bool_word(carry))
+        }
+        Expr::AddOverflow {
+            lhs,
+            rhs,
+            carry_in,
+            width,
+        } => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let carry_in = evaluate_expr(carry_in, state)?;
+            if lhs.width != *width || rhs.width != *width || carry_in.width != 1 {
+                return None;
+            }
+            let result = lhs.value.wrapping_add(rhs.value).wrapping_add(carry_in.value & 1)
+                & bit_mask(*width);
+            Some(bool_word(
+                (!(lhs.value ^ rhs.value) & (lhs.value ^ result) & sign_bit(*width)) != 0,
+            ))
+        }
+        Expr::SubCarryOut {
+            lhs,
+            rhs,
+            borrow_in,
+            width,
+        } => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let borrow_in = evaluate_expr(borrow_in, state)?;
+            if lhs.width != *width || rhs.width != *width || borrow_in.width != 1 {
+                return None;
+            }
+            let lhs = lhs.value & bit_mask(*width);
+            let rhs = rhs.value & bit_mask(*width);
+            let (diff, borrow1) = lhs.overflowing_sub(rhs);
+            let (_, borrow2) = diff.overflowing_sub(borrow_in.value & 1);
+            Some(bool_word(!(borrow1 || borrow2)))
+        }
+        Expr::SubOverflow {
+            lhs,
+            rhs,
+            borrow_in,
+            width,
+        } => {
+            let lhs = evaluate_expr(lhs, state)?;
+            let rhs = evaluate_expr(rhs, state)?;
+            let borrow_in = evaluate_expr(borrow_in, state)?;
+            if lhs.width != *width || rhs.width != *width || borrow_in.width != 1 {
+                return None;
+            }
+            let result = lhs.value.wrapping_sub(rhs.value).wrapping_sub(borrow_in.value & 1)
+                & bit_mask(*width);
+            Some(bool_word(
+                ((lhs.value ^ rhs.value) & (lhs.value ^ result) & sign_bit(*width)) != 0,
+            ))
+        }
+        Expr::Select {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let condition = evaluate_expr(condition, state)?;
+            let when_true = evaluate_expr(when_true, state)?;
+            let when_false = evaluate_expr(when_false, state)?;
+            if condition.width != 1 || when_true.width != when_false.width {
+                return None;
+            }
+            Some(if condition.value & 1 != 0 {
+                when_true
+            } else {
+                when_false
+            })
+        }
+    }
+}
 
 // Cloning is not allowed to enforce exclusive ownership of the manager
 // Similarly, manager_ref should never be accessed from outside the struct and
@@ -472,6 +877,7 @@ impl BddManager {
                             lowered_address: None,
                             width: *width,
                             value: BddWord { bits: vec![] },
+                            value_variables: BddWord { bits: vec![] },
                         });
                         *next_read_id += 1;
                     }
@@ -515,6 +921,7 @@ impl BddManager {
                 next_read_id += 1;
 
                 read.value.bits.reserve(read.width as usize);
+                read.value_variables.bits.reserve(read.width as usize);
             }
 
             // Get maximum read bit-width
@@ -547,7 +954,8 @@ impl BddManager {
                         bit: bit as usize,
                     });
 
-                    table[index].value.bits.push(function);
+                    table[index].value.bits.push(function.clone());
+                    table[index].value_variables.bits.push(function);
                 }
             }
         }
@@ -661,12 +1069,192 @@ impl BddManager {
         return true;
     }
 
+    /// Builds the memory constraint
+    /// Which equals And_(i<j)(Ai == Aj => Vi == Vj)
+    fn build_memory_constraint(&mut self) {
+        let mut constraint = self.true_fn.clone();
+
+        // Create a combined array of all memory reads
+        let memory_reads: Vec<&MemoryRead> = self.left_memory_read_table
+            .iter()
+            .chain(&self.right_memory_read_table)
+            .collect();
+
+        for i in 0..memory_reads.len() {
+            for j in 0..i {
+                let left_addr = memory_reads[i]
+                    .lowered_address
+                    .clone()
+                    .expect("Memory read address should be lowered before building constraints");
+                let right_addr = memory_reads[j]
+                    .lowered_address
+                    .clone()
+                    .expect("Memory read address should be lowered before building constraints");
+
+                let addresses_equal = self
+                    .lower_equal(left_addr, right_addr)
+                    .expect("Failed to compare memory read addresses")
+                    .bits
+                    .pop()
+                    .expect("Equality comparison should produce one bit");
+                let values_equal = self
+                    .all_true(
+                        &memory_reads[i]
+                            .value_variables
+                            .bits
+                            .iter()
+                            .zip(&memory_reads[j].value_variables.bits)
+                            .map(|(left_bit, right_bit)| {
+                                left_bit
+                                    .equiv(right_bit)
+                                    .expect("Failed to compare memory read value bits")
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("Failed to compare memory read values");
+                let implication = addresses_equal
+                    .not()
+                    .expect("Failed to negate memory address equality")
+                    .or(&values_equal)
+                    .expect("Failed to build memory read implication");
+                constraint = constraint
+                    .and(&implication)
+                    .expect("Failed to update memory constraint");
+            }
+        }
+
+        self.constraint = constraint;
+    }
+
+    fn word_difference(
+        lhs: &BddWord,
+        rhs: &BddWord,
+        bdd_false: &BCDDFunction,
+    ) -> AllocResult<BCDDFunction> {
+        assert_eq!(lhs.bits.len(), rhs.bits.len());
+
+        let mut different = bdd_false.clone();
+
+        for (lhs_bit, rhs_bit) in lhs.bits.iter().zip(&rhs.bits) {
+            let bit_different = lhs_bit.xor(rhs_bit)?;
+            different = different.or(&bit_different)?;
+        }
+
+        Ok(different)
+    }
+
+    fn lower_left_and_right(&mut self) -> (BddWord, BddWord) {
+        if self.left.is_none() {
+            self.left = Some(self.lower_expression(&self.left_expr, LEFT_EXPR));
+        }
+        if self.right.is_none() {
+            self.right = Some(self.lower_expression(&self.right_expr, RIGHT_EXPR));
+        }
+
+        (
+            self.left
+                .clone()
+                .expect("Left expression should be lowered"),
+            self.right
+                .clone()
+                .expect("Right expression should be lowered"),
+        )
+    }
+
+    fn cube_bit(cube: &[OptBool], variable_index: usize) -> bool {
+        matches!(cube.get(variable_index), Some(OptBool::True))
+    }
+
+    fn cube_assignment(cube: &[OptBool]) -> Vec<(u32, bool)> {
+        cube.iter()
+            .enumerate()
+            .map(|(index, value)| (index as u32, matches!(value, OptBool::True)))
+            .collect()
+    }
+
+    fn evaluate_bdd_word_under_cube(word: &BddWord, assignment: &[(u32, bool)]) -> u128 {
+        word.bits
+            .iter()
+            .enumerate()
+            .map(|(bit, function)| {
+                if function.eval(assignment.iter().copied()) {
+                    1u128 << bit
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    pub fn counterexample_state_from_cube(&self, cube: &[OptBool]) -> MachineState {
+        let mut state = MachineState::default();
+
+        for (index, (description, _)) in self.variables.iter().enumerate() {
+            let VariableDescription::RegisterBit { register, bit } = description else {
+                continue;
+            };
+
+            let entry = state
+                .registers
+                .entry(register.identifier as u128)
+                .or_insert_with(|| BitWord::new(0, register.width as u16));
+            assert_eq!(
+                entry.width, register.width as u16,
+                "Register variable descriptions should agree on register width"
+            );
+            if Self::cube_bit(cube, index) {
+                entry.value |= 1u128 << *bit as u32;
+            }
+        }
+
+        let assignment = Self::cube_assignment(cube);
+        for read in self
+            .left_memory_read_table
+            .iter()
+            .chain(&self.right_memory_read_table)
+        {
+            let Some(address) = &read.lowered_address else {
+                continue;
+            };
+            let address = Self::evaluate_bdd_word_under_cube(address, &assignment);
+            let value = Self::evaluate_bdd_word_under_cube(&read.value_variables, &assignment);
+            state
+                .memory
+                .insert((address, read.width), BitWord::new(value, read.width));
+        }
+
+        state
+    }
+
     /// Compares the equality of the left and right expressions using a BDD
-    fn compare(&mut self) -> bool {
+    /// Returns a counterexample if they are not equal
+    pub fn compare(&mut self) -> AllocResult<BddEquality> {
+        let (left, right) = self.lower_left_and_right();
+
+        // Lower the memory of both expressions
+        // This function call is cheap if LEFT_EXPR has already been lowered
         self.lower_memory(LEFT_EXPR);
         self.lower_memory(RIGHT_EXPR);
 
-        true
+        // Now, we need to build the memory constraint
+        self.build_memory_constraint();
+
+        // Returns whether there is a difference bitwise between the left and right word
+        let difference = Self::word_difference(&left, &right, &self.false_fn)?;
+
+        // Now, by anding this difference function with the constraint function,
+        // we get a function which is high for any counter example inputs (ie machine states where the Expr doesn't match)
+        let counterexamples = self.constraint.and(&difference)?;
+
+        // If counterexamples is UNSAT, it is always 0 and so there is never
+        // a difference between left and right for any valid input
+        if !counterexamples.satisfiable() {
+            Ok(BddEquality::Equal)
+        } else {
+            // Now we want to return a specific counterexample
+            let cube = counterexamples.pick_cube(|_, _, _| false).expect("Function is satisfiable, so a counterexample should exist");
+            Ok(BddEquality::Unequal(self.counterexample_state_from_cube(&cube)))
+        }
     }
 
     /// Lowers an expression
@@ -1710,8 +2298,8 @@ mod tests {
         instruction_semantics::{
             Register, add_carry_out, add_overflow, and_expr, arithmetic_shift_right, bool_const,
             count_ones, equal, fixed_register, logical_shift_right, mul, not_expr, read_memory,
-            read_register, rotate_right, shift_left, sign_extend, signed_less_than,
-            unsigned_less_than, zero_extend,
+            read_register, rotate_right, shift_left, sign_extend, signed_less_than, sub,
+            sub_carry_out, sub_overflow, unsigned_less_than, xor_expr, zero_extend,
         },
         isa_specification::{InstructionForm, StackDirection, StackPointer},
     };
@@ -1890,6 +2478,941 @@ mod tests {
             .sum()
     }
 
+    fn bdd_compare_test_isa(width: u8) -> ISA {
+        test_isa(
+            vec![
+                test_arch_register(0, 8, width),
+                test_arch_register(1, 8, width),
+                test_arch_register(2, 8, width),
+            ],
+            vec![],
+        )
+    }
+
+    fn equivalence_test_isa(width: u8, instructions: Vec<Instruction>) -> ISA {
+        test_isa(
+            (0u8..8)
+                .map(|identifier| test_arch_register(identifier, 8, width))
+                .collect(),
+            instructions,
+        )
+    }
+
+    fn decoded_sequence(names: &[&str]) -> Vec<DecodedInstruction> {
+        names.iter().map(|name| decoded(name)).collect()
+    }
+
+    fn assert_bdd_compare_equal(left: Expr, right: Expr, isa: &ISA) {
+        let mut manager = BddManager::from_exprs(left.canonicalize(), right.canonicalize(), isa);
+
+        assert_eq!(manager.compare().expect("compare should allocate"), BddEquality::Equal);
+    }
+
+    fn assert_bdd_compare_unequal_counterexample(left: Expr, right: Expr, isa: &ISA) {
+        let left = left.canonicalize();
+        let right = right.canonicalize();
+        let mut manager = BddManager::from_exprs(left.clone(), right.clone(), isa);
+
+        let result = manager.compare().expect("compare should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("expected expressions to be unequal");
+        };
+
+        let left_value =
+            evaluate_expr(&left, &state).expect("counterexample should evaluate left expr");
+        let right_value =
+            evaluate_expr(&right, &state).expect("counterexample should evaluate right expr");
+        assert_eq!(
+            left_value.width, right_value.width,
+            "counterexample sides should have matching widths"
+        );
+        assert_ne!(
+            left_value.value, right_value.value,
+            "returned state should be an actual counterexample"
+        );
+    }
+
+    #[test]
+    fn effect_canonicalize_normalizes_destinations_guards_and_values() {
+        let guard = or_expr(read_register(reg(1), 1), bool_const(false));
+        let address = add(constant(1, 8), reg(0));
+        let value = xor_expr(read_register(reg(2), 8), constant(0, 8));
+
+        assert_eq!(
+            Effect::write_memory_if(guard.clone(), address.clone(), value.clone(), 8)
+                .canonicalize(),
+            Effect::write_memory_if(
+                guard.canonicalize(),
+                address.canonicalize(),
+                value.canonicalize(),
+                8,
+            )
+        );
+
+        let register = add(reg(3), constant(0, 8));
+        let register_value = add(read_register(reg(4), 8), constant(0, 8));
+        assert_eq!(
+            Effect::write_register(register.clone(), register_value.clone()).canonicalize(),
+            Effect::write_register(register.canonicalize(), register_value.canonicalize())
+        );
+    }
+
+    #[test]
+    fn compare_reports_equal_for_equivalent_expression_identities() {
+        let isa = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let y = read_register(reg(1), 4);
+
+        assert_bdd_compare_equal(
+            add(x.clone(), constant(0, 4)),
+            x.clone(),
+            &isa,
+        );
+        assert_bdd_compare_equal(
+            mul(x.clone(), constant(1, 4)),
+            x.clone(),
+            &isa,
+        );
+        assert_bdd_compare_equal(
+            add(x.clone(), y.clone()),
+            add(y.clone(), x.clone()),
+            &isa,
+        );
+        assert_bdd_compare_equal(
+            zero_extend(extract(x.clone(), 2, 0), 4),
+            and_expr(x, constant(0b0111, 4)),
+            &isa,
+        );
+    }
+
+    #[test]
+    fn compare_reports_unequal_and_returns_real_counterexamples() {
+        let isa = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let y = read_register(reg(1), 4);
+
+        assert_bdd_compare_unequal_counterexample(
+            and_expr(x.clone(), constant(0b1110, 4)),
+            x.clone(),
+            &isa,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            logical_shift_right(shift_left(x.clone(), constant(1, 4)), constant(1, 4)),
+            x.clone(),
+            &isa,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            unsigned_less_than(x.clone(), y.clone()),
+            signed_less_than(x.clone(), y.clone()),
+            &isa,
+        );
+    }
+
+    #[test]
+    fn compare_counterexamples_work_for_expressions_equal_on_many_values() {
+        let isa = bdd_compare_test_isa(8);
+        let x = read_register(reg(0), 8);
+        let memory = read_memory(x.clone(), 8);
+
+        assert_bdd_compare_unequal_counterexample(
+            and_expr(memory.clone(), constant(0xfe, 8)),
+            memory,
+            &isa,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            zero_extend(extract(x.clone(), 6, 0), 8),
+            x,
+            &isa,
+        );
+    }
+
+    #[test]
+    fn compare_covers_canonicalized_expr_forms() {
+        let isa = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let y = read_register(reg(1), 4);
+        let z = read_register(reg(2), 4);
+        let memory_at_x = read_memory(x.clone(), 4);
+
+        let cases = vec![
+            ("const", constant(0b1010, 4), constant(0b1010, 4)),
+            ("fixed-register operand", reg(2), constant(2, 8)),
+            ("read-register", x.clone(), add(x.clone(), constant(0, 4))),
+            ("read-memory", memory_at_x.clone(), add(memory_at_x.clone(), constant(0, 4))),
+            ("add", add(x.clone(), y.clone()), add(y.clone(), x.clone())),
+            ("sub", sub(x.clone(), constant(0, 4)), x.clone()),
+            ("mul", mul(x.clone(), constant(1, 4)), x.clone()),
+            ("and", and_expr(x.clone(), constant(0b1111, 4)), x.clone()),
+            ("or", or_expr(x.clone(), constant(0, 4)), x.clone()),
+            ("xor", xor_expr(x.clone(), constant(0, 4)), x.clone()),
+            ("not", not_expr(not_expr(x.clone())), x.clone()),
+            ("shift-left", shift_left(x.clone(), constant(0, 4)), x.clone()),
+            ("logical-shift-right", logical_shift_right(x.clone(), constant(0, 4)), x.clone()),
+            (
+                "arithmetic-shift-right",
+                arithmetic_shift_right(x.clone(), constant(0, 4)),
+                x.clone(),
+            ),
+            ("rotate-right", rotate_right(x.clone(), constant(0, 4)), x.clone()),
+            ("equal", equal(x.clone(), x.clone()), bool_const(true)),
+            (
+                "unsigned-less-than",
+                unsigned_less_than(x.clone(), x.clone()),
+                bool_const(false),
+            ),
+            (
+                "signed-less-than",
+                signed_less_than(x.clone(), x.clone()),
+                bool_const(false),
+            ),
+            ("extract", extract(x.clone(), 3, 0), x.clone()),
+            (
+                "concat",
+                concat([extract(x.clone(), 3, 2), extract(x.clone(), 1, 0)]),
+                x.clone(),
+            ),
+            (
+                "zero-extend",
+                zero_extend(x.clone(), 8),
+                concat([constant(0, 4), x.clone()]),
+            ),
+            ("sign-extend", sign_extend(x.clone(), 8), sign_extend(x.clone(), 8)),
+            ("count-ones", count_ones(x.clone()), count_ones(x.clone())),
+            (
+                "add-carry-out",
+                add_carry_out(x.clone(), y.clone(), bool_const(false), 4),
+                add_carry_out(y.clone(), x.clone(), bool_const(false), 4),
+            ),
+            (
+                "add-overflow",
+                add_overflow(x.clone(), y.clone(), bool_const(false), 4),
+                add_overflow(y.clone(), x.clone(), bool_const(false), 4),
+            ),
+            (
+                "sub-carry-out",
+                sub_carry_out(x.clone(), y.clone(), bool_const(false), 4),
+                sub_carry_out(x.clone(), y.clone(), bool_const(false), 4),
+            ),
+            (
+                "sub-overflow",
+                sub_overflow(x.clone(), y.clone(), bool_const(false), 4),
+                sub_overflow(x.clone(), y.clone(), bool_const(false), 4),
+            ),
+            (
+                "select",
+                select(bool_const(true), x.clone(), y.clone()),
+                x.clone(),
+            ),
+            (
+                "nested primitive mix",
+                add(
+                    and_expr(read_memory(add(x.clone(), y.clone()), 4), not_expr(z.clone())),
+                    count_ones(or_expr(x.clone(), y.clone())),
+                ),
+                add(
+                    count_ones(or_expr(y.clone(), x.clone())),
+                    and_expr(read_memory(add(y.clone(), x.clone()), 4), not_expr(z.clone())),
+                ),
+            ),
+        ];
+
+        for (name, left, right) in cases {
+            let mut manager =
+                BddManager::from_exprs(left.canonicalize(), right.canonicalize(), &isa);
+
+            assert_eq!(
+                manager.compare().expect("compare should allocate"),
+                BddEquality::Equal,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_covers_multiply_and_manual_bit_level_arithmetic() {
+        let isa_4 = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let y = read_register(reg(1), 4);
+
+        assert_bdd_compare_equal(
+            mul(add(x.clone(), constant(1, 4)), y.clone()),
+            mul(y.clone(), add(x.clone(), constant(1, 4))),
+            &isa_4,
+        );
+        assert_bdd_compare_equal(
+            mul(x.clone(), constant(2, 4)),
+            shift_left(x.clone(), constant(1, 4)),
+            &isa_4,
+        );
+        assert_bdd_compare_equal(
+            mul(x.clone(), constant(3, 4)),
+            add(shift_left(x.clone(), constant(1, 4)), x.clone()),
+            &isa_4,
+        );
+        assert_bdd_compare_equal(
+            mul(x.clone(), constant(5, 4)),
+            add(shift_left(x.clone(), constant(2, 4)), x.clone()),
+            &isa_4,
+        );
+        assert_bdd_compare_equal(
+            mul(add(x.clone(), y.clone()), constant(2, 4)),
+            shift_left(add(y.clone(), x.clone()), constant(1, 4)),
+            &isa_4,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            mul(x.clone(), constant(3, 4)),
+            shift_left(x.clone(), constant(1, 4)),
+            &isa_4,
+        );
+
+        let isa_2 = bdd_compare_test_isa(2);
+        let a = read_register(reg(0), 2);
+        let b = read_register(reg(1), 2);
+        let a0 = extract(a.clone(), 0, 0);
+        let a1 = extract(a.clone(), 1, 1);
+        let b0 = extract(b.clone(), 0, 0);
+        let b1 = extract(b.clone(), 1, 1);
+        let low_sum = xor_expr(a0.clone(), b0.clone());
+        let carry = and_expr(a0, b0);
+        let high_sum = xor_expr(xor_expr(a1, b1), carry);
+        let manual_adder = concat([high_sum, low_sum]);
+
+        assert_bdd_compare_equal(add(a.clone(), b.clone()), manual_adder, &isa_2);
+    }
+
+    #[test]
+    fn compare_complex_nested_expressions_return_real_counterexamples() {
+        let isa = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let y = read_register(reg(1), 4);
+        let memory_at_sum = read_memory(add(x.clone(), y.clone()), 4);
+
+        assert_bdd_compare_unequal_counterexample(
+            count_ones(and_expr(memory_at_sum.clone(), not_expr(x.clone()))),
+            count_ones(and_expr(memory_at_sum.clone(), x.clone())),
+            &isa,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            rotate_right(add(shift_left(x.clone(), constant(1, 4)), y.clone()), constant(1, 4)),
+            logical_shift_right(
+                add(shift_left(x.clone(), constant(1, 4)), y.clone()),
+                constant(1, 4),
+            ),
+            &isa,
+        );
+        assert_bdd_compare_unequal_counterexample(
+            select(
+                equal(extract(x.clone(), 0, 0), constant(0, 1)),
+                y.clone(),
+                x.clone(),
+            ),
+            y,
+            &isa,
+        );
+    }
+
+    #[test]
+    fn compare_replacement_of_right_expr_updates_equality_result() {
+        let isa = bdd_compare_test_isa(4);
+        let x = read_register(reg(0), 4);
+        let equivalent = add(x.clone(), constant(0, 4)).canonicalize();
+        let unequal = and_expr(x.clone(), constant(0b1110, 4)).canonicalize();
+
+        let mut manager = BddManager::from_exprs(x.clone().canonicalize(), equivalent, &isa);
+        assert_eq!(
+            manager.compare().expect("initial compare should allocate"),
+            BddEquality::Equal
+        );
+
+        manager.replace_right_expr(unequal.clone());
+        let BddEquality::Unequal(state) = manager
+            .compare()
+            .expect("replacement compare should allocate")
+        else {
+            panic!("replacement should make expressions unequal");
+        };
+        let left_value =
+            evaluate_expr(&x.clone().canonicalize(), &state).expect("counterexample should evaluate left");
+        let right_value =
+            evaluate_expr(&unequal, &state).expect("counterexample should evaluate right");
+        assert_ne!(left_value.value, right_value.value);
+
+        manager.replace_right_expr(x.clone().canonicalize());
+        assert_eq!(
+            manager.compare().expect("final compare should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_compares_equivalent_register_sequences() {
+        let r0 = read_register(reg(0), 4);
+        let r1 = read_register(reg(1), 4);
+        let r2 = read_register(reg(2), 4);
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "SUM_R0_R1_R2",
+                    vec![Effect::write_register(
+                        reg(0),
+                        add(r1.clone(), r2.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "SUM_R0_R2_R1",
+                    vec![Effect::write_register(
+                        reg(0),
+                        add(r2.clone(), r1.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "TRIPLE_R3_R0_WITH_MUL",
+                    vec![Effect::write_register(
+                        reg(3),
+                        mul(r0.clone(), constant(3, 4)),
+                    )],
+                ),
+                isa_instruction(
+                    "TRIPLE_R3_R0_WITH_SHIFT_ADD",
+                    vec![Effect::write_register(
+                        reg(3),
+                        add(shift_left(r0.clone(), constant(1, 4)), r0),
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
+        let right = decoded_sequence(&["SUM_R0_R2_R1", "TRIPLE_R3_R0_WITH_SHIFT_ADD"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("instruction comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_returns_counterexample_for_different_register_sequence() {
+        let r0 = read_register(reg(0), 4);
+        let r1 = read_register(reg(1), 4);
+        let r2 = read_register(reg(2), 4);
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "SUM_R0_R1_R2",
+                    vec![Effect::write_register(
+                        reg(0),
+                        add(r1.clone(), r2.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "TRIPLE_R3_R0_WITH_MUL",
+                    vec![Effect::write_register(
+                        reg(3),
+                        mul(r0.clone(), constant(3, 4)),
+                    )],
+                ),
+                isa_instruction(
+                    "DOUBLE_R3_R0_WITH_SHIFT",
+                    vec![Effect::write_register(
+                        reg(3),
+                        shift_left(r0, constant(1, 4)),
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
+        let right = decoded_sequence(&["SUM_R0_R1_R2", "DOUBLE_R3_R0_WITH_SHIFT"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+
+        let result = manager
+            .compare_instructions()
+            .expect("instruction comparison should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("different instruction sequence should produce a counterexample");
+        };
+        assert!(
+            !state.registers.is_empty(),
+            "counterexample should include the register state that separates the sequences"
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_compares_guarded_write_to_explicit_select() {
+        let r0 = read_register(reg(0), 4);
+        let r1 = read_register(reg(1), 4);
+        let r2 = read_register(reg(2), 4);
+        let guard = unsigned_less_than(r1, r2);
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "GUARDED_WRITE_R0",
+                    vec![Effect::write_register_if(
+                        guard.clone(),
+                        reg(0),
+                        constant(0b1010, 4),
+                    )],
+                ),
+                isa_instruction(
+                    "EXPLICIT_SELECT_WRITE_R0",
+                    vec![Effect::write_register(
+                        reg(0),
+                        select(guard, constant(0b1010, 4), r0),
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["GUARDED_WRITE_R0"]);
+        let right = decoded_sequence(&["EXPLICIT_SELECT_WRITE_R0"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("instruction comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_matches_canonicalized_effect_destinations() {
+        let r1 = read_register(reg(1), 8);
+        let base = constant(0x20, 8);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "LEFT_CANONICAL_DESTINATIONS",
+                    vec![
+                        Effect::write_register(add(reg(0), constant(0, 8)), r1.clone()),
+                        Effect::write_memory(
+                            add(constant(1, 8), base.clone()),
+                            xor_expr(r1.clone(), constant(0, 8)),
+                            8,
+                        ),
+                    ],
+                ),
+                isa_instruction(
+                    "RIGHT_CANONICAL_DESTINATIONS",
+                    vec![
+                        Effect::write_register(reg(0), add(r1.clone(), constant(0, 8))),
+                        Effect::write_memory(add(base, constant(1, 8)), r1, 8),
+                    ],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["LEFT_CANONICAL_DESTINATIONS"]);
+        let right = decoded_sequence(&["RIGHT_CANONICAL_DESTINATIONS"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("canonicalized destination comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_from_left_then_replace_right_register_sequences() {
+        let r0 = read_register(reg(0), 4);
+        let r1 = read_register(reg(1), 4);
+        let r2 = read_register(reg(2), 4);
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "SUM_R0_R1_R2",
+                    vec![Effect::write_register(
+                        reg(0),
+                        add(r1.clone(), r2.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "SUM_R0_R2_R1",
+                    vec![Effect::write_register(reg(0), add(r2, r1))],
+                ),
+                isa_instruction(
+                    "TRIPLE_R3_R0_WITH_MUL",
+                    vec![Effect::write_register(
+                        reg(3),
+                        mul(r0.clone(), constant(3, 4)),
+                    )],
+                ),
+                isa_instruction(
+                    "TRIPLE_R3_R0_WITH_SHIFT_ADD",
+                    vec![Effect::write_register(
+                        reg(3),
+                        add(shift_left(r0.clone(), constant(1, 4)), r0.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "DOUBLE_R3_R0_WITH_SHIFT",
+                    vec![Effect::write_register(
+                        reg(3),
+                        shift_left(r0, constant(1, 4)),
+                    )],
+                ),
+            ],
+        );
+        let original = decoded_sequence(&["SUM_R0_R1_R2", "TRIPLE_R3_R0_WITH_MUL"]);
+        let equivalent = decoded_sequence(&["SUM_R0_R2_R1", "TRIPLE_R3_R0_WITH_SHIFT_ADD"]);
+        let different = decoded_sequence(&["SUM_R0_R1_R2", "DOUBLE_R3_R0_WITH_SHIFT"]);
+        let mut manager = EquivalenceManager::from_left_instruction(&original, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("initial instruction comparison should allocate"),
+            BddEquality::Equal
+        );
+
+        manager.replace_right_instruction(&equivalent);
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("equivalent replacement should allocate"),
+            BddEquality::Equal
+        );
+
+        manager.replace_right_instruction(&different);
+        assert!(
+            matches!(
+                manager
+                    .compare_instructions()
+                    .expect("different replacement should allocate"),
+                BddEquality::Unequal(_)
+            ),
+            "different replacement should make the instruction sequences unequal"
+        );
+
+        manager.replace_right_instruction(&original);
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("restored replacement should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Right instruction sequence is missing effect writing")]
+    fn equivalence_manager_from_instructions_rejects_missing_right_effect() {
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "WRITE_R0_AND_R3",
+                    vec![
+                        Effect::write_register(reg(0), constant(1, 4)),
+                        Effect::write_register(reg(3), constant(2, 4)),
+                    ],
+                ),
+                isa_instruction(
+                    "WRITE_ONLY_R0",
+                    vec![Effect::write_register(reg(0), constant(1, 4))],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["WRITE_R0_AND_R3"]);
+        let right = decoded_sequence(&["WRITE_ONLY_R0"]);
+
+        let _ = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+    }
+
+    #[test]
+    #[should_panic(expected = "Right instruction sequence is missing effect writing")]
+    fn equivalence_manager_replace_right_instruction_rejects_missing_left_effect() {
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "STORE_A",
+                    vec![Effect::write_memory(constant(0x20, 8), constant(0xa5, 8), 8)],
+                ),
+                isa_instruction(
+                    "STORE_B",
+                    vec![Effect::write_memory(constant(0x30, 8), constant(0x5a, 8), 8)],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["STORE_A"]);
+        let missing_left_effect = decoded_sequence(&["STORE_B"]);
+        let mut manager = EquivalenceManager::from_left_instruction(&left, vec![], &isa);
+
+        manager.replace_right_instruction(&missing_left_effect);
+    }
+
+    #[test]
+    fn equivalence_manager_compares_lowered_memory_write_sequences() {
+        let address = constant(0x20, 8);
+        let value = constant(0xbeef, 16);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "STORE16",
+                    vec![Effect::write_memory(address.clone(), value.clone(), 16)],
+                ),
+                isa_instruction(
+                    "STORE16_LOW_BYTE",
+                    vec![Effect::write_memory(
+                        address.clone(),
+                        extract(value.clone(), 7, 0),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE16_HIGH_BYTE",
+                    vec![Effect::write_memory(
+                        add(address.clone(), constant(1, 8)),
+                        extract(value, 15, 8),
+                        8,
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["STORE16"]);
+        let right = decoded_sequence(&["STORE16_LOW_BYTE", "STORE16_HIGH_BYTE"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("memory instruction comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn equivalence_manager_replace_right_instruction_allows_extra_memory_effect_changes() {
+        let address_a = constant(0x20, 8);
+        let address_b = constant(0x30, 8);
+        let address_c = constant(0x40, 8);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "STORE_A",
+                    vec![Effect::write_memory(
+                        address_a.clone(),
+                        constant(0xa5, 8),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE_B",
+                    vec![Effect::write_memory(
+                        address_b.clone(),
+                        constant(0x5a, 8),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "STORE_C",
+                    vec![Effect::write_memory(
+                        address_c.clone(),
+                        constant(0xc3, 8),
+                        8,
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["STORE_A"]);
+        let right_with_b = decoded_sequence(&["STORE_A", "STORE_B"]);
+        let right_with_c = decoded_sequence(&["STORE_A", "STORE_C"]);
+        let mut manager = EquivalenceManager::from_instructions(&left, &right_with_b, vec![], &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("initial memory comparison should allocate"),
+            BddEquality::Equal
+        );
+
+        manager.replace_right_instruction(&right_with_c);
+        assert!(
+            manager.right_effects.iter().any(|effect| {
+                matches!(effect, Effect::WriteMemory { address, .. } if *address == address_c)
+            }),
+            "replacement should install the new extra right-side memory effect"
+        );
+        assert!(
+            !manager.right_effects.iter().any(|effect| {
+                matches!(effect, Effect::WriteMemory { address, .. } if *address == address_b)
+            }),
+            "replacement should remove the old extra right-side memory effect"
+        );
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("memory replacement comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_uses_registers_memory_and_bitvector_operations() {
+        let mut state = MachineState::default();
+        state.registers.insert(1, BitWord::new(0x0f, 8));
+        state.memory.insert((0x20, 8), BitWord::new(0xf0, 8));
+
+        let expr = Expr::Xor(
+            Box::new(read_register(reg(1), 8)),
+            Box::new(read_memory(constant(0x20, 8), 8)),
+        );
+
+        assert_eq!(evaluate_expr(&expr, &state), Some(BitWord::new(0xff, 8)));
+
+        let selected = select(
+            equal(read_register(reg(1), 8), constant(0x0f, 8)),
+            constant(0x12, 8),
+            constant(0x34, 8),
+        );
+        assert_eq!(
+            evaluate_expr(&selected, &state),
+            Some(BitWord::new(0x12, 8))
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_returns_none_for_missing_state() {
+        let state = MachineState::default();
+
+        assert_eq!(evaluate_expr(&read_register(reg(1), 8), &state), None);
+        assert_eq!(
+            evaluate_expr(&read_memory(constant(0x20, 8), 8), &state),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_returns_counterexample_state_that_evaluates_expressions() {
+        let mut manager = BddManager::from_exprs(
+            read_register(reg(0), 1),
+            constant(0, 1),
+            &test_isa(vec![test_arch_register(0, 8, 1)], vec![]),
+        );
+
+        let result = manager.compare().expect("compare should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("expected a counterexample");
+        };
+
+        assert_eq!(
+            evaluate_expr(&read_register(reg(0), 1), &state),
+            Some(BitWord::new(1, 1))
+        );
+        assert_eq!(evaluate_expr(&constant(0, 1), &state), Some(BitWord::new(0, 1)));
+    }
+
+    #[test]
+    fn compare_counterexample_state_includes_memory_reads() {
+        let memory_read = read_memory(constant(0x40, 8), 8);
+        let mut manager =
+            BddManager::from_exprs(memory_read.clone(), constant(0, 8), &bdd_test_isa());
+
+        let result = manager.compare().expect("compare should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("expected a counterexample");
+        };
+
+        let read_value = evaluate_expr(&memory_read, &state)
+            .expect("counterexample should include the memory read value");
+        assert_ne!(read_value.value, 0);
+        assert_eq!(read_value.width, 8);
+    }
+
+    #[test]
+    fn compare_counterexample_handles_register_addressed_memory_and_shared_register_read() {
+        let address = add(read_register(reg(0), 8), read_register(reg(1), 8));
+        let expr = Expr::Xor(
+            Box::new(read_memory(address.clone(), 8)),
+            Box::new(read_register(reg(0), 8)),
+        )
+        .canonicalize();
+        let mut manager = BddManager::from_exprs(
+            expr.clone(),
+            constant(0, 8),
+            &test_isa(
+                vec![test_arch_register(0, 8, 8), test_arch_register(1, 8, 8)],
+                vec![],
+            ),
+        );
+
+        let result = manager.compare().expect("compare should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("expected a counterexample");
+        };
+
+        let address_value = evaluate_expr(&address, &state)
+            .expect("counterexample should include address registers");
+        assert!(
+            state.memory.contains_key(&(address_value.value, 8)),
+            "counterexample should include memory at the register-computed address"
+        );
+        let expr_value = evaluate_expr(&expr, &state)
+            .expect("counterexample should evaluate the register-addressed memory expression");
+        assert_ne!(expr_value.value, 0);
+        assert_eq!(expr_value.width, 8);
+    }
+
+    #[test]
+    fn compare_counterexample_handles_memory_indexed_register_and_shared_memory_read() {
+        let selector = read_memory(constant(0x20, 8), 1);
+        let indexed_register = read_register(selector.clone(), 8);
+        let expr = Expr::Xor(
+            Box::new(indexed_register.clone()),
+            Box::new(zero_extend(selector.clone(), 8)),
+        )
+        .canonicalize();
+        let mut manager = BddManager::from_exprs(
+            expr.clone(),
+            constant(0, 8),
+            &test_isa(
+                vec![test_arch_register(0, 1, 8), test_arch_register(1, 1, 8)],
+                vec![],
+            ),
+        );
+
+        let result = manager.compare().expect("compare should allocate");
+        let BddEquality::Unequal(state) = result else {
+            panic!("expected a counterexample");
+        };
+
+        let selector_value = evaluate_expr(&selector, &state)
+            .expect("counterexample should include the memory-backed register selector");
+        assert!(selector_value.value <= 1);
+        assert!(
+            state.memory.contains_key(&(0x20, 1)),
+            "counterexample should include the shared memory selector read"
+        );
+        evaluate_expr(&indexed_register, &state)
+            .expect("counterexample should include the selected register");
+        let expr_value = evaluate_expr(&expr, &state)
+            .expect("counterexample should evaluate the memory-indexed register expression");
+        assert_ne!(expr_value.value, 0);
+        assert_eq!(expr_value.width, 8);
+    }
+
+    #[test]
+    fn compare_returns_equal_for_identical_memory_reads() {
+        let expr = read_memory(constant(0x40, 8), 8);
+        let mut manager = BddManager::from_exprs(expr.clone(), expr, &bdd_test_isa());
+
+        assert_eq!(manager.compare().expect("compare should allocate"), BddEquality::Equal);
+    }
+
     #[test]
     fn new_variable_reuses_released_slots() {
         let mut manager = bdd_manager_for_width(1);
@@ -1969,6 +3492,7 @@ mod tests {
             value: BddWord {
                 bits: vec![manager.false_fn.clone()],
             },
+            value_variables: BddWord { bits: vec![] },
         }];
 
         assert!(BddManager::function_uses_variable(
@@ -3057,6 +4581,23 @@ mod tests {
         }
 
         assert_eq!(descriptions, expected);
+
+        for read in &manager.left_memory_read_table {
+            assert_eq!(read.value.bits.len(), read.value_variables.bits.len());
+            for (bit, variable) in read.value_variables.bits.iter().enumerate() {
+                assert!(
+                    read.value.bits[bit] == *variable,
+                    "memory read bit should match its value variable"
+                );
+                assert!(
+                    manager
+                        .variables
+                        .iter()
+                        .any(|(_, manager_variable)| manager_variable == variable),
+                    "memory read bit should come from BddManager.variables"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3165,6 +4706,20 @@ mod tests {
             assert!(manager.constraint == manager.true_fn);
             assert_eq!(manager.right_expr, read_memory(constant(address, 32), 16));
             assert_eq!(manager.right_memory_read_table.len(), 1);
+            let read = &manager.right_memory_read_table[0];
+            for (bit, variable) in read.value_variables.bits.iter().enumerate() {
+                assert!(
+                    read.value.bits[bit] == *variable,
+                    "reused right memory read bit should match its value variable"
+                );
+                assert!(
+                    manager
+                        .variables
+                        .iter()
+                        .any(|(_, manager_variable)| manager_variable == variable),
+                    "reused right memory read bit should come from BddManager.variables"
+                );
+            }
         }
     }
 
