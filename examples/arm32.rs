@@ -1042,19 +1042,39 @@ pub fn set_flags() -> InstructionField {
 }
 
 pub fn rn_addr() -> InstructionField {
-    InstructionField::variable("rn_addr", 4).merge_mode_uses()
+    InstructionField::variable("rn_addr", 4)
+        .merge_mode_uses()
+        .register_read()
 }
 
 pub fn rd_addr() -> InstructionField {
-    InstructionField::variable("rd_addr", 4).merge_mode_uses()
+    InstructionField::variable("rd_addr", 4)
+        .merge_mode_uses()
+        .register_write()
 }
 
 pub fn rm_addr() -> InstructionField {
-    InstructionField::variable("rm_addr", 4).merge_mode_uses()
+    InstructionField::variable("rm_addr", 4)
+        .merge_mode_uses()
+        .register_read()
 }
 
 pub fn rs_addr() -> InstructionField {
-    InstructionField::variable("rs_addr", 4).merge_mode_uses()
+    InstructionField::variable("rs_addr", 4)
+        .merge_mode_uses()
+        .register_read()
+}
+
+pub fn rn_addr_read_write() -> InstructionField {
+    InstructionField::variable("rn_addr", 4)
+        .merge_mode_uses()
+        .register_read_write()
+}
+
+pub fn rd_addr_read_write() -> InstructionField {
+    InstructionField::variable("rd_addr", 4)
+        .merge_mode_uses()
+        .register_read_write()
 }
 
 pub fn data_proc_opcode() -> InstructionField {
@@ -1066,7 +1086,7 @@ pub fn has_imm() -> InstructionField {
 }
 
 pub fn op2_imm_shift_amt() -> InstructionField {
-    InstructionField::variable("op2_imm_shift_amt", 5)
+    InstructionField::variable("op2_imm_shift_amt", 5).immediate()
 }
 
 pub fn op2_shift_type() -> InstructionField {
@@ -1074,11 +1094,11 @@ pub fn op2_shift_type() -> InstructionField {
 }
 
 pub fn imm_ror_amt() -> InstructionField {
-    InstructionField::variable("imm_ror_amt", 4)
+    InstructionField::variable("imm_ror_amt", 4).immediate()
 }
 
 pub fn imm8() -> InstructionField {
-    InstructionField::variable("imm8", 8)
+    InstructionField::variable("imm8", 8).immediate()
 }
 
 pub fn do_mul_accum() -> InstructionField {
@@ -1090,11 +1110,15 @@ pub fn is_unsigned_mul() -> InstructionField {
 }
 
 pub fn rdhi_addr() -> InstructionField {
-    InstructionField::variable("rdhi_addr", 4).merge_mode_uses()
+    InstructionField::variable("rdhi_addr", 4)
+        .merge_mode_uses()
+        .register_read_write()
 }
 
 pub fn rdlo_addr() -> InstructionField {
-    InstructionField::variable("rdlo_addr", 4).merge_mode_uses()
+    InstructionField::variable("rdlo_addr", 4)
+        .merge_mode_uses()
+        .register_read_write()
 }
 
 pub fn is_pre_idx() -> InstructionField {
@@ -1123,11 +1147,11 @@ pub fn sh_bits() -> InstructionField {
 }
 
 pub fn imm8_high() -> InstructionField {
-    InstructionField::variable("imm8_high", 4)
+    InstructionField::variable("imm8_high", 4).immediate()
 }
 
 pub fn imm8_low() -> InstructionField {
-    InstructionField::variable("imm8_low", 4)
+    InstructionField::variable("imm8_low", 4).immediate()
 }
 
 pub fn is_byte_tfr() -> InstructionField {
@@ -1135,7 +1159,7 @@ pub fn is_byte_tfr() -> InstructionField {
 }
 
 pub fn imm12() -> InstructionField {
-    InstructionField::variable("imm12", 12)
+    InstructionField::variable("imm12", 12).immediate()
 }
 
 pub fn is_pre_idx_block() -> InstructionField {
@@ -1159,7 +1183,7 @@ pub fn is_load_block() -> InstructionField {
 }
 
 pub fn block_reglist() -> InstructionField {
-    InstructionField::variable("block_reglist", 16)
+    InstructionField::variable("block_reglist", 16).immediate()
 }
 
 pub fn do_link() -> InstructionField {
@@ -1167,7 +1191,7 @@ pub fn do_link() -> InstructionField {
 }
 
 pub fn branch_offset() -> InstructionField {
-    InstructionField::variable("branch_offset", 24)
+    InstructionField::variable("branch_offset", 24).immediate()
 }
 
 // Instruction definitions
@@ -1193,8 +1217,8 @@ pub fn data_tfr_prefix() -> Vec<InstructionField> {
         is_byte_tfr(),
         do_writeback(),
         is_load(),
-        rn_addr(),
-        rd_addr(),
+        rn_addr_read_write(),
+        rd_addr_read_write(),
     ]
 }
 
@@ -1416,8 +1440,8 @@ pub fn hwtfr_reg_offset() -> Instruction {
                         c(ENC_BIT_LOW),
                         do_writeback(),
                         is_load(),
-                        rn_addr(),
-                        rd_addr(),
+                        rn_addr_read_write(),
+                        rd_addr_read_write(),
                         c(ENC_HWTFR_REG_MARKER),
                         sh_bits(),
                         c(ENC_BIT_HIGH),
@@ -1468,8 +1492,8 @@ pub fn hwtfr_imm_offset() -> Instruction {
                         c(ENC_BIT_HIGH),
                         do_writeback(),
                         is_load(),
-                        rn_addr(),
-                        rd_addr(),
+                        rn_addr_read_write(),
+                        rd_addr_read_write(),
                         imm8_high(),
                         c(ENC_BIT_HIGH),
                         sh_bits(),
@@ -1595,7 +1619,7 @@ pub fn block_tfr() -> Instruction {
                         do_load_psr(),
                         do_writeback_block(),
                         is_load_block(),
-                        rn_addr(),
+                        rn_addr_read_write(),
                         block_reglist(),
                     ])
                     .derived_value(dv("transfer_count", block_transfer_count()))
@@ -1790,6 +1814,7 @@ fn main() {
             name,
             value,
             merge_mode,
+            ..
         } in &decoded.fields
         {
             let name = match name {

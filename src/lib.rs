@@ -2,6 +2,7 @@ use std::error::Error;
 use std::path::PathBuf;
 
 pub mod bit;
+pub mod constants;
 pub mod instruction_semantics;
 pub mod isa_specification;
 pub mod parser;

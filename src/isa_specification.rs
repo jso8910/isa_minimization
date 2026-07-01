@@ -22,6 +22,9 @@ pub struct ISA {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StackPointer {
     /// Which register is used as the stack pointer
+    /// This is assumed to point to the most recent item pushed to the stack
+    /// Even if it points to the next item on the stack for some reason, this assumption does not
+    /// lead to any errors but is merely slightly conservative.
     pub register: ArchitecturalRegister,
     /// How many bytes the symbolic solver can assume will be free above/below the current stack pointer
     /// Set to a conservative value to avoid accidental overwrites of real data.
@@ -158,6 +161,9 @@ impl Instruction {
                         bits[current_bit_index..current_bit_index + field.pattern.len()].to_vec(),
                     ),
                     merge_mode: field.merge_mode,
+                    is_immediate: field.is_immediate,
+                    is_register_read: field.is_register_read,
+                    is_register_write: field.is_register_write,
                 });
 
                 current_bit_index += field.pattern.len();
@@ -191,6 +197,9 @@ pub struct DecodedField {
     pub name: Option<String>,
     pub value: BitPattern,
     pub merge_mode: MergeMode,
+    pub is_immediate: bool,
+    pub is_register_read: bool,
+    pub is_register_write: bool,
 }
 
 impl DecodedInstruction {
@@ -304,6 +313,20 @@ impl InstructionForm {
     ) -> Vec<BitPattern> {
         let mut encodings = Vec::new();
 
+        let mut num_permutations = 1;
+        for field in self.fields.iter() {
+            let Some(name) = &field.name else { continue };
+            let Some(field_use) = field_values.get(name) else {
+                continue;
+            };
+            print!("{name}\t");
+            println!("{:?}", field_use);
+            if let FieldUses::Uses { patterns, .. } = field_use {
+                num_permutations *= patterns.len();
+            }
+        }
+        println!("{num_permutations}");
+
         // We approach this problem by walking through each field in in the instruction form
         // If a field is MergeMode::VariableBits, we don't need to expand anything
         // If it is MergeMode::Uses, and there are n uses, we need to generate n new instructions
@@ -365,6 +388,21 @@ impl InstructionForm {
                     }
                 }
                 (MergeMode::Uses, FieldUses::Uses { name: _, patterns }) => {
+                    let merged_patterns;
+                    let patterns = if field.is_register_read && !field.is_register_write {
+                        merged_patterns = FieldUses::Uses {
+                            name: field.name.clone().unwrap_or_default(),
+                            patterns: patterns.clone(),
+                        }
+                        .merge();
+                        match &merged_patterns {
+                            FieldUses::Uses { patterns, .. } => patterns,
+                            FieldUses::VariableBits { .. } => unreachable!(),
+                        }
+                    } else {
+                        patterns
+                    };
+
                     // For each pattern, append it to the current encoding and recurse
                     for pattern in patterns {
                         if let Some(constrained_pattern) = form.constrain_variable_bits(
@@ -584,6 +622,9 @@ pub struct InstructionField {
     pub name: Option<String>,
     pub pattern: BitPattern,
     pub merge_mode: MergeMode,
+    pub is_immediate: bool,
+    pub is_register_read: bool,
+    pub is_register_write: bool,
 }
 
 impl InstructionField {
@@ -592,6 +633,9 @@ impl InstructionField {
             name: Some(name.into()),
             pattern,
             merge_mode: MergeMode::VariableBits,
+            is_immediate: false,
+            is_register_read: false,
+            is_register_write: false,
         }
     }
 
@@ -600,6 +644,9 @@ impl InstructionField {
             name: None,
             pattern: BitPattern::parse(bits),
             merge_mode: MergeMode::VariableBits,
+            is_immediate: false,
+            is_register_read: false,
+            is_register_write: false,
         }
     }
 
@@ -608,6 +655,9 @@ impl InstructionField {
             name: Some(name.into()),
             pattern: BitPattern::variable(width),
             merge_mode: MergeMode::VariableBits,
+            is_immediate: false,
+            is_register_read: false,
+            is_register_write: false,
         }
     }
 
@@ -618,6 +668,27 @@ impl InstructionField {
 
     pub fn merge_mode_variable_bits(mut self) -> Self {
         self.merge_mode = MergeMode::VariableBits;
+        self
+    }
+
+    pub fn immediate(mut self) -> Self {
+        self.is_immediate = true;
+        self
+    }
+
+    pub fn register_read(mut self) -> Self {
+        self.is_register_read = true;
+        self
+    }
+
+    pub fn register_write(mut self) -> Self {
+        self.is_register_write = true;
+        self
+    }
+
+    pub fn register_read_write(mut self) -> Self {
+        self.is_register_read = true;
+        self.is_register_write = true;
         self
     }
 
@@ -739,6 +810,31 @@ mod tests {
             assert_eq!(test_decoded.fields[0].value, BitPattern::parse("0"));
             assert_eq!(test_decoded.fields[1].name, Some("field2".to_string()));
             assert_eq!(test_decoded.fields[1].value, BitPattern::parse("0"));
+        }
+
+        #[test]
+        fn decoded_fields_preserve_immediate_marker() {
+            let test =
+                Instruction::new("TEST", 6).form(InstructionForm::new("form1").fields(vec![
+                    InstructionField::constant("10"),
+                    InstructionField::variable("rd", 2).merge_mode_uses(),
+                    InstructionField::variable("imm", 2).immediate(),
+                ]));
+
+            let decoded = test
+                .find_match(&[
+                    Bit::High,
+                    Bit::Low,
+                    Bit::High,
+                    Bit::Low,
+                    Bit::Low,
+                    Bit::High,
+                ])
+                .expect("instruction should decode");
+
+            assert!(!decoded.fields[0].is_immediate);
+            assert!(!decoded.fields[1].is_immediate);
+            assert!(decoded.fields[2].is_immediate);
         }
 
         #[test]

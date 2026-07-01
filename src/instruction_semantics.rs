@@ -2052,6 +2052,47 @@ pub enum Effect {
 }
 
 impl Effect {
+    pub fn destination(&self) -> &Expr {
+        match self {
+            Self::WriteRegister { register, .. } => register,
+            Self::WriteMemory { address, .. } => address,
+        }
+    }
+
+    pub fn is_memory(&self) -> bool {
+        match self {
+            Self::WriteRegister { .. } => false,
+            Self::WriteMemory { .. } => true,
+        }
+    }
+
+    /// Normalized value, removing the guard and merging it into the value
+    pub fn normalized_value(&self) -> Expr {
+        let (value, guard, original_value) = match self {
+            Self::WriteRegister {
+                value,
+                guard,
+                register,
+                ..
+            } => (
+                value,
+                guard,
+                read_register(
+                    register.clone(),
+                    value.expr_width().expect("Register width should exist"),
+                ),
+            ),
+            Self::WriteMemory {
+                guard,
+                value,
+                address,
+                width,
+                ..
+            } => (value, guard, read_memory(address.clone(), *width)),
+        };
+        select(guard.clone(), value.clone(), original_value)
+    }
+
     pub fn canonicalize(self) -> Self {
         match self {
             Effect::WriteRegister {

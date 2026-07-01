@@ -8,17 +8,12 @@
 //      1. the original instruction read from it (eg if ReadMemory(R4 + 4) is present, you can read from there)
 //      2. the new program has already written to it
 
-// TODO multiple threads perchance? command line option
-const THREAD_COUNT: u32 = 1;
-const INNER_NODE_CAPACITY: usize = 4096;
-const APPLY_CACHE_CAPACITY: usize = 2048;
-
 const LEFT_EXPR: bool = true;
 const RIGHT_EXPR: bool = false;
 
 use std::{
-    collections::HashMap,
-    ops::{BitAnd, BitOr},
+    collections::{HashMap, HashSet},
+    ops::{BitAnd, BitOr, BitXor},
 };
 
 use oxidd::{
@@ -28,11 +23,14 @@ use oxidd::{
 };
 
 use crate::{
+    constants::*,
     instruction_semantics::{
         Effect, Expr, OperandRef, RegisterRef, add, concat, constant, extract, or_expr,
         read_memory, read_register, select,
     },
-    isa_specification::{ArchitecturalRegister, DecodedInstruction, ISA},
+    isa_specification::{
+        ArchitecturalRegister, DecodedInstruction, ISA, StackDirection, StackPointer,
+    },
 };
 
 pub type InstructionIdx = u32;
@@ -318,12 +316,250 @@ impl BitWord {
     fn bool(value: bool) -> Self {
         Self::new(value as u128, 1)
     }
+
+    pub fn population(&self) -> u32 {
+        (self.value & bit_mask(self.width)).count_ones()
+    }
+}
+
+impl BitXor for BitWord {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        debug_assert_eq!(self.width, rhs.width);
+        Self {
+            value: self.value ^ rhs.value,
+            width: self.width,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MachineState {
+    /// Register values keyed by the evaluated register identifier.
+    ///
+    /// For fixed registers this is the numeric register id; for symbolic
+    /// register expressions it is the concrete identifier produced by a
+    /// counterexample assignment.
     pub registers: HashMap<u128, BitWord>,
+    /// Memory values keyed by `(byte_address, width_in_bits)`.
+    ///
+    /// The `u128` is the concrete byte address produced by evaluating a memory
+    /// address expression. The `u16` is the access width, in bits, from the
+    /// corresponding memory read or write. Width is part of the key because the
+    /// evaluator looks up exactly the value requested by `ReadMemory`; when
+    /// callers need byte-level aliasing, they should lower wider accesses first.
     pub memory: HashMap<(u128, u16), BitWord>,
+}
+
+impl MachineState {
+    /// Compares two MachineStates and returns a cost representing their difference. Lower is
+    /// closer.
+    /// (inspired by Equations 8, 10, and 15 of Stochastic Superoptimization by Schkufza et al.)
+    /// mem(s, s1) = sum(POP(val(s, m) xor val(s1, m)))
+    ///     This equation sums the Hamming distance between each memory location, m
+    /// reg(s, s1) = sum(min R(r, r')), R = POP(val(s, r) xor val(s1, r')) + w_m * {r != r'}
+    ///     Described in section 4.6, this equation acts the same as the memory cost equation, but it
+    ///     chooses the two closest registers between the machine states to compare, rewarding an
+    ///     implementation for producing correct values in incorrect locations, before applying a
+    ///     penalty, w_m whenever the register with the lowest difference is not the same as the
+    ///     normal register.
+    ///
+    /// One difference from the paper is the behavior when there is a write in one MachineState but not the other.
+    /// In that case, all bits are considered to be different, as well as an additional penalty,
+    /// w_{extra write} being added. This gives the following final equation:
+    ///
+    /// compare(s, s1) = mem(s, s1) + reg(s, s1)
+    ///     where
+    ///         reg(s, s1) = sum(min R(r, r')), R = POP(val(s, r) xor val(s1, r')) + w_m * {r != r'}
+    ///                      + sum(width(r) + w_{extra write} for one-sided included register writes r)
+    ///         mem(s, s1) = sum(POP(val(s, m) xor val(s1, m)))
+    ///                      + sum(width(m) + w_{extra write} for one-sided included memory writes m)
+    /// To illustrate, if self writes to R0, and other writes to R1, but they write the same value,
+    /// the cost reg(self, other) = w_m + 2 * (width(R0) + w_{extra write}).
+    ///
+    /// In the calculation of the cost, not all registers and memory locations are included in the cost
+    ///     - Registers: all registers in self.registers, as well as those in protected_registers.
+    ///       Other registers are scratch, and have arbitrary values
+    ///     - Memory: all memory locations other than those within the stack indicated by the
+    ///       StackPointer, as well as those in self.memory.
+    ///
+    /// sp_val should be the value that the stack pointer had in the counterexample.
+    pub fn compare(
+        &self,
+        other: &MachineState,
+        protected_registers: &[ArchitecturalRegister],
+        sp: &StackPointer,
+        sp_val: u128,
+    ) -> u32 {
+        self.compute_memory_cost(other, sp, sp_val)
+            + self.compute_register_cost(other, protected_registers)
+    }
+
+    fn compute_memory_cost(&self, other: &MachineState, sp: &StackPointer, sp_val: u128) -> u32 {
+        let mut cost = 0;
+        for (memory_location, value) in self.memory.iter() {
+            let Some(other_value) = other.memory.get(&memory_location) else {
+                // We handle this case (missing memory write) later
+                continue;
+            };
+
+            // pop(value XOR other_value) represents the Hamming distance
+            cost += (*value ^ *other_value).population();
+        }
+
+        // Now we need to look for locations which are written to by one MachineState but not the
+        // other, in both directions.
+        let keys_only_in_self: Vec<_> = self
+            .memory
+            .keys()
+            .filter(|key| !other.memory.contains_key(*key))
+            .collect();
+
+        let keys_only_in_other: Vec<_> = other
+            .memory
+            .keys()
+            .filter(|key| {
+                !self.memory.contains_key(*key)
+                    && !memory_location_is_stack_scratch(**key, sp, sp_val)
+            })
+            .collect();
+
+        for (_, width) in keys_only_in_self.iter() {
+            cost += *width as u32;
+            cost += WEIGHT_EXTRA_WRITE;
+        }
+
+        for (_, width) in keys_only_in_other.iter() {
+            cost += *width as u32;
+            cost += WEIGHT_EXTRA_WRITE;
+        }
+
+        cost
+    }
+
+    fn compute_register_cost(
+        &self,
+        other: &MachineState,
+        protected_registers: &[ArchitecturalRegister],
+    ) -> u32 {
+        let mut cost = 0;
+        let involved_registers: HashSet<u128> = self
+            .registers
+            .keys()
+            .copied()
+            .chain(
+                protected_registers
+                    .iter()
+                    .map(|register| register.identifier as u128),
+            )
+            .collect();
+
+        for (reg, val) in self
+            .registers
+            .iter()
+            .filter(|(reg, _)| involved_registers.contains(*reg))
+        {
+            let mut lowest_cost = u32::MAX;
+            let mut lowest_cost_ident = 0;
+
+            // whether there exists another register with the same bit-width
+            let mut comparable_register_found = false;
+            for (other_reg, other_val) in other
+                .registers
+                .iter()
+                .filter(|(reg, _)| involved_registers.contains(*reg))
+            {
+                // Only compare registers with the same bit-width
+                if other_val.width != val.width {
+                    continue;
+                }
+
+                comparable_register_found = true;
+                let local_cost = (*val ^ *other_val).population();
+                if local_cost < lowest_cost {
+                    lowest_cost = local_cost;
+                    lowest_cost_ident = *other_reg;
+                }
+
+                // If the local cost equals the lowest cost, we have to make sure
+                // that, if the identifiers are the same, this is reflected
+                if local_cost == lowest_cost && other_reg == reg {
+                    lowest_cost_ident = *reg;
+                }
+            }
+
+            if !comparable_register_found {
+                lowest_cost = 0;
+                lowest_cost_ident = *reg;
+            }
+
+            cost += lowest_cost;
+
+            if lowest_cost_ident != *reg {
+                cost += WEIGHT_REGISTER_MISMATCH;
+            }
+        }
+
+        // Now, check for registers which exist on one side but not the other
+        let keys_only_in_self: Vec<_> = self
+            .registers
+            .iter()
+            .filter(|(key, _)| {
+                involved_registers.contains(*key) && !other.registers.contains_key(*key)
+            })
+            .collect();
+
+        let keys_only_in_other: Vec<_> = other
+            .registers
+            .iter()
+            .filter(|(key, _)| {
+                involved_registers.contains(*key) && !self.registers.contains_key(*key)
+            })
+            .collect();
+
+        for (_, value) in keys_only_in_self.iter() {
+            cost += value.width as u32;
+            cost += WEIGHT_EXTRA_WRITE;
+        }
+
+        for (_, value) in keys_only_in_other.iter() {
+            cost += value.width as u32;
+            cost += WEIGHT_EXTRA_WRITE;
+        }
+
+        cost
+    }
+}
+
+/// Returns whether a memory location is on the stack
+fn memory_location_is_stack_scratch(
+    (address, width): (u128, u16),
+    sp: &StackPointer,
+    sp_val: u128,
+) -> bool {
+    let byte_width = u128::from(width).div_ceil(8);
+    let Some(last_address) = address.checked_add(byte_width - 1) else {
+        return false;
+    };
+
+    match sp.direction {
+        StackDirection::Downwards => {
+            let Some(stack_start) = sp_val.checked_sub(sp.stack_size as u128) else {
+                return false;
+            };
+            address >= stack_start && last_address < sp_val
+        }
+        StackDirection::Upwards => {
+            let Some(stack_start) = sp_val.checked_add(1) else {
+                return false;
+            };
+            let Some(stack_end) = sp_val.checked_add(sp.stack_size as u128) else {
+                return false;
+            };
+            address >= stack_start && last_address <= stack_end
+        }
+    }
 }
 
 fn bit_mask(width: u16) -> u128 {
@@ -2378,6 +2614,42 @@ mod tests {
         test_isa(vec![test_arch_register(0, 1, 1)], vec![])
     }
 
+    fn machine_state(
+        registers: &[(u128, BitWord)],
+        memory: &[((u128, u16), BitWord)],
+    ) -> MachineState {
+        MachineState {
+            registers: registers.iter().copied().collect(),
+            memory: memory.iter().copied().collect(),
+        }
+    }
+
+    fn machine_state_with_optional_register_and_memory(
+        include_register: bool,
+        include_memory: bool,
+    ) -> MachineState {
+        machine_state(
+            include_register
+                .then_some((0, BitWord::new(0xab, 8)))
+                .as_slice(),
+            include_memory
+                .then_some(((0x20, 8), BitWord::new(0xcd, 8)))
+                .as_slice(),
+        )
+    }
+
+    fn compare_test_sp(direction: StackDirection) -> StackPointer {
+        StackPointer {
+            register: test_arch_register(254, 8, 32),
+            stack_size: 16,
+            direction,
+        }
+    }
+
+    fn compare_test_sp_val() -> u128 {
+        0x100
+    }
+
     fn manager_variable_count(manager: &BddManager) -> u32 {
         manager
             .manager_ref
@@ -2539,6 +2811,198 @@ mod tests {
         assert_ne!(
             left_value.value, right_value.value,
             "returned state should be an actual counterexample"
+        );
+    }
+
+    #[test]
+    fn machine_state_memory_cost_counts_hamming_distance_for_shared_writes() {
+        let left = machine_state(
+            &[],
+            &[
+                ((0x20, 8), BitWord::new(0b1010_1010, 8)),
+                ((0x40, 4), BitWord::new(0b1100, 4)),
+            ],
+        );
+        let right = machine_state(
+            &[],
+            &[
+                ((0x20, 8), BitWord::new(0b1111_0000, 8)),
+                ((0x40, 4), BitWord::new(0b0101, 4)),
+            ],
+        );
+
+        assert_eq!(
+            left.compute_memory_cost(
+                &right,
+                &compare_test_sp(StackDirection::Downwards),
+                compare_test_sp_val()
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn machine_state_memory_cost_counts_missing_write_as_all_bits_plus_penalty() {
+        let left = machine_state(&[], &[((0x20, 8), BitWord::new(0xab, 8))]);
+        let right = MachineState::default();
+
+        assert_eq!(
+            left.compute_memory_cost(
+                &right,
+                &compare_test_sp(StackDirection::Downwards),
+                compare_test_sp_val()
+            ),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+        assert_eq!(
+            right.compute_memory_cost(
+                &left,
+                &compare_test_sp(StackDirection::Downwards),
+                compare_test_sp_val()
+            ),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+    }
+
+    #[test]
+    fn machine_state_register_cost_counts_hamming_distance_for_same_register() {
+        let left = machine_state(&[(0, BitWord::new(0b1010_1010, 8))], &[]);
+        let right = machine_state(&[(0, BitWord::new(0b1111_0000, 8))], &[]);
+
+        assert_eq!(left.compute_register_cost(&right, &[]), 4);
+    }
+
+    #[test]
+    fn machine_state_register_cost_rewards_matching_value_in_different_register_with_penalties() {
+        let left = machine_state(&[(0, BitWord::new(0xab, 8))], &[]);
+        let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
+        let protected = [test_arch_register(1, 8, 8)];
+
+        assert_eq!(
+            left.compute_register_cost(&right, &protected),
+            WEIGHT_REGISTER_MISMATCH + (2 * (8 + WEIGHT_EXTRA_WRITE))
+        );
+    }
+
+    #[test]
+    fn machine_state_register_cost_counts_missing_write_as_all_bits_plus_penalty() {
+        let left = machine_state(&[(0, BitWord::new(0xab, 8))], &[]);
+        let right = MachineState::default();
+        let protected = [test_arch_register(0, 8, 8)];
+
+        assert_eq!(
+            left.compute_register_cost(&right, &[]),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+        assert_eq!(
+            right.compute_register_cost(&left, &protected),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+    }
+
+    #[test]
+    fn machine_state_register_cost_ignores_unprotected_other_scratch_registers() {
+        let left = MachineState::default();
+        let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
+
+        assert_eq!(left.compute_register_cost(&right, &[]), 0);
+    }
+
+    #[test]
+    fn machine_state_register_cost_includes_protected_other_registers() {
+        let left = MachineState::default();
+        let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
+        let protected = [test_arch_register(1, 8, 8)];
+
+        assert_eq!(
+            left.compute_register_cost(&right, &protected),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+    }
+
+    #[test]
+    fn machine_state_memory_cost_ignores_other_stack_scratch_unless_live_in_self() {
+        let stack_memory = [((0xf8, 8), BitWord::new(0xab, 8))];
+        let left = MachineState::default();
+        let right = machine_state(&[], &stack_memory);
+        let sp = compare_test_sp(StackDirection::Downwards);
+
+        assert_eq!(
+            left.compute_memory_cost(&right, &sp, compare_test_sp_val()),
+            0
+        );
+
+        let left = machine_state(&[], &stack_memory);
+        let right = MachineState::default();
+        assert_eq!(
+            left.compute_memory_cost(&right, &sp, compare_test_sp_val()),
+            8 + WEIGHT_EXTRA_WRITE
+        );
+    }
+
+    #[test]
+    fn machine_state_costs_handle_all_empty_register_and_memory_combinations() {
+        for self_has_register in [false, true] {
+            for other_has_register in [false, true] {
+                for self_has_memory in [false, true] {
+                    for other_has_memory in [false, true] {
+                        let left = machine_state_with_optional_register_and_memory(
+                            self_has_register,
+                            self_has_memory,
+                        );
+                        let right = machine_state_with_optional_register_and_memory(
+                            other_has_register,
+                            other_has_memory,
+                        );
+
+                        let expected_register_cost = match (self_has_register, other_has_register) {
+                            (false, false) | (false, true) | (true, true) => 0,
+                            (true, false) => 8 + WEIGHT_EXTRA_WRITE,
+                        };
+                        let expected_memory_cost = match (self_has_memory, other_has_memory) {
+                            (false, false) | (true, true) => 0,
+                            (true, false) | (false, true) => 8 + WEIGHT_EXTRA_WRITE,
+                        };
+
+                        assert_eq!(
+                            left.compute_register_cost(&right, &[]),
+                            expected_register_cost,
+                            "register cost for self_has_register={self_has_register}, other_has_register={other_has_register}, self_has_memory={self_has_memory}, other_has_memory={other_has_memory}",
+                        );
+                        assert_eq!(
+                            left.compute_memory_cost(
+                                &right,
+                                &compare_test_sp(StackDirection::Downwards),
+                                compare_test_sp_val()
+                            ),
+                            expected_memory_cost,
+                            "memory cost for self_has_register={self_has_register}, other_has_register={other_has_register}, self_has_memory={self_has_memory}, other_has_memory={other_has_memory}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn machine_state_compare_adds_memory_and_register_costs() {
+        let left = machine_state(
+            &[(0, BitWord::new(0b1010, 4))],
+            &[((0x20, 4), BitWord::new(0b1100, 4))],
+        );
+        let right = machine_state(
+            &[(0, BitWord::new(0b0011, 4))],
+            &[((0x20, 4), BitWord::new(0b0101, 4))],
+        );
+
+        assert_eq!(
+            left.compare(
+                &right,
+                &[],
+                &compare_test_sp(StackDirection::Downwards),
+                compare_test_sp_val()
+            ),
+            4
         );
     }
 
@@ -2836,6 +3300,40 @@ mod tests {
             y,
             &isa,
         );
+    }
+
+    #[test]
+    #[ignore = "stress test: intentionally builds an unrealistically large BDD"]
+    fn stress_constructs_unrealistically_large_symbolic_bdd() {
+        let width = 96;
+        let isa = bdd_compare_test_isa(width as u8);
+        let x = read_register(reg(0), width);
+        let y = read_register(reg(1), width);
+        let z = read_register(reg(2), width);
+        let mut expr = mul(
+            add(x.clone(), rotate_right(y.clone(), constant(13, width))),
+            add(z.clone(), constant(0x9e37, width)),
+        );
+
+        for round in 0..6 {
+            let round_constant = constant(0x1001 + round, width);
+            let mixed_xy = mul(expr, add(y.clone(), round_constant));
+            let mixed_xz = rotate_right(
+                mul(add(x.clone(), constant(round + 1, width)), z.clone()),
+                constant((round * 7 + 3) % width as u128, width),
+            );
+            expr = add(mixed_xy, mixed_xz);
+        }
+
+        let mut manager = BddManager::from_exprs(expr, constant(0, width), &isa);
+        let comparison =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| manager.compare()));
+
+        match comparison {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => panic!("BDD allocation failed during stress construction"),
+            Err(_) => panic!("BDD stress construction panicked"),
+        }
     }
 
     #[test]
@@ -5185,5 +5683,14 @@ mod tests {
         assert_eq!(combine_effects(&first, &true_second), Some(true_second));
         assert_eq!(combine_effects(&first, &false_second), Some(first.clone()));
         assert_eq!(combine_effects(&first, &different_address), None);
+    }
+    #[test]
+    #[ignore = "64 bit multiplication is too much for the BDD"]
+    fn compare_64_bit_symbolic_multiply_commutes() {
+        let isa = bdd_compare_test_isa(64);
+        let x = read_register(reg(0), 64);
+        let y = read_register(reg(1), 64);
+
+        assert_bdd_compare_equal(mul(x.clone(), y.clone()), mul(y, x), &isa);
     }
 }

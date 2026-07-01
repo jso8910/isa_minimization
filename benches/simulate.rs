@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::{HashMap, HashSet};
 
-use isa_minimization::{bit::Bit, parser::Expr, simulator::Simulator};
+use isa_minimization::{bit::Bit, simulator::Simulator};
 
 fn make_input() -> HashMap<String, Bit> {
     let mut bit_input = HashMap::new();
