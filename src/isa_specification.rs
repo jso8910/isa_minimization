@@ -454,7 +454,7 @@ impl InstructionForm {
     /// * `pattern` - the BitPattern to elaborate.
     /// * `pattern_idx` - the starting index of the pattern in the overall instruction encoding (used for checking BitEq predicates)
     /// * `field_name` - the name of the field corresponding to this pattern (used for checking FieldEq and FieldIn predicates)
-    fn constrain_variable_bits(
+    pub fn constrain_variable_bits(
         &self,
         pattern: &BitPattern,
         pattern_idx: usize,
@@ -914,6 +914,30 @@ mod tests {
 
     mod fields_to_encodings {
         use super::*;
+
+        #[test]
+        fn constrain_variable_bits_applies_field_and_bit_eq_predicates() {
+            let form = InstructionForm::new("form1")
+                .field(InstructionField::variable("field1", 3))
+                .when(and(vec![field_eq("field1", "1x0"), bit_eq(1, Bit::High)]));
+
+            assert_eq!(
+                form.constrain_variable_bits(&BitPattern::parse("xxx"), 0, "field1"),
+                Some(BitPattern::parse("110"))
+            );
+        }
+
+        #[test]
+        fn constrain_variable_bits_rejects_unsatisfiable_predicates() {
+            let form = InstructionForm::new("form1")
+                .field(InstructionField::variable("field1", 2))
+                .when(and(vec![field_eq("field1", "10"), bit_eq(1, Bit::High)]));
+
+            assert_eq!(
+                form.constrain_variable_bits(&BitPattern::parse("1x"), 0, "field1"),
+                None
+            );
+        }
 
         #[test]
         fn test_variable_bits() {

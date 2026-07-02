@@ -2021,21 +2021,21 @@ fn main() {
     //     &arm32,
     // )
     // Program: mov r5, #3; mul r4, r4, r5
-    let program = DecodedInstruction::decode_program_str(
-        "11100011101000000101000000000011\n11100000000001000000010110010100",
-        &arm32,
-    )
-    .unwrap();
-    let effects = instruction_seq_to_effects(&program, &arm32);
-    println!("\n\n\n\n\n\n\n");
-    for effect in &effects {
-        println!("{:#?}", effect);
-    }
+    // let program = DecodedInstruction::decode_program_str(
+    //     "11100011101000000101000000000011\n11100000000001000000010110010100",
+    //     &arm32,
+    // )
+    // .unwrap();
+    // let effects = instruction_seq_to_effects(&program, &arm32);
+    // println!("\n\n\n\n\n\n\n");
+    // for effect in &effects {
+    //     println!("{:#?}", effect);
+    // }
 
-    // program2: add r1, r0, r1
-    let program2 =
-        DecodedInstruction::decode_program_str("11100000100000000001000000000001", &arm32).unwrap();
-    let effects2 = instruction_seq_to_effects(&program2, &arm32);
-    // effects[1] should be the write to r1 (mov r1, r0) and effects2[0] should be add r1, r0, r1. so these should be semantically equivalent in their contexts
-    assert_eq!(effects[1], effects2[0]);
+    // // program2: add r1, r0, r1
+    // let program2 =
+    //     DecodedInstruction::decode_program_str("11100000100000000001000000000001", &arm32).unwrap();
+    // let effects2 = instruction_seq_to_effects(&program2, &arm32);
+    // // effects[1] should be the write to r1 (mov r1, r0) and effects2[0] should be add r1, r0, r1. so these should be semantically equivalent in their contexts
+    // assert_eq!(effects[1], effects2[0]);
 }

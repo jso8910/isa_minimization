@@ -31,6 +31,7 @@ use crate::{
     isa_specification::{
         ArchitecturalRegister, DecodedInstruction, ISA, StackDirection, StackPointer,
     },
+    superoptimization::Program,
 };
 
 pub type InstructionIdx = u32;
@@ -97,11 +98,7 @@ pub struct EquivalenceManager<'a> {
 }
 
 impl<'a> EquivalenceManager<'a> {
-    pub fn from_instructions(
-        left: &[DecodedInstruction],
-        right: &[DecodedInstruction],
-        isa: &'a ISA,
-    ) -> Self {
+    pub fn from_instructions(left: &Program, right: &Program, isa: &'a ISA) -> Self {
         let left_effects = Self::canonical_effects(instruction_seq_to_effects(left, isa));
         let right_effects = Self::canonical_effects(instruction_seq_to_effects(right, isa));
 
@@ -132,11 +129,11 @@ impl<'a> EquivalenceManager<'a> {
         }
     }
 
-    pub fn from_left_instruction(left: &[DecodedInstruction], isa: &'a ISA) -> Self {
+    pub fn from_left_instruction(left: &Program, isa: &'a ISA) -> Self {
         Self::from_instructions(left, left, isa)
     }
 
-    pub fn replace_right_instruction(&mut self, new_right: &[DecodedInstruction]) {
+    pub fn replace_right_instruction(&mut self, new_right: &Program) {
         self.right_effects =
             Self::canonical_effects(instruction_seq_to_effects(new_right, self.isa));
         for (idx, effect) in self.left_effects.iter().enumerate() {
@@ -2234,9 +2231,9 @@ impl BitAnd for BddWord {
 /// Given some sequence of instructions, create a list of all Effects of the sequence in terms of the initial state
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
-pub fn instruction_seq_to_effects(instructions: &[DecodedInstruction], isa: &ISA) -> Vec<Effect> {
+pub fn instruction_seq_to_effects(instructions: &Program, isa: &ISA) -> Vec<Effect> {
     let mut seq_effects = vec![];
-    for instruction in instructions.iter() {
+    for instruction in instructions.iter_instructions() {
         let lowered_effects = instruction_to_lowered_effects(instruction, isa, &seq_effects);
 
         // We want to combine the effects of this instruction with the existing effects in seq_effects
@@ -2777,8 +2774,11 @@ mod tests {
         )
     }
 
-    fn decoded_sequence(names: &[&str]) -> Vec<DecodedInstruction> {
-        names.iter().map(|name| decoded(name)).collect()
+    fn decoded_sequence(names: &[&str]) -> Program {
+        Program::from_instructions(
+            names.iter().map(|name| decoded(name)).collect(),
+            names.len(),
+        )
     }
 
     fn assert_bdd_compare_equal(left: Expr, right: Expr, isa: &ISA) {
@@ -5283,7 +5283,8 @@ mod tests {
                 ),
             ],
         );
-        let sequence = vec![decoded("ADD_R0_R0_R0"), decoded("MOV_R1_R0")];
+        let sequence =
+            Program::from_instructions(vec![decoded("ADD_R0_R0_R0"), decoded("MOV_R1_R0")], 2);
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
@@ -5303,7 +5304,7 @@ mod tests {
                 vec![Effect::write_memory(address.clone(), value.clone(), 32)],
             )],
         );
-        let sequence = vec![decoded("STORE32")];
+        let sequence = Program::from_instructions(vec![decoded("STORE32")], 1);
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
@@ -5350,7 +5351,8 @@ mod tests {
                 ),
             ],
         );
-        let sequence = vec![decoded("STORE32"), decoded("LOAD32_R0")];
+        let sequence =
+            Program::from_instructions(vec![decoded("STORE32"), decoded("LOAD32_R0")], 2);
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
@@ -5420,7 +5422,8 @@ mod tests {
                 ),
             ],
         );
-        let sequence = vec![decoded("STORE_R0"), decoded("LOAD_R2_FROM_R1")];
+        let sequence =
+            Program::from_instructions(vec![decoded("STORE_R0"), decoded("LOAD_R2_FROM_R1")], 2);
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
@@ -5489,13 +5492,16 @@ mod tests {
                 ),
             ],
         );
-        let sequence = vec![
-            decoded("STORE_R0"),
-            decoded("STORE_R1"),
-            decoded("STORE_R2"),
-            decoded("STORE_R3"),
-            decoded("LOAD_R5_FROM_R4"),
-        ];
+        let sequence = Program::from_instructions(
+            vec![
+                decoded("STORE_R0"),
+                decoded("STORE_R1"),
+                decoded("STORE_R2"),
+                decoded("STORE_R3"),
+                decoded("LOAD_R5_FROM_R4"),
+            ],
+            5,
+        );
         let expected = write_addresses
             .iter()
             .cloned()
@@ -5544,7 +5550,10 @@ mod tests {
                 ),
             ],
         );
-        let sequence = vec![decoded("GUARDED_STORE_R0"), decoded("LOAD_R2_FROM_R1")];
+        let sequence = Program::from_instructions(
+            vec![decoded("GUARDED_STORE_R0"), decoded("LOAD_R2_FROM_R1")],
+            2,
+        );
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 

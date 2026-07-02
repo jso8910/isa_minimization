@@ -11,6 +11,7 @@ use isa_minimization::isa_specification::{DecodedInstruction, ISA, StackDirectio
 use isa_minimization::semantic_matching::{
     BddEquality, BddManager, evaluate_expr, instruction_seq_to_effects,
 };
+use isa_minimization::superoptimization::Program;
 
 const ASR_R1_R0_31: &str = "11100001101000000001111111000000";
 const ARM_REGISTER_IDENTIFIER_WIDTH: u16 = 4;
@@ -72,6 +73,7 @@ fn main() {
     let isa = arm32_isa();
     let program =
         DecodedInstruction::decode_program_str(ASR_R1_R0_31, &isa).expect("decode ASR program");
+    let program = Program::from_instructions(program, 1);
     let effects = instruction_seq_to_effects(&program, &isa);
     let r1 = fixed_gpr(1);
 

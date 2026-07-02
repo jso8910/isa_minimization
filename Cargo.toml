@@ -20,6 +20,7 @@ thiserror = "2"
 petgraph = "0.8.3"
 oxidd = "0.11.0"
 itertools = "0.15.0"
+rand = "0.10.2"
 
 [dev-dependencies]
 criterion = "0.5"

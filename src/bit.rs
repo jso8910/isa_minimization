@@ -151,6 +151,10 @@ impl BitPattern {
         return self.bits.iter().filter(|b| **b == Bit::High).count();
     }
 
+    pub fn num_variable(&self) -> usize {
+        return self.bits.iter().filter(|b| **b == Bit::Var).count();
+    }
+
     pub fn can_merge_with(&self, other: &BitPattern) -> bool {
         if self.bits.len() != other.bits.len() {
             return false;
@@ -539,6 +543,20 @@ mod tests {
         fn bit_pattern_num_high() {
             let bp = BitPattern::parse("1011xxx1000x");
             assert_eq!(bp.num_high(), 4);
+        }
+
+        #[test]
+        fn bit_pattern_num_variable_counts_only_variable_bits() {
+            let bp = BitPattern::new(vec![
+                Bit::Var,
+                Bit::High,
+                Bit::Low,
+                Bit::Test,
+                Bit::Var,
+                Bit::Var,
+            ]);
+
+            assert_eq!(bp.num_variable(), 3);
         }
     }
 
