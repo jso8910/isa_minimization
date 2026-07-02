@@ -10,12 +10,12 @@ use itertools::Itertools;
 use rand::{RngExt, rngs::ThreadRng};
 
 use crate::{
-    bit::Bit,
+    bit::{Bit, BitPattern},
     constants::{MCMC_TEMP, SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_PROG_LEN},
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
-        ArchitecturalRegister, DecodedField, DecodedInstruction, FieldUses, ISA, InstructionForm,
-        MergeMode, StackDirection,
+        ArchitecturalRegister, DecodedField, DecodedInstruction, FieldUses, ISA, InstructionField,
+        InstructionForm, MergeMode, StackDirection,
     },
     semantic_matching::{
         BddEquality, EquivalenceManager, MachineState, evaluate_expr, instruction_seq_to_effects,
@@ -166,48 +166,16 @@ impl<'a> SuperoptimizationCtx<'a> {
 
             for field in selected_form.fields.iter() {
                 let pattern_idx = bits.len();
-                let value = match &field.name {
-                    Some(name) => {
-                        let Some(field_use) = valid_field_uses.get(name) else {
-                            valid = false;
-                            break;
-                        };
-                        match (field.merge_mode, field_use) {
-                            (MergeMode::VariableBits, FieldUses::VariableBits { pattern, .. }) => {
-                                pattern.clone()
-                            }
-                            (MergeMode::Uses, FieldUses::Uses { patterns, .. }) => {
-                                let selected = rng.random_range(0..patterns.len());
-                                patterns
-                                    .iter()
-                                    .nth(selected)
-                                    .expect("Field use must contain at least one pattern")
-                                    .clone()
-                            }
-                            _ => {
-                                valid = false;
-                                break;
-                            }
-                        }
-                    }
-                    None => field.pattern.clone(),
-                };
-
-                let Some(mut value) = selected_form.constrain_variable_bits(
-                    &value,
+                let Some(value) = Self::select_random_field_value_with_rng(
+                    selected_form,
+                    field,
                     pattern_idx,
-                    field.name.as_deref().unwrap_or("__const__"),
+                    valid_field_uses,
+                    rng,
                 ) else {
                     valid = false;
                     break;
                 };
-
-                // Randomly set Var bits to high or low
-                for bit in value.bits.iter_mut() {
-                    if *bit == Bit::Var {
-                        *bit = if rng.random() { Bit::High } else { Bit::Low };
-                    }
-                }
 
                 bits.extend(value.bits.iter().copied());
                 fields.push(DecodedField {
@@ -231,15 +199,53 @@ impl<'a> SuperoptimizationCtx<'a> {
                 fields,
             };
 
-            if selected_form.when.check(&instruction)
-                && selected_instruction
-                    .constraints
-                    .iter()
-                    .all(|constraint| constraint.check(&instruction))
-            {
+            if selected_form.when.check(&instruction) {
                 return instruction;
             }
         }
+    }
+
+    fn select_random_field_value_with_rng<R: RngExt>(
+        form: &InstructionForm,
+        field: &InstructionField,
+        pattern_idx: usize,
+        valid_field_uses: &HashMap<FieldName, FieldUses>,
+        rng: &mut R,
+    ) -> Option<BitPattern> {
+        let value = match &field.name {
+            Some(name) => {
+                let field_use = valid_field_uses.get(name)?;
+                match (field.merge_mode, field_use) {
+                    (MergeMode::VariableBits, FieldUses::VariableBits { pattern, .. }) => {
+                        pattern.clone()
+                    }
+                    (MergeMode::Uses, FieldUses::Uses { patterns, .. }) => {
+                        let selected = rng.random_range(0..patterns.len());
+                        patterns
+                            .iter()
+                            .nth(selected)
+                            .expect("Field use must contain at least one pattern")
+                            .clone()
+                    }
+                    _ => return None,
+                }
+            }
+            None => field.pattern.clone(),
+        };
+
+        let mut value = form.constrain_variable_bits(
+            &value,
+            pattern_idx,
+            field.name.as_deref().unwrap_or("__const__"),
+        )?;
+
+        for bit in &mut value.bits {
+            if *bit == Bit::Var {
+                *bit = if rng.random() { Bit::High } else { Bit::Low };
+            }
+        }
+
+        Some(value)
     }
 
     /// Naive superoptimization which merely iterates through all valid instructions,
@@ -845,6 +851,116 @@ mod tests {
     }
 
     #[test]
+    fn select_random_field_value_uses_constant_field_pattern() {
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::constant("10"))
+            .field(InstructionField::variable("tail", 1));
+        let mut rng = StdRng::seed_from_u64(0);
+
+        let value = SuperoptimizationCtx::select_random_field_value_with_rng(
+            &form,
+            &form.fields[0],
+            0,
+            &HashMap::new(),
+            &mut rng,
+        )
+        .expect("constant field should not need field uses");
+
+        assert_eq!(value, BitPattern::parse("10"));
+    }
+
+    #[test]
+    fn select_random_field_value_uses_variable_bits_and_materializes_vars() {
+        let form = InstructionForm::new("candidate").field(InstructionField::variable("imm", 2));
+        let valid_field_uses = HashMap::from([variable_bits_use("imm", "1x")]);
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let value = SuperoptimizationCtx::select_random_field_value_with_rng(
+            &form,
+            &form.fields[0],
+            0,
+            &valid_field_uses,
+            &mut rng,
+        )
+        .expect("matching variable-bits use should produce a value");
+
+        assert_eq!(value.bits[0], Bit::High);
+        assert!(matches!(value.bits[1], Bit::Low | Bit::High));
+    }
+
+    #[test]
+    fn select_random_field_value_samples_uses_patterns() {
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("opcode", 2).merge_mode_uses());
+        let valid_field_uses = HashMap::from([uses_field("opcode", &["00", "11"])]);
+        let mut rng = StdRng::seed_from_u64(2);
+
+        for _ in 0..16 {
+            let value = SuperoptimizationCtx::select_random_field_value_with_rng(
+                &form,
+                &form.fields[0],
+                0,
+                &valid_field_uses,
+                &mut rng,
+            )
+            .expect("matching uses field should produce a value");
+
+            assert!(value == BitPattern::parse("00") || value == BitPattern::parse("11"));
+        }
+    }
+
+    #[test]
+    fn select_random_field_value_returns_none_for_missing_or_mismatched_field_uses() {
+        let variable_form =
+            InstructionForm::new("candidate").field(InstructionField::variable("imm", 2));
+        let uses_form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("opcode", 2).merge_mode_uses());
+        let mut rng = StdRng::seed_from_u64(3);
+
+        assert!(
+            SuperoptimizationCtx::select_random_field_value_with_rng(
+                &variable_form,
+                &variable_form.fields[0],
+                0,
+                &HashMap::new(),
+                &mut rng,
+            )
+            .is_none()
+        );
+
+        assert!(
+            SuperoptimizationCtx::select_random_field_value_with_rng(
+                &uses_form,
+                &uses_form.fields[0],
+                0,
+                &HashMap::from([variable_bits_use("opcode", "xx")]),
+                &mut rng,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn select_random_field_value_applies_form_constraints_before_randomizing() {
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("imm", 2))
+            .when(field_eq("imm", "10"));
+        let valid_field_uses = HashMap::from([variable_bits_use("imm", "xx")]);
+        let mut rng = StdRng::seed_from_u64(4);
+
+        let value = SuperoptimizationCtx::select_random_field_value_with_rng(
+            &form,
+            &form.fields[0],
+            0,
+            &valid_field_uses,
+            &mut rng,
+        )
+        .expect("constraint should fix variable bits");
+
+        assert_eq!(value, BitPattern::parse("10"));
+    }
+
+    #[test]
     fn expand_variable_bits_enumerates_all_assignments_in_order() {
         let expanded = expand_variable_bits(&[Bit::High, Bit::Var, Bit::Low, Bit::Var]);
 
@@ -976,17 +1092,16 @@ mod tests {
     }
 
     #[test]
-    fn select_random_instruction_retries_until_instruction_constraints_hold() {
+    fn select_random_instruction_retries_until_form_predicate_holds() {
         let isa = test_isa(
             StackDirection::Downwards,
             vec![
                 encoded_instruction("ORIGINAL", "0", vec![]),
-                Instruction::new("CONSTRAINED", 1)
-                    .form(
-                        InstructionForm::new("candidate")
-                            .field(InstructionField::variable("imm", 1)),
-                    )
-                    .constraint(field_eq("imm", "1")),
+                Instruction::new("CONSTRAINED", 1).form(
+                    InstructionForm::new("candidate")
+                        .field(InstructionField::variable("imm", 1))
+                        .when(field_eq("imm", "1")),
+                ),
             ],
         );
         let mut ctx = SuperoptimizationCtx::new_from_single_instruction(

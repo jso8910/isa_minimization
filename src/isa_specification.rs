@@ -80,7 +80,6 @@ pub struct Instruction {
 
     /// An instruction can have multiple forms (eg immediate-shifted-registers vs register-shifted-register)
     pub forms: Vec<InstructionForm>,
-    pub constraints: Vec<Predicate>,
 
     /// Each instruction has a set of effects which occur. An instruction should never
     /// have two effects which could possibly write to the same location.
@@ -93,7 +92,6 @@ impl Instruction {
             name: name.into(),
             width,
             forms: Vec::new(),
-            constraints: Vec::new(),
             effects: Vec::new(),
         }
     }
@@ -109,11 +107,6 @@ impl Instruction {
         }
 
         self.forms.push(form);
-        self
-    }
-
-    pub fn constraint(mut self, predicate: Predicate) -> Self {
-        self.constraints.push(predicate);
         self
     }
 
@@ -169,10 +162,7 @@ impl Instruction {
                 current_bit_index += field.pattern.len();
             }
 
-            if matches
-                && form.when.check(&decoded_fields)
-                && self.constraints.iter().all(|c| c.check(&decoded_fields))
-            {
+            if matches && form.when.check(&decoded_fields) {
                 if matched_form.is_some() {
                     // Multiple forms match, this is ambiguous
                     return None;

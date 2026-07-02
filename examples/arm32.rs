@@ -18,8 +18,8 @@ use isa_minimization::instruction_semantics::{
 };
 use isa_minimization::isa_specification::{
     ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA,
-    Instruction, InstructionField, InstructionForm, MergeMode, StackDirection, StackPointer, and,
-    bit_eq, c, field_eq, field_in, not,
+    Instruction, InstructionField, InstructionForm, MergeMode, Predicate, StackDirection,
+    StackPointer, and, bit_eq, c, field_eq, field_in, not,
 };
 use isa_minimization::parser::parse_netlist;
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
@@ -1222,6 +1222,53 @@ pub fn data_tfr_prefix() -> Vec<InstructionField> {
     ]
 }
 
+fn dproc_valid_predicate() -> Predicate {
+    and([
+        // TST, TEQ, CMP, CMN must set flags.
+        //
+        // Invalid:
+        // data_proc_opcode in {1000, 1001, 1010, 1011}
+        // AND set_flags == 0
+        not(and([
+            field_in(
+                "data_proc_opcode",
+                [
+                    DPROC_OPCODE_TST_BITS,
+                    DPROC_OPCODE_TEQ_BITS,
+                    DPROC_OPCODE_CMP_BITS,
+                    DPROC_OPCODE_CMN_BITS,
+                ],
+            ),
+            field_eq("set_flags", BIT_CLEAR),
+        ])),
+        not(and([
+            field_eq("set_flags", BIT_SET),
+            field_eq("rd_addr", REG_PC_BITS),
+        ])),
+    ])
+}
+
+fn hwtfr_valid_predicate() -> Predicate {
+    and([
+        // sh_bits must not be 00.
+        not(field_eq("sh_bits", HWTFR_SH_INVALID_BITS)),
+        not(and([
+            field_eq("is_load", BIT_CLEAR),
+            field_in(
+                "sh_bits",
+                [HWTFR_SH_SIGNED_BYTE_BITS, HWTFR_SH_SIGNED_HALFWORD_BITS],
+            ),
+        ])),
+    ])
+}
+
+fn block_tfr_valid_predicate() -> Predicate {
+    and([
+        not(field_eq("block_reglist", EMPTY_BLOCK_REGLIST_BITS)),
+        field_eq("do_load_psr", BIT_CLEAR),
+    ])
+}
+
 pub fn dproc() -> Instruction {
     with_effects(
         Instruction::new("dproc", 32)
@@ -1257,7 +1304,7 @@ pub fn dproc() -> Instruction {
                             true,
                         ),
                     ))
-                    .when(bit_eq(6, Bit::Low)),
+                    .when(and([bit_eq(6, Bit::Low), dproc_valid_predicate()])),
             )
             .form(
                 InstructionForm::new("register_immediate_shift")
@@ -1287,7 +1334,7 @@ pub fn dproc() -> Instruction {
                             false,
                         ),
                     ))
-                    .when(bit_eq(6, Bit::Low)),
+                    .when(and([bit_eq(6, Bit::Low), dproc_valid_predicate()])),
             )
             .form(
                 InstructionForm::new("immediate")
@@ -1318,29 +1365,8 @@ pub fn dproc() -> Instruction {
                             )),
                         ),
                     ))
-                    .when(bit_eq(6, Bit::High)),
-            )
-            // TST, TEQ, CMP, CMN must set flags.
-            //
-            // Invalid:
-            // data_proc_opcode in {1000, 1001, 1010, 1011}
-            // AND set_flags == 0
-            .constraint(not(and([
-                field_in(
-                    "data_proc_opcode",
-                    [
-                        DPROC_OPCODE_TST_BITS,
-                        DPROC_OPCODE_TEQ_BITS,
-                        DPROC_OPCODE_CMP_BITS,
-                        DPROC_OPCODE_CMN_BITS,
-                    ],
-                ),
-                field_eq("set_flags", BIT_CLEAR),
-            ])))
-            .constraint(not(and([
-                field_eq("set_flags", BIT_SET),
-                field_eq("rd_addr", REG_PC_BITS),
-            ]))),
+                    .when(and([bit_eq(6, Bit::High), dproc_valid_predicate()])),
+            ),
         dproc_effects(),
     )
 }
@@ -1429,111 +1455,93 @@ pub fn bx() -> Instruction {
 
 pub fn hwtfr_reg_offset() -> Instruction {
     with_effects(
-        Instruction::new("hwtfr_reg_offset", 32)
-            .form(
-                InstructionForm::new("base")
-                    .fields([
-                        cond(),
-                        c(ENC_HWTFR_FIXED_PREFIX),
-                        is_pre_idx(),
-                        is_up_offset(),
-                        c(ENC_BIT_LOW),
-                        do_writeback(),
-                        is_load(),
-                        rn_addr_read_write(),
-                        rd_addr_read_write(),
-                        c(ENC_HWTFR_REG_MARKER),
-                        sh_bits(),
-                        c(ENC_BIT_HIGH),
-                        rm_addr(),
-                    ])
-                    .derived_value(dv("offset", read_register_field("rm_addr", 32)))
-                    .derived_value(dv(
-                        "address",
-                        transfer_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_pre_idx",
-                            "is_up_offset",
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "writeback_address",
-                        transfer_writeback_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_up_offset",
-                        ),
-                    )),
-            )
-            // sh_bits must not be 00.
-            .constraint(not(field_eq("sh_bits", HWTFR_SH_INVALID_BITS)))
-            .constraint(not(and([
-                field_eq("is_load", BIT_CLEAR),
-                field_in(
-                    "sh_bits",
-                    [HWTFR_SH_SIGNED_BYTE_BITS, HWTFR_SH_SIGNED_HALFWORD_BITS],
-                ),
-            ]))),
+        Instruction::new("hwtfr_reg_offset", 32).form(
+            InstructionForm::new("base")
+                .fields([
+                    cond(),
+                    c(ENC_HWTFR_FIXED_PREFIX),
+                    is_pre_idx(),
+                    is_up_offset(),
+                    c(ENC_BIT_LOW),
+                    do_writeback(),
+                    is_load(),
+                    rn_addr_read_write(),
+                    rd_addr_read_write(),
+                    c(ENC_HWTFR_REG_MARKER),
+                    sh_bits(),
+                    c(ENC_BIT_HIGH),
+                    rm_addr(),
+                ])
+                .derived_value(dv("offset", read_register_field("rm_addr", 32)))
+                .derived_value(dv(
+                    "address",
+                    transfer_address(
+                        read_register_field("rn_addr", 32),
+                        derived("offset"),
+                        "is_pre_idx",
+                        "is_up_offset",
+                    ),
+                ))
+                .derived_value(dv(
+                    "writeback_address",
+                    transfer_writeback_address(
+                        read_register_field("rn_addr", 32),
+                        derived("offset"),
+                        "is_up_offset",
+                    ),
+                ))
+                .when(hwtfr_valid_predicate()),
+        ),
         hwtfr_effects(),
     )
 }
 
 pub fn hwtfr_imm_offset() -> Instruction {
     with_effects(
-        Instruction::new("hwtfr_imm_offset", 32)
-            .form(
-                InstructionForm::new("base")
-                    .fields([
-                        cond(),
-                        c(ENC_HWTFR_FIXED_PREFIX),
-                        is_pre_idx(),
-                        is_up_offset(),
-                        c(ENC_BIT_HIGH),
-                        do_writeback(),
-                        is_load(),
-                        rn_addr_read_write(),
-                        rd_addr_read_write(),
-                        imm8_high(),
-                        c(ENC_BIT_HIGH),
-                        sh_bits(),
-                        c(ENC_BIT_HIGH),
-                        imm8_low(),
-                    ])
-                    .derived_value(dv(
-                        "offset",
-                        zero_extend(
-                            concat([immediate_field("imm8_high"), immediate_field("imm8_low")]),
-                            32,
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "address",
-                        transfer_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_pre_idx",
-                            "is_up_offset",
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "writeback_address",
-                        transfer_writeback_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_up_offset",
-                        ),
-                    )),
-            )
-            // sh_bits must not be 00.
-            .constraint(not(field_eq("sh_bits", HWTFR_SH_INVALID_BITS)))
-            .constraint(not(and([
-                field_eq("is_load", BIT_CLEAR),
-                field_in(
-                    "sh_bits",
-                    [HWTFR_SH_SIGNED_BYTE_BITS, HWTFR_SH_SIGNED_HALFWORD_BITS],
-                ),
-            ]))),
+        Instruction::new("hwtfr_imm_offset", 32).form(
+            InstructionForm::new("base")
+                .fields([
+                    cond(),
+                    c(ENC_HWTFR_FIXED_PREFIX),
+                    is_pre_idx(),
+                    is_up_offset(),
+                    c(ENC_BIT_HIGH),
+                    do_writeback(),
+                    is_load(),
+                    rn_addr_read_write(),
+                    rd_addr_read_write(),
+                    imm8_high(),
+                    c(ENC_BIT_HIGH),
+                    sh_bits(),
+                    c(ENC_BIT_HIGH),
+                    imm8_low(),
+                ])
+                .derived_value(dv(
+                    "offset",
+                    zero_extend(
+                        concat([immediate_field("imm8_high"), immediate_field("imm8_low")]),
+                        32,
+                    ),
+                ))
+                .derived_value(dv(
+                    "address",
+                    transfer_address(
+                        read_register_field("rn_addr", 32),
+                        derived("offset"),
+                        "is_pre_idx",
+                        "is_up_offset",
+                    ),
+                ))
+                .derived_value(dv(
+                    "writeback_address",
+                    transfer_writeback_address(
+                        read_register_field("rn_addr", 32),
+                        derived("offset"),
+                        "is_up_offset",
+                    ),
+                ))
+                .when(hwtfr_valid_predicate()),
+        ),
         hwtfr_effects(),
     )
 }
@@ -1608,26 +1616,24 @@ pub fn data_tfr() -> Instruction {
 
 pub fn block_tfr() -> Instruction {
     with_effects(
-        Instruction::new("block_tfr", 32)
-            .form(
-                InstructionForm::new("base")
-                    .fields([
-                        cond(),
-                        c(ENC_BLOCK_TRANSFER_CLASS),
-                        is_pre_idx_block(),
-                        is_up_offset_block(),
-                        do_load_psr(),
-                        do_writeback_block(),
-                        is_load_block(),
-                        rn_addr_read_write(),
-                        block_reglist(),
-                    ])
-                    .derived_value(dv("transfer_count", block_transfer_count()))
-                    .derived_value(dv("start_address", block_start_address()))
-                    .derived_value(dv("writeback_address", block_writeback_address())),
-            )
-            .constraint(not(field_eq("block_reglist", EMPTY_BLOCK_REGLIST_BITS)))
-            .constraint(field_eq("do_load_psr", BIT_CLEAR)),
+        Instruction::new("block_tfr", 32).form(
+            InstructionForm::new("base")
+                .fields([
+                    cond(),
+                    c(ENC_BLOCK_TRANSFER_CLASS),
+                    is_pre_idx_block(),
+                    is_up_offset_block(),
+                    do_load_psr(),
+                    do_writeback_block(),
+                    is_load_block(),
+                    rn_addr_read_write(),
+                    block_reglist(),
+                ])
+                .derived_value(dv("transfer_count", block_transfer_count()))
+                .derived_value(dv("start_address", block_start_address()))
+                .derived_value(dv("writeback_address", block_writeback_address()))
+                .when(block_tfr_valid_predicate()),
+        ),
         block_tfr_effects(),
     )
 }
