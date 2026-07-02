@@ -171,3 +171,19 @@ impl Pin {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_name_returns_name_for_each_pin_kind() {
+        let input = Pin::new_in("A".to_string());
+        let output = Pin::new_out("Z".to_string(), "A", &vec![input.clone()]);
+        let sequential = Pin::new_seq("Q".to_string());
+
+        assert_eq!(input.name(), "A");
+        assert_eq!(output.name(), "Z");
+        assert_eq!(sequential.name(), "Q");
+    }
+}

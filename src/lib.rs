@@ -50,8 +50,46 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_temp_file(prefix: &str) -> String {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path: PathBuf = std::env::temp_dir();
+        path.push(format!(
+            "isa_minimization_config_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            id
+        ));
+        fs::write(&path, "").unwrap();
+        path.to_string_lossy().into_owned()
+    }
 
     #[test]
-    fn test_config() {}
+    fn config_new_accepts_existing_paths() {
+        let hdl_path = write_temp_file("hdl");
+        let program_binary_path = write_temp_file("program");
+        let gate_library_path = write_temp_file("liberty");
+
+        let config = Config::new(
+            hdl_path.clone(),
+            program_binary_path.clone(),
+            gate_library_path.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(config.hdl_path, PathBuf::from(hdl_path));
+        assert_eq!(
+            config.program_binary_path,
+            PathBuf::from(program_binary_path)
+        );
+        assert_eq!(config.gate_library_path, PathBuf::from(gate_library_path));
+    }
 }

@@ -698,6 +698,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_parameterized_instance_and_iterates_declared_nets() {
+        let src = r#"
+            module top(input a, output y);
+                wire n1;
+                MYCELL #(.WIDTH(1), .INIT(1'b0)) u_param (
+                    .A(a),
+                    .Y(y)
+                );
+            endmodule
+        "#;
+
+        let netlist = parse_netlist(src).unwrap();
+        let declared = netlist.all_declared_nets().cloned().collect::<Vec<_>>();
+        assert_eq!(declared, vec!["a", "y", "n1"]);
+
+        let instance = netlist.instances.get("u_param").unwrap();
+        assert_eq!(instance.cell_type, "MYCELL");
+        assert_eq!(
+            instance.parameters.get("WIDTH"),
+            Some(&Some(Expr::Const("1".to_string())))
+        );
+        assert_eq!(
+            instance.parameters.get("INIT"),
+            Some(&Some(Expr::Const("1'b0".to_string())))
+        );
+    }
+
+    #[test]
     fn rejects_part_select() {
         let src = r#"
             module top(input [3:0] a, output y);

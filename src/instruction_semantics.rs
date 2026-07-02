@@ -2436,6 +2436,70 @@ mod tests {
             .expect("fixture instruction should decode")
     }
 
+    #[test]
+    fn operation_names_cover_error_label_helpers() {
+        assert_eq!(ExtensionOp::Zero.name(), "Zero extension");
+        assert_eq!(ExtensionOp::Sign.name(), "Sign extension");
+
+        assert_eq!(FlagOp::AddCarryOut.name(), "AddCarryOut");
+        assert_eq!(FlagOp::AddOverflow.name(), "AddOverflow");
+        assert_eq!(FlagOp::SubCarryOut.name(), "SubCarryOut");
+        assert_eq!(FlagOp::SubOverflow.name(), "SubOverflow");
+    }
+
+    #[test]
+    fn collapse_substitute_and_canonicalize_forwards_prior_register_write() {
+        let expr = add(
+            read_register(fixed_register(Register(1), 8), 32),
+            constant(3, 32),
+        );
+        let previous_effects = vec![Effect::write_register(
+            fixed_register(Register(1), 8),
+            constant(2, 32),
+        )];
+
+        assert_eq!(
+            expr.collapse_substitute_and_canonicalize(&empty_instruction(), &previous_effects),
+            constant(5, 32)
+        );
+    }
+
+    #[test]
+    fn effect_accessors_distinguish_register_and_memory_writes() {
+        let register_effect = Effect::write_register_if(
+            bool_const(false),
+            fixed_register(Register(2), 8),
+            constant(9, 32),
+        );
+        let memory_effect =
+            Effect::write_memory_if(bool_const(true), constant(4, 32), constant(0xab, 8), 8);
+
+        assert_eq!(
+            register_effect.destination(),
+            &fixed_register(Register(2), 8)
+        );
+        assert!(!register_effect.is_memory());
+        assert_eq!(
+            register_effect.normalized_value(),
+            select(
+                bool_const(false),
+                constant(9, 32),
+                read_register(fixed_register(Register(2), 8), 32),
+            )
+        );
+
+        assert_eq!(memory_effect.destination(), &constant(4, 32));
+        assert!(memory_effect.is_memory());
+        assert_eq!(
+            memory_effect.normalized_value(),
+            select(
+                bool_const(true),
+                constant(0xab, 8),
+                read_memory(constant(4, 32), 8),
+            )
+        );
+    }
+
     /// Asserts recursively that subtraction, OR, and XOR have been lowered.
     fn assert_operator_reduced(expr: &Expr) {
         match expr {

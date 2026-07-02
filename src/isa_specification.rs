@@ -786,6 +786,90 @@ pub fn or(predicates: impl IntoIterator<Item = Predicate>) -> Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_temp_program(contents: &str) -> String {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path: PathBuf = std::env::temp_dir();
+        path.push(format!(
+            "isa_minimization_decode_program_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn minimal_isa(instruction: Instruction) -> ISA {
+        let reg = ArchitecturalRegister {
+            identifier: 0,
+            identifier_width: 1,
+            width: 32,
+        };
+        ISA {
+            registers: vec![reg],
+            instructions: vec![instruction],
+            sp: StackPointer {
+                register: reg,
+                stack_size: 16,
+                direction: StackDirection::Downwards,
+            },
+            pc: reg,
+        }
+    }
+
+    #[test]
+    fn decode_program_reads_binary_file() {
+        let instruction = Instruction::new("NOP", 2)
+            .form(InstructionForm::new("nop_form").field(InstructionField::constant("01")));
+        let isa = minimal_isa(instruction);
+        let path = write_temp_program("01\n01\n");
+
+        let decoded = DecodedInstruction::decode_program(&path, &isa).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert!(
+            decoded
+                .iter()
+                .all(|instr| instr.name.as_deref() == Some("NOP"))
+        );
+    }
+
+    #[test]
+    fn field_and_predicate_builders_cover_variable_bits_and_or() {
+        let field = InstructionField::variable("mode", 2)
+            .merge_mode_uses()
+            .merge_mode_variable_bits();
+        assert_eq!(field.merge_mode, MergeMode::VariableBits);
+
+        let instruction = Instruction::new("TEST", 2).form(
+            InstructionForm::new("form")
+                .field(field)
+                .when(or(vec![field_eq("mode", "01"), field_eq("mode", "10")])),
+        );
+
+        assert!(
+            instruction
+                .find_match(&BitPattern::parse("01").bits)
+                .is_some()
+        );
+        assert!(
+            instruction
+                .find_match(&BitPattern::parse("10").bits)
+                .is_some()
+        );
+        assert!(
+            instruction
+                .find_match(&BitPattern::parse("11").bits)
+                .is_none()
+        );
+    }
 
     mod inst_recognition {
         use super::*;

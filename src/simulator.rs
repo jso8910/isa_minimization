@@ -1514,6 +1514,42 @@ endmodule
     }
 
     #[test]
+    fn public_optimization_wrappers_and_exported_wires_use_compiled_simulator() {
+        let verilog = r#"
+module wrapper_paths(a, b, out);
+  input a, b;
+  output out;
+  wire a, b, out, forced;
+  OR2_X1 g_static(.A1 (a), .A2 (1'b1), .ZN (forced));
+  XOR2_X1 g_out(.A (forced), .B (b), .Z (out));
+endmodule
+"#;
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+        let bit_inputs = vec![test_input(&[("a", Bit::Var), ("b", Bit::Var)])];
+
+        assert_eq!(
+            simulator.optimize_gate_usage(&bit_inputs),
+            vec!["g_out".to_string()]
+        );
+
+        let batch = simulator.optimize_gate_usage_details_batch(&[bit_inputs.clone()]);
+        assert_eq!(batch.len(), 1);
+        assert!(batch[0].static_gates.contains(&"g_static".to_string()));
+
+        let validation = simulator.validate_gate_usage_optimization(&bit_inputs, &batch[0]);
+        assert_eq!(validation.input_patterns_checked, 1);
+        assert_eq!(validation.replacement_outputs_checked, 1);
+
+        let a_wire = simulator.wire_ids["a"];
+        assert_eq!(
+            simulator.export_nonarbitrary_wires(&HashSet::from([a_wire])),
+            HashSet::from([Expr::Net("a".to_string())])
+        );
+    }
+
+    #[test]
     fn validation_checks_top_level_outputs_and_sequential_inputs() {
         let verilog = r#"
 module effective_outputs(a, clk, out);

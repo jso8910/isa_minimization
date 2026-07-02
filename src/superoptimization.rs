@@ -845,6 +845,21 @@ mod tests {
     }
 
     #[test]
+    fn expand_variable_bits_enumerates_all_assignments_in_order() {
+        let expanded = expand_variable_bits(&[Bit::High, Bit::Var, Bit::Low, Bit::Var]);
+
+        assert_eq!(
+            expanded,
+            vec![
+                vec![Bit::High, Bit::Low, Bit::Low, Bit::Low],
+                vec![Bit::High, Bit::Low, Bit::Low, Bit::High],
+                vec![Bit::High, Bit::High, Bit::Low, Bit::Low],
+                vec![Bit::High, Bit::High, Bit::Low, Bit::High],
+            ]
+        );
+    }
+
+    #[test]
     fn program_from_instructions_pads_with_unused_and_iterates_instructions() {
         let isa = test_isa(
             StackDirection::Downwards,

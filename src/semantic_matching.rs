@@ -4051,6 +4051,19 @@ mod tests {
     }
 
     #[test]
+    fn from_left_expr_uses_same_expression_on_both_sides() {
+        let expr = and_expr(read_register(reg(0), 1), bool_const(true));
+        let mut manager = BddManager::from_left_expr(expr.clone(), &bdd_test_isa());
+
+        assert_eq!(manager.left_expr, expr);
+        assert_eq!(manager.right_expr, expr);
+        assert_eq!(
+            manager.compare().expect("comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "new_expr width should match existing expression widths")]
     fn replace_right_expr_rejects_mismatched_widths() {
         let mut manager = bdd_manager_for_width(8);
