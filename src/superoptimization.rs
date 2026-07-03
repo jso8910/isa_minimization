@@ -7,11 +7,19 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
-use rand::{RngExt, rngs::ThreadRng};
+use rand::{
+    RngExt,
+    distr::{Distribution, weighted::WeightedIndex},
+    rngs::ThreadRng,
+    seq::IteratorRandom,
+};
 
 use crate::{
     bit::{Bit, BitPattern},
-    constants::{MCMC_TEMP, SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_PROG_LEN},
+    constants::{
+        MCMC_TEMP, P_FIELD_CHANGE, P_INSERT_UNUSED, P_INSTR_CHANGE, P_SWAP_LINES,
+        SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_PROG_LEN,
+    },
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
         ArchitecturalRegister, DecodedField, DecodedInstruction, FieldUses, ISA, InstructionField,
@@ -119,6 +127,118 @@ impl<'a> SuperoptimizationCtx<'a> {
             }
         }
         true
+    }
+
+    /// Mutates the current program to return a new proposal
+    /// Can do any of these with the following probabilities
+    ///     - P_FIELD_CHANGE - change a random field in a random non-UNUSED instruction
+    ///     - P_INSTR_CHANGE - changes a random program slot to another randomly generated valid instruction
+    ///     - P_INSERT_UNUSED - changes a random non-UNUSED instruction to ProgramInstr::UNUSED
+    ///     - P_SWAP_LINES - switches two random non-UNUSED instructions
+    fn generate_proposal(&mut self) -> Program {
+        loop {
+            let mutation = ProgramMutation::random(&mut self.rng);
+            if let Some(proposal) = self.generate_proposal_for_mutation(mutation) {
+                return proposal;
+            }
+        }
+    }
+
+    /// Returns None if a mutation was impossible for any reason (eg if FieldChange was selected but
+    /// there are no non-UNUSED instructions)
+    fn generate_proposal_for_mutation(&mut self, mutation: ProgramMutation) -> Option<Program> {
+        let mut new_program = self.gen_program.clone();
+
+        match mutation {
+            ProgramMutation::FieldChange => {
+                let (idx, instruction) =
+                    self.gen_program.clone_random_instruction(&mut self.rng)?;
+
+                let form = instruction
+                    .form
+                    .clone()
+                    .expect("DecodedInstruction form must be some");
+
+                let field_idx = (0..instruction.fields.len())
+                    .filter(|idx| instruction.fields[*idx].name.is_some())
+                    .choose(&mut self.rng)?;
+                let new_instruction =
+                    self.change_selected_field(instruction, &form.fields[field_idx]);
+
+                new_program.set_instruction(idx, new_instruction);
+            }
+
+            ProgramMutation::InsertUnused => {
+                let idx = self.gen_program.choose_random_instruction(&mut self.rng)?;
+                new_program.set_unused(idx);
+            }
+
+            ProgramMutation::InstructionChange => {
+                let idx = self.gen_program.choose_random_slot(&mut self.rng)?;
+                let new_instruction = self.select_random_instruction();
+                new_program.set_instruction(idx, new_instruction);
+            }
+
+            ProgramMutation::SwapLines => {
+                let (idx_1, idx_2) = new_program.choose_two_random_instructions(&mut self.rng)?;
+                new_program.swap_instructions(idx_1, idx_2);
+            }
+        }
+
+        Some(new_program)
+    }
+
+    /// Mutates an instruction by changing one selected field
+    fn change_selected_field(
+        &mut self,
+        mut instr: DecodedInstruction,
+        field: &InstructionField,
+    ) -> DecodedInstruction {
+        let (field_idx, pattern_idx) = {
+            let form = instr.form.as_ref().expect("Form should be defined!");
+            Self::selected_field_index_and_pattern_idx(form, field)
+                .expect("Selected field must belong to the instruction form")
+        };
+
+        let form = instr.form.as_ref().expect("Form should be defined!");
+        let selected_field = &form.fields[field_idx];
+
+        let new_field_val = Self::select_random_field_value_with_rng(
+            &form,
+            selected_field,
+            pattern_idx,
+            &self.valid_field_uses,
+            &mut self.rng,
+        )
+        .expect("Generating random field value failed!");
+
+        // Replace the bits in instr.bits
+        instr.bits[pattern_idx..pattern_idx + new_field_val.len()]
+            .copy_from_slice(&new_field_val.bits);
+
+        // Replace the value in instr.fields
+        instr.fields[field_idx].value = new_field_val;
+        instr
+    }
+
+    fn selected_field_index_and_pattern_idx(
+        form: &InstructionForm,
+        field: &InstructionField,
+    ) -> Option<(usize, usize)> {
+        let mut pattern_idx = 0;
+        let mut structural_match = None;
+
+        for (field_idx, inst_field) in form.fields.iter().enumerate() {
+            if std::ptr::eq(inst_field, field) {
+                return Some((field_idx, pattern_idx));
+            }
+            if inst_field == field {
+                structural_match = Some((field_idx, pattern_idx));
+            }
+            pattern_idx += inst_field.pattern.len();
+        }
+
+        structural_match
     }
 
     /// Selects a legal instruction (under valid_field_uses) randomly
@@ -333,7 +453,8 @@ impl<'a> SuperoptimizationCtx<'a> {
     /// Evaluates performance cost of instruction sequence
     /// Currently, just the length of the sequence
     fn performance_cost(&self, sequence: &Program) -> u32 {
-        u32::try_from(sequence.iter_instructions().count()).expect("Sequence doesn't fit into u32")
+        u32::try_from(sequence.iter_enumerate_instructions().count())
+            .expect("Sequence doesn't fit into u32")
             * WEIGHT_PROG_LEN
     }
 
@@ -472,6 +593,36 @@ impl<'a> SuperoptimizationCtx<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramMutation {
+    FieldChange,
+    InstructionChange,
+    InsertUnused,
+    SwapLines,
+}
+
+impl ProgramMutation {
+    pub fn random<R: RngExt>(rng: &mut R) -> Self {
+        let weights = [
+            P_FIELD_CHANGE,
+            P_INSTR_CHANGE,
+            P_INSERT_UNUSED,
+            P_SWAP_LINES,
+        ];
+        let enums = [
+            Self::FieldChange,
+            Self::InstructionChange,
+            Self::InsertUnused,
+            Self::SwapLines,
+        ];
+
+        let dist = WeightedIndex::new(&weights).expect("WeightedIndex not created");
+
+        // Return enum sampled from distribution
+        enums[dist.sample(rng)]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramInstr {
     UNUSED,
@@ -497,11 +648,75 @@ impl Program {
         }
     }
 
+    pub fn iter_enumerate_instructions(
+        &self,
+    ) -> impl Iterator<Item = (usize, &DecodedInstruction)> {
+        self.instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, instr)| match instr {
+                ProgramInstr::UNUSED => None,
+                ProgramInstr::Instruction(i) => Some((idx, i)),
+            })
+    }
+
     pub fn iter_instructions(&self) -> impl Iterator<Item = &DecodedInstruction> {
-        self.instructions.iter().filter_map(|instr| match instr {
-            ProgramInstr::UNUSED => None,
-            ProgramInstr::Instruction(i) => Some(i),
-        })
+        self.iter_enumerate_instructions()
+            .map(|(_, instruction)| instruction)
+    }
+
+    /// Returns a random, non UNUSED instruction
+    pub fn clone_random_instruction<R: RngExt>(
+        &self,
+        rng: &mut R,
+    ) -> Option<(usize, DecodedInstruction)> {
+        match self.iter_enumerate_instructions().choose(rng) {
+            Some((idx, instr)) => Some((idx, instr.clone())),
+            None => None,
+        }
+    }
+
+    /// Returns the index of a random non UNUSED instruction
+    pub fn choose_random_instruction<R: RngExt>(&self, rng: &mut R) -> Option<usize> {
+        match self.iter_enumerate_instructions().choose(rng) {
+            Some((idx, _)) => Some(idx),
+            None => None,
+        }
+    }
+
+    /// Returns the index of a random program slot, including UNUSED slots
+    pub fn choose_random_slot<R: RngExt>(&self, rng: &mut R) -> Option<usize> {
+        if self.instructions.is_empty() {
+            None
+        } else {
+            Some(rng.random_range(0..self.instructions.len()))
+        }
+    }
+
+    /// Returns the index of two random non UNUSED instructions
+    pub fn choose_two_random_instructions<R: RngExt>(&self, rng: &mut R) -> Option<(usize, usize)> {
+        let res = self.iter_enumerate_instructions().sample(rng, 2);
+        if res.len() == 2 {
+            Some((res[0].0, res[1].0))
+        } else {
+            None
+        }
+    }
+
+    /// Sets instruction at idx
+    pub fn set_instruction(&mut self, idx: usize, instruction: DecodedInstruction) {
+        self.instructions[idx] = ProgramInstr::Instruction(instruction);
+    }
+
+    /// Sets instruction at idx to UNUSED
+    pub fn set_unused(&mut self, idx: usize) {
+        self.instructions[idx] = ProgramInstr::UNUSED;
+    }
+
+    /// Swaps two instructions
+    pub fn swap_instructions(&mut self, idx_1: usize, idx_2: usize) {
+        assert_ne!(idx_1, idx_2);
+        self.instructions.swap(idx_1, idx_2);
     }
 }
 
@@ -850,6 +1065,94 @@ mod tests {
         )
     }
 
+    fn assert_uniform_counts(counts: &[usize], samples: usize) {
+        let expected = samples as f64 / counts.len() as f64;
+        let probability = 1.0 / counts.len() as f64;
+        let standard_deviation = (samples as f64 * probability * (1.0 - probability)).sqrt();
+        let tolerance = 7.0 * standard_deviation;
+
+        for count in counts {
+            let delta = (*count as f64 - expected).abs();
+            assert!(
+                delta <= tolerance,
+                "count {count} was outside tolerance {tolerance:.2} around expected {expected:.2}; counts = {counts:?}"
+            );
+        }
+    }
+
+    fn assert_distribution_counts(counts: &[(usize, f64)], samples: usize) {
+        for (count, probability) in counts {
+            let expected = samples as f64 * probability;
+            let standard_deviation = (samples as f64 * probability * (1.0 - probability)).sqrt();
+            let tolerance = 7.0 * standard_deviation.max(1.0);
+            let delta = (*count as f64 - expected).abs();
+
+            assert!(
+                delta <= tolerance,
+                "count {count} was outside tolerance {tolerance:.2} around expected {expected:.2}; counts = {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_field_index_and_pattern_idx_counts_preceding_widths() {
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::constant("10"))
+            .field(InstructionField::variable("opcode", 3).merge_mode_uses())
+            .field(InstructionField::variable("imm", 4));
+
+        assert_eq!(
+            SuperoptimizationCtx::selected_field_index_and_pattern_idx(&form, &form.fields[2]),
+            Some((2, 5))
+        );
+    }
+
+    #[test]
+    fn change_selected_field_updates_selected_field_with_repeated_name() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "00", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::from([uses_field("dup", &["1"])]),
+            &isa,
+            vec![],
+        );
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("dup", 1))
+            .field(InstructionField::variable("dup", 1).merge_mode_uses());
+        let instr = DecodedInstruction {
+            name: Some("CANDIDATE".to_string()),
+            form: Some(form.clone()),
+            bits: BitPattern::parse("00").bits,
+            fields: vec![
+                DecodedField {
+                    name: Some("dup".to_string()),
+                    value: BitPattern::parse("0"),
+                    merge_mode: MergeMode::VariableBits,
+                    is_immediate: false,
+                    is_register_read: false,
+                    is_register_write: false,
+                },
+                DecodedField {
+                    name: Some("dup".to_string()),
+                    value: BitPattern::parse("0"),
+                    merge_mode: MergeMode::Uses,
+                    is_immediate: false,
+                    is_register_read: false,
+                    is_register_write: false,
+                },
+            ],
+        };
+
+        let changed = ctx.change_selected_field(instr, &form.fields[1]);
+
+        assert_eq!(changed.bits, BitPattern::parse("01").bits);
+        assert_eq!(changed.fields[0].value, BitPattern::parse("0"));
+        assert_eq!(changed.fields[1].value, BitPattern::parse("1"));
+    }
+
     #[test]
     fn select_random_field_value_uses_constant_field_pattern() {
         let form = InstructionForm::new("candidate")
@@ -998,11 +1301,537 @@ mod tests {
         assert!(matches!(program.instructions[3], ProgramInstr::UNUSED));
         assert_eq!(
             program
-                .iter_instructions()
-                .map(|instruction| instruction.name.as_deref())
+                .iter_enumerate_instructions()
+                .map(|(_, instruction)| instruction.name.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("FIRST"), Some("SECOND")]
         );
+    }
+
+    #[test]
+    fn program_iterators_preserve_sparse_indices_and_instruction_order() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+                encoded_instruction("THIRD", "10", vec![]),
+            ],
+        );
+        let mut program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+            ],
+            4,
+        );
+
+        program.set_unused(0);
+        program.set_instruction(3, decode_one(&isa, "10", "THIRD"));
+
+        assert_eq!(
+            program
+                .iter_enumerate_instructions()
+                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(1, Some("SECOND")), (3, Some("THIRD"))]
+        );
+        assert_eq!(
+            program
+                .iter_instructions()
+                .map(|instruction| instruction.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("SECOND"), Some("THIRD")]
+        );
+
+        program.swap_instructions(1, 3);
+
+        assert_eq!(
+            program
+                .iter_enumerate_instructions()
+                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(1, Some("THIRD")), (3, Some("SECOND"))]
+        );
+    }
+
+    #[test]
+    fn program_random_instruction_selection_ignores_unused_slots() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+                encoded_instruction("THIRD", "10", vec![]),
+            ],
+        );
+        let empty = Program::from_instructions(vec![], 3);
+        let mut rng = StdRng::seed_from_u64(0x5150);
+
+        assert_eq!(empty.choose_random_instruction(&mut rng), None);
+        assert_eq!(empty.clone_random_instruction(&mut rng), None);
+        assert_eq!(empty.choose_two_random_instructions(&mut rng), None);
+        for _ in 0..16 {
+            assert!(
+                (0..3).contains(
+                    &empty
+                        .choose_random_slot(&mut rng)
+                        .expect("all program slots should be selectable")
+                )
+            );
+        }
+        assert_eq!(
+            Program::from_instructions(vec![], 0).choose_random_slot(&mut rng),
+            None
+        );
+
+        let mut program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+            ],
+            5,
+        );
+        program.set_unused(0);
+        program.set_instruction(4, decode_one(&isa, "10", "THIRD"));
+
+        for _ in 0..64 {
+            let idx = program
+                .choose_random_instruction(&mut rng)
+                .expect("program should have selectable instructions");
+            assert!([1, 4].contains(&idx));
+
+            let (idx, instruction) = program
+                .clone_random_instruction(&mut rng)
+                .expect("program should clone a selectable instruction");
+            assert!([1, 4].contains(&idx));
+            assert!(matches!(
+                instruction.name.as_deref(),
+                Some("SECOND") | Some("THIRD")
+            ));
+        }
+
+        for _ in 0..64 {
+            let idx = program
+                .choose_random_slot(&mut rng)
+                .expect("program should have selectable slots");
+            assert!(idx < program.instructions.len());
+        }
+
+        for _ in 0..16 {
+            let (left, right) = program
+                .choose_two_random_instructions(&mut rng)
+                .expect("program should have two selectable instructions");
+            assert_ne!(left, right);
+            assert!([1, 4].contains(&left));
+            assert!([1, 4].contains(&right));
+        }
+
+        program.set_unused(4);
+        assert_eq!(program.choose_two_random_instructions(&mut rng), None);
+    }
+
+    #[test]
+    fn choose_random_instruction_samples_non_unused_indices_uniformly() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+                encoded_instruction("THIRD", "10", vec![]),
+            ],
+        );
+        let mut program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+            ],
+            6,
+        );
+        program.set_unused(0);
+        program.set_instruction(3, decode_one(&isa, "10", "THIRD"));
+        let mut counts = [0usize; 3];
+        let samples = 30_000;
+        let mut rng = StdRng::seed_from_u64(0xc001);
+
+        for _ in 0..samples {
+            match program
+                .choose_random_instruction(&mut rng)
+                .expect("program should have selectable instructions")
+            {
+                1 => counts[0] += 1,
+                3 => counts[1] += 1,
+                idx => panic!("selected UNUSED or out-of-scope index {idx}"),
+            }
+        }
+
+        assert_uniform_counts(&counts[..2], samples);
+        assert_eq!(counts[2], 0);
+    }
+
+    #[test]
+    fn clone_random_instruction_samples_non_unused_instructions_uniformly() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+                encoded_instruction("THIRD", "10", vec![]),
+            ],
+        );
+        let mut program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+                decode_one(&isa, "10", "THIRD"),
+            ],
+            7,
+        );
+        program.set_unused(1);
+        program.set_instruction(5, decode_one(&isa, "01", "SECOND"));
+        let mut counts = [0usize; 3];
+        let samples = 30_000;
+        let mut rng = StdRng::seed_from_u64(0xc102e);
+
+        for _ in 0..samples {
+            let (idx, instruction) = program
+                .clone_random_instruction(&mut rng)
+                .expect("program should have selectable instructions");
+            match idx {
+                0 => {
+                    counts[0] += 1;
+                    assert_eq!(instruction.name.as_deref(), Some("FIRST"));
+                }
+                2 => {
+                    counts[1] += 1;
+                    assert_eq!(instruction.name.as_deref(), Some("THIRD"));
+                }
+                5 => {
+                    counts[2] += 1;
+                    assert_eq!(instruction.name.as_deref(), Some("SECOND"));
+                }
+                idx => panic!("selected UNUSED or out-of-scope index {idx}"),
+            }
+        }
+
+        assert_uniform_counts(&counts, samples);
+    }
+
+    #[test]
+    fn choose_random_slot_samples_all_program_slots_uniformly() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ONLY", "0", vec![])],
+        );
+        let mut program = Program::from_instructions(vec![decode_one(&isa, "0", "ONLY")], 5);
+        program.set_instruction(3, decode_one(&isa, "0", "ONLY"));
+        let mut counts = [0usize; 5];
+        let samples = 50_000;
+        let mut rng = StdRng::seed_from_u64(0x5107);
+
+        for _ in 0..samples {
+            let idx = program
+                .choose_random_slot(&mut rng)
+                .expect("nonempty program should have selectable slots");
+            counts[idx] += 1;
+        }
+
+        assert_uniform_counts(&counts, samples);
+    }
+
+    #[test]
+    fn choose_two_random_instructions_samples_pairs_uniformly_without_replacement() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+                encoded_instruction("THIRD", "10", vec![]),
+            ],
+        );
+        let mut program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+                decode_one(&isa, "10", "THIRD"),
+            ],
+            6,
+        );
+        program.set_unused(1);
+        program.set_instruction(4, decode_one(&isa, "01", "SECOND"));
+        let mut pair_counts = [0usize; 3];
+        let samples = 45_000;
+        let mut rng = StdRng::seed_from_u64(0x2a11);
+
+        for _ in 0..samples {
+            let (left, right) = program
+                .choose_two_random_instructions(&mut rng)
+                .expect("program should have two selectable instructions");
+            assert_ne!(left, right);
+            let pair = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+
+            match pair {
+                (0, 2) => pair_counts[0] += 1,
+                (0, 4) => pair_counts[1] += 1,
+                (2, 4) => pair_counts[2] += 1,
+                pair => panic!("selected pair containing UNUSED or out-of-scope index {pair:?}"),
+            }
+        }
+
+        assert_uniform_counts(&pair_counts, samples);
+    }
+
+    #[test]
+    fn random_proposal_selection_matches_configured_mutation_distribution() {
+        let mut rng = StdRng::seed_from_u64(0x600d);
+        let mut field_changes = 0;
+        let mut instruction_changes = 0;
+        let mut insert_unused = 0;
+        let mut swaps = 0;
+        let samples = 100_000;
+
+        for _ in 0..samples {
+            match ProgramMutation::random(&mut rng) {
+                ProgramMutation::FieldChange => field_changes += 1,
+                ProgramMutation::InstructionChange => instruction_changes += 1,
+                ProgramMutation::InsertUnused => insert_unused += 1,
+                ProgramMutation::SwapLines => swaps += 1,
+            }
+        }
+
+        assert_distribution_counts(
+            &[
+                (field_changes, P_FIELD_CHANGE),
+                (instruction_changes, P_INSTR_CHANGE),
+                (insert_unused, P_INSERT_UNUSED),
+                (swaps, P_SWAP_LINES),
+            ],
+            samples,
+        );
+    }
+
+    #[test]
+    fn field_change_proposal_updates_only_selected_field_and_preserves_current_program() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![instruction_with_form(
+                "CANDIDATE",
+                InstructionForm::new("candidate").field(InstructionField::variable("imm", 1)),
+                vec![],
+            )],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "0", "CANDIDATE"),
+            HashMap::from([variable_bits_use("imm", "1")]),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(vec![decode_one(&isa, "0", "CANDIDATE")], 3);
+        let current = ctx.gen_program.clone();
+
+        let proposal = ctx
+            .generate_proposal_for_mutation(ProgramMutation::FieldChange)
+            .expect("single named field should be changeable");
+
+        assert_eq!(ctx.gen_program, current);
+        assert_eq!(
+            proposal
+                .iter_enumerate_instructions()
+                .map(|(idx, instruction)| (idx, instruction.bits.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, BitPattern::parse("1").bits)]
+        );
+        assert!(matches!(proposal.instructions[1], ProgramInstr::UNUSED));
+        assert!(matches!(proposal.instructions[2], ProgramInstr::UNUSED));
+    }
+
+    #[test]
+    fn field_change_proposal_returns_none_for_constant_only_instruction() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("CONSTANT", "0", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "0", "CONSTANT"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(vec![decode_one(&isa, "0", "CONSTANT")], 3);
+
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::FieldChange),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_unused_proposal_removes_one_existing_instruction_and_preserves_current_program() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ONLY", "0", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "0", "ONLY"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(vec![decode_one(&isa, "0", "ONLY")], 3);
+        let current = ctx.gen_program.clone();
+
+        let proposal = ctx
+            .generate_proposal_for_mutation(ProgramMutation::InsertUnused)
+            .expect("single instruction should be removable");
+
+        assert_eq!(ctx.gen_program, current);
+        assert_eq!(proposal.iter_instructions().count(), 0);
+        assert!(
+            proposal
+                .instructions
+                .iter()
+                .all(|instruction| matches!(instruction, ProgramInstr::UNUSED))
+        );
+    }
+
+    #[test]
+    fn swap_lines_proposal_swaps_two_existing_instructions_and_preserves_current_program() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("FIRST", "00", vec![]),
+                encoded_instruction("SECOND", "01", vec![]),
+            ],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "FIRST"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "00", "FIRST"),
+                decode_one(&isa, "01", "SECOND"),
+            ],
+            4,
+        );
+        let current = ctx.gen_program.clone();
+
+        let proposal = ctx
+            .generate_proposal_for_mutation(ProgramMutation::SwapLines)
+            .expect("two instructions should be swappable");
+
+        assert_eq!(ctx.gen_program, current);
+        assert_eq!(
+            proposal
+                .iter_enumerate_instructions()
+                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(0, Some("SECOND")), (1, Some("FIRST"))]
+        );
+        assert!(matches!(proposal.instructions[2], ProgramInstr::UNUSED));
+        assert!(matches!(proposal.instructions[3], ProgramInstr::UNUSED));
+    }
+
+    #[test]
+    fn impossible_mutations_return_none_when_generated_program_has_no_instructions() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "00", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::FieldChange),
+            None
+        );
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::InsertUnused),
+            None
+        );
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::SwapLines),
+            None
+        );
+
+        ctx.gen_program = Program::from_instructions(vec![], 0);
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::InstructionChange),
+            None
+        );
+    }
+
+    #[test]
+    fn instruction_change_proposal_can_insert_into_unused_slot() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "00", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        let proposal = ctx
+            .generate_proposal_for_mutation(ProgramMutation::InstructionChange)
+            .expect("instruction change should select from UNUSED slots too");
+
+        assert_eq!(ctx.gen_program.iter_instructions().count(), 0);
+        assert_eq!(proposal.iter_instructions().count(), 1);
+        assert_eq!(
+            proposal
+                .iter_instructions()
+                .next()
+                .and_then(|instruction| instruction.name.as_deref()),
+            Some("ORIGINAL")
+        );
+    }
+
+    #[test]
+    fn generate_proposal_returns_new_program_without_mutating_current_program() {
+        let candidate_form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("opcode", 1).merge_mode_uses())
+            .field(InstructionField::variable("imm", 1));
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction("ORIGINAL", "00", vec![]),
+                instruction_with_form("CANDIDATE", candidate_form, vec![]),
+            ],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::from([uses_field("opcode", &["1"]), variable_bits_use("imm", "x")]),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(
+            vec![
+                decode_one(&isa, "10", "CANDIDATE"),
+                decode_one(&isa, "11", "CANDIDATE"),
+            ],
+            4,
+        );
+
+        for _ in 0..128 {
+            let current = ctx.gen_program.clone();
+            let proposal = ctx.generate_proposal();
+
+            assert_eq!(ctx.gen_program, current);
+            assert_eq!(proposal.instructions.len(), current.instructions.len());
+        }
     }
 
     #[test]
@@ -1030,7 +1859,7 @@ mod tests {
             ctx.original_program,
             Program::from_instructions(vec![original], SUPEROPTIMIZATION_PROGRAM_LEN)
         );
-        assert_eq!(ctx.gen_program.iter_instructions().count(), 0);
+        assert_eq!(ctx.gen_program.iter_enumerate_instructions().count(), 0);
         assert!(ctx.counterexamples.is_empty());
         assert!(ctx.valid_field_uses.contains_key("imm"));
     }
@@ -1450,10 +2279,12 @@ mod tests {
             .naive_superoptimize()
             .expect("naive superoptimizer should find the commuted add");
 
-        let replacement_instructions = replacement.iter_instructions().collect::<Vec<_>>();
+        let replacement_instructions = replacement
+            .iter_enumerate_instructions()
+            .collect::<Vec<_>>();
         assert_eq!(replacement_instructions.len(), 1);
         assert_eq!(
-            replacement_instructions[0].name.as_deref(),
+            replacement_instructions[0].1.name.as_deref(),
             Some("CANDIDATE_ADD")
         );
         assert_eq!(ctx.gen_program, replacement);
@@ -1505,8 +2336,8 @@ mod tests {
             .expect("naive superoptimizer should build the value through r2");
 
         let names = replacement
-            .iter_instructions()
-            .map(|instruction| instruction.name.as_deref())
+            .iter_enumerate_instructions()
+            .map(|instruction| instruction.1.name.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(names, vec![Some("SET_R0_ONE"), Some("SET_R1_TWO")]);
         assert_eq!(ctx.gen_program, replacement);
