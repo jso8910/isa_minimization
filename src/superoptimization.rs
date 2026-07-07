@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use itertools::Itertools;
 use rand::{
     RngExt,
     distr::{Distribution, weighted::WeightedIndex},
@@ -38,9 +37,14 @@ pub struct SuperoptimizationCtx<'a> {
     gen_program: Program,
     gen_program_cost: f64,
     original_program_effects: Vec<Effect>,
+    equality_manager: EquivalenceManager<'a>,
     protected_registers: Vec<ArchitecturalRegister>,
 
     instr_form_encoding_count: Vec<(usize, usize, u64)>,
+
+    /// Candidates which are perfect matches to the original program
+    /// Stored as a tuple with their total cost
+    perfect_matches: Vec<(f64, Program)>,
 
     rng: ThreadRng,
 }
@@ -57,6 +61,8 @@ impl<'a> SuperoptimizationCtx<'a> {
         let rng = rand::rng();
         let gen_program = Program::from_instructions(vec![], SUPEROPTIMIZATION_PROGRAM_LEN);
         let original_program_effects = instruction_seq_to_effects(&original_program, isa);
+        let equality_manager = EquivalenceManager::from_left_instruction(&original_program, isa);
+        let perfect_matches = vec![];
 
         // Generate the legal count per instruction in the ISA
         let mut instr_form_encoding_count = Vec::new();
@@ -85,9 +91,11 @@ impl<'a> SuperoptimizationCtx<'a> {
             gen_program,
             gen_program_cost: f64::INFINITY,
             original_program_effects,
+            equality_manager,
             protected_registers,
             instr_form_encoding_count,
             rng,
+            perfect_matches,
         }
     }
 
@@ -368,62 +376,17 @@ impl<'a> SuperoptimizationCtx<'a> {
         Some(value)
     }
 
-    /// Naive superoptimization which merely iterates through all valid instructions,
-    /// checks whether they are valid (`instruction_valid`), checks whether they meet state constraints,
-    /// then does the following to check whether the instruction sequences match, only moving to the next check if previous succeeds
-    ///     1. Compare canonical forms of all effect exprs - if equal, they match
-    ///             TODO not done yet
-    ///     2. Check 5 random MachineState cases
-    ///             TODO not done yet
-    ///     3. Checks against all MachineStates in counterexamples
-    ///     4. Checking using a BDD whether the sequences are equivalent, adding counterexamples if applicable
-    pub fn naive_superoptimize(&mut self) -> Option<Program> {
-        self.clear_counterexamples();
-        let mut equivalence_manager =
-            EquivalenceManager::from_left_instruction(&self.original_program, self.isa);
-        // let candidates = self.all_legal_instructions();
-        // println!("{}", candidates.len());
-        // just iterate by length
-        // this is quite naive
-        for length in 0..10 {
-            println!("{}", length);
-            let mut i = 0;
-            // for sequence in candidates.iter().cloned().permutations(length) {
-            // i += 1;
-            // if i % 10_000 == 0 {
-            //     println!("{i}");
-            // }
-            // if !self.sequence_meets_state_constraints(&sequence) {
-            //     continue;
-            // }
-            // if !self.sequence_matches_counterexamples(&sequence) {
-            //     continue;
-            // }
-            // equivalence_manager.replace_right_instruction(&sequence);
-            // let BddEquality::Unequal(counterexample) = equivalence_manager
-            //     .compare_instructions()
-            //     .unwrap_or_else(|e| panic!("Error: {e}"))
-            // else {
-            //     self.gen_program = sequence.clone();
-            //     return Some(sequence);
-            // };
-            // self.add_counterexample(counterexample);
-            // }
-        }
-
-        None
-    }
-
     /// Returns the cost of a new instruction sequence, and selects it if applicable
     /// If false is returned, the proposal was not accepted.
     /// If true is returned, gen_instruction_seq is set to the `proposal` and
     /// `gen_instruction_seq_cost` is set to `cost(proposal)`
     fn decide_proposal_acceptance(&mut self, proposal: Program) -> bool {
-        // Preliminary cost -- not yet complete calculating
-        let mut cost: f64 = self
+        let performance_cost: f64 = self
             .performance_cost(&proposal)
             .try_into()
             .expect("Could not convert u32 to f64");
+        // Preliminary cost -- not yet complete calculating
+        let mut cost = performance_cost;
 
         // Now, calculate random number which determines whether new sequence is selected
         let random: f64 = self.rng.random();
@@ -434,7 +397,7 @@ impl<'a> SuperoptimizationCtx<'a> {
 
         // We accept the new proposal iff:
         // cost' < cost - log(p) / beta, beta = 1/T (inverse temperature)
-        let maximum_cost: f64 = self.gen_program_cost
+        let mut maximum_cost: f64 = self.gen_program_cost
             - random.ln() * f64::try_from(MCMC_TEMP).expect("Could not convert u32 to f64");
 
         for counterexample in self.counterexamples.iter() {
@@ -445,6 +408,33 @@ impl<'a> SuperoptimizationCtx<'a> {
                 return false;
             }
         }
+
+        // If equality_cost == 0 (ie passes all counterexamples), we need to check the equality with a bdd
+        if cost == performance_cost {
+            let result = self.compare_program(&proposal);
+            if let BddEquality::Unequal(counterexample) = result {
+                // Before we add the new counterexample, we want to maintain the random component of
+                // the maximum cost
+                // This can be done by subtracting self.gen_program_cost then adding it back once
+                // it's been modified
+                maximum_cost -= self.gen_program_cost;
+                self.add_counterexample(counterexample.clone());
+                maximum_cost += self.gen_program_cost;
+
+                // Add the cost of the new counterexample
+                cost += self.equality_cost(&proposal, &counterexample);
+
+                // At this point, performance cost and cost should not be equal
+                // because the equality cost of the new counterexample should be nonzero
+                assert_ne!(performance_cost, cost);
+                if cost > maximum_cost {
+                    return false;
+                }
+            } else {
+                self.add_match(proposal.clone(), cost);
+            }
+        }
+
         self.gen_program_cost = cost;
         self.gen_program = proposal;
         true
@@ -480,6 +470,18 @@ impl<'a> SuperoptimizationCtx<'a> {
             .expect("Could not convert u32 to f64");
 
         equality_cost
+    }
+
+    /// Compares a program candidate to the original program
+    fn compare_program(&mut self, sequence: &Program) -> BddEquality {
+        self.equality_manager.replace_right_instruction(sequence);
+        self.equality_manager
+            .compare_instructions()
+            .expect("BDD comparison allocation failed")
+    }
+
+    fn add_match(&mut self, program: Program, cost: f64) {
+        self.perfect_matches.push((cost, program));
     }
 
     fn add_counterexample(&mut self, counterexample: MachineState) {
@@ -2014,6 +2016,177 @@ mod tests {
     }
 
     #[test]
+    fn add_match_records_perfect_candidate_and_cost() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "0", vec![])],
+        );
+        let original = decode_one(&isa, "0", "ORIGINAL");
+        let program =
+            Program::from_instructions(vec![original.clone()], SUPEROPTIMIZATION_PROGRAM_LEN);
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            original,
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        ctx.add_match(program.clone(), 42.0);
+
+        assert_eq!(ctx.perfect_matches, vec![(42.0, program)]);
+    }
+
+    #[test]
+    fn compare_program_reuses_manager_for_equal_and_unequal_candidates() {
+        let r0 = read_reg(0);
+        let r1 = read_reg(1);
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(
+                        fixed_reg(2),
+                        add(r0.clone(), r1.clone()),
+                    )],
+                ),
+                encoded_instruction(
+                    "EQUIVALENT",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(2), add(r1, r0.clone()))],
+                ),
+                encoded_instruction(
+                    "DIFFERENT",
+                    "10",
+                    vec![Effect::write_register(
+                        fixed_reg(2),
+                        sub(r0, constant(1, 32)),
+                    )],
+                ),
+            ],
+        );
+        let original = decode_one(&isa, "00", "ORIGINAL");
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            original.clone(),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.compare_program(&Program::from_instructions(
+                vec![decode_one(&isa, "01", "EQUIVALENT")],
+                SUPEROPTIMIZATION_PROGRAM_LEN,
+            )),
+            BddEquality::Equal
+        );
+        assert!(matches!(
+            ctx.compare_program(&Program::from_instructions(
+                vec![decode_one(&isa, "10", "DIFFERENT")],
+                SUPEROPTIMIZATION_PROGRAM_LEN,
+            )),
+            BddEquality::Unequal(_)
+        ));
+        assert_eq!(
+            ctx.compare_program(&Program::from_instructions(
+                vec![original],
+                SUPEROPTIMIZATION_PROGRAM_LEN,
+            )),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
+    fn decide_proposal_acceptance_adds_counterexample_when_bdd_finds_hidden_difference() {
+        let r0 = read_reg(0);
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(
+                        fixed_reg(1),
+                        add(r0.clone(), constant(1, 32)),
+                    )],
+                ),
+                encoded_instruction(
+                    "DIFFERENT",
+                    "01",
+                    vec![Effect::write_register(
+                        fixed_reg(1),
+                        add(r0, constant(2, 32)),
+                    )],
+                ),
+            ],
+        );
+        let original = decode_one(&isa, "00", "ORIGINAL");
+        let proposal = Program::from_instructions(
+            vec![decode_one(&isa, "01", "DIFFERENT")],
+            SUPEROPTIMIZATION_PROGRAM_LEN,
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            original,
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert!(ctx.counterexamples.is_empty());
+        assert!(ctx.decide_proposal_acceptance(proposal.clone()));
+
+        assert_eq!(ctx.counterexamples.len(), 1);
+        assert!(!ctx.passes_test(&proposal, &ctx.counterexamples[0]));
+        assert!(ctx.perfect_matches.is_empty());
+        assert_eq!(ctx.gen_program, proposal);
+        assert!(ctx.gen_program_cost > WEIGHT_PROG_LEN as f64);
+    }
+
+    #[test]
+    fn decide_proposal_acceptance_records_perfect_match_when_bdd_proves_equal() {
+        let r0 = read_reg(0);
+        let r1 = read_reg(1);
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(
+                        fixed_reg(2),
+                        add(r0.clone(), r1.clone()),
+                    )],
+                ),
+                encoded_instruction(
+                    "EQUIVALENT",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(2), add(r1, r0))],
+                ),
+            ],
+        );
+        let original = decode_one(&isa, "00", "ORIGINAL");
+        let proposal = Program::from_instructions(
+            vec![decode_one(&isa, "01", "EQUIVALENT")],
+            SUPEROPTIMIZATION_PROGRAM_LEN,
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            original,
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert!(ctx.decide_proposal_acceptance(proposal.clone()));
+
+        assert!(ctx.counterexamples.is_empty());
+        assert_eq!(
+            ctx.perfect_matches,
+            vec![(WEIGHT_PROG_LEN as f64, proposal)]
+        );
+    }
+
+    #[test]
     fn sequence_matches_counterexamples_requires_all_tests_to_pass() {
         let isa = test_isa(
             StackDirection::Downwards,
@@ -2238,109 +2411,6 @@ mod tests {
         let instr = decode_one(&isa, "01000", "CANDIDATE");
 
         assert!(!ctx.instruction_valid(&instr));
-    }
-
-    #[test]
-    #[ignore = "naive superoptimizer path is currently unfinished"]
-    fn naive_superoptimize_finds_equivalent_single_instruction_in_minimal_isa() {
-        let r0 = read_reg(0);
-        let r1 = read_reg(1);
-        let isa = test_isa(
-            StackDirection::Downwards,
-            vec![
-                instruction_with_form(
-                    "ORIGINAL_ADD",
-                    InstructionForm::new("original").field(
-                        InstructionField::named("op", BitPattern::parse("0")).merge_mode_uses(),
-                    ),
-                    vec![Effect::write_register(
-                        fixed_reg(2),
-                        add(r0.clone(), r1.clone()),
-                    )],
-                ),
-                instruction_with_form(
-                    "CANDIDATE_ADD",
-                    InstructionForm::new("candidate").field(
-                        InstructionField::named("op", BitPattern::parse("1")).merge_mode_uses(),
-                    ),
-                    vec![Effect::write_register(fixed_reg(2), add(r1, r0))],
-                ),
-            ],
-        );
-        let original = decode_one(&isa, "0", "ORIGINAL_ADD");
-        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
-            original,
-            HashMap::from([uses_field("op", &["1"])]),
-            &isa,
-            vec![],
-        );
-
-        let replacement = ctx
-            .naive_superoptimize()
-            .expect("naive superoptimizer should find the commuted add");
-
-        let replacement_instructions = replacement
-            .iter_enumerate_instructions()
-            .collect::<Vec<_>>();
-        assert_eq!(replacement_instructions.len(), 1);
-        assert_eq!(
-            replacement_instructions[0].1.name.as_deref(),
-            Some("CANDIDATE_ADD")
-        );
-        assert_eq!(ctx.gen_program, replacement);
-        assert!(ctx.counterexamples.is_empty());
-    }
-
-    #[test]
-    #[ignore = "naive superoptimizer path is currently unfinished"]
-    fn naive_superoptimize_finds_two_instruction_replacement_in_minimal_isa() {
-        let isa = test_isa(
-            StackDirection::Downwards,
-            vec![
-                instruction_with_form(
-                    "ORIGINAL_SET_TWO_REGISTERS",
-                    InstructionForm::new("original").field(
-                        InstructionField::named("op", BitPattern::parse("00")).merge_mode_uses(),
-                    ),
-                    vec![
-                        Effect::write_register(fixed_reg(0), constant(1, 2)),
-                        Effect::write_register(fixed_reg(1), constant(2, 2)),
-                    ],
-                ),
-                instruction_with_form(
-                    "SET_R0_ONE",
-                    InstructionForm::new("first").field(
-                        InstructionField::named("op", BitPattern::parse("01")).merge_mode_uses(),
-                    ),
-                    vec![Effect::write_register(fixed_reg(0), constant(1, 2))],
-                ),
-                instruction_with_form(
-                    "SET_R1_TWO",
-                    InstructionForm::new("second").field(
-                        InstructionField::named("op", BitPattern::parse("10")).merge_mode_uses(),
-                    ),
-                    vec![Effect::write_register(fixed_reg(1), constant(2, 2))],
-                ),
-            ],
-        );
-        let original = decode_one(&isa, "00", "ORIGINAL_SET_TWO_REGISTERS");
-        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
-            original,
-            HashMap::from([uses_field("op", &["01", "10"])]),
-            &isa,
-            vec![],
-        );
-
-        let replacement = ctx
-            .naive_superoptimize()
-            .expect("naive superoptimizer should build the value through r2");
-
-        let names = replacement
-            .iter_enumerate_instructions()
-            .map(|instruction| instruction.1.name.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec![Some("SET_R0_ONE"), Some("SET_R1_TWO")]);
-        assert_eq!(ctx.gen_program, replacement);
     }
 
     #[test]
