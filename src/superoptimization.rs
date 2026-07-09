@@ -4,7 +4,10 @@
 //      1. Identify whether the instruction is valid under the new ISA
 //      2. If it is not valid, generate some functionally equivalent replacement for the instruction
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use rand::{
     RngExt,
@@ -17,7 +20,8 @@ use crate::{
     bit::{Bit, BitPattern},
     constants::{
         MCMC_TEMP, P_FIELD_CHANGE, P_INSERT_UNUSED, P_INSTR_CHANGE, P_SWAP_LINES,
-        SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_PROG_LEN,
+        SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_ILLEGAL_READ, WEIGHT_PROG_LEN,
+        WEIGHT_REVISIT_PENALTY,
     },
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
@@ -25,19 +29,22 @@ use crate::{
         InstructionForm, MergeMode, StackDirection,
     },
     semantic_matching::{
-        BddEquality, EquivalenceManager, MachineState, evaluate_expr, instruction_seq_to_effects,
+        BddEquality, ConcreteProgram, MachineState, Z3EquivalenceManager, evaluate_expr,
+        instruction_seq_to_effects, write_concrete_memory_bytes,
     },
 };
 
 pub struct SuperoptimizationCtx<'a> {
     pub isa: &'a ISA,
     valid_field_uses: HashMap<FieldName, FieldUses>,
-    counterexamples: Vec<MachineState>,
+    // counterexample, input/desired output pairs
+    counterexamples: Vec<(MachineState, MachineState)>,
     original_program: Program,
+    original_concrete_program: ConcreteProgram,
     gen_program: Program,
     gen_program_cost: f64,
     original_program_effects: Vec<Effect>,
-    equality_manager: EquivalenceManager<'a>,
+    equality_manager: Z3EquivalenceManager<'a>,
     protected_registers: Vec<ArchitecturalRegister>,
 
     instr_form_encoding_count: Vec<(usize, usize, u64)>,
@@ -45,6 +52,8 @@ pub struct SuperoptimizationCtx<'a> {
     /// Candidates which are perfect matches to the original program
     /// Stored as a tuple with their total cost
     perfect_matches: Vec<(f64, Program)>,
+
+    seen_programs: HashMap<ProgramFinalWriteKey, f64>,
 
     rng: ThreadRng,
 }
@@ -61,8 +70,11 @@ impl<'a> SuperoptimizationCtx<'a> {
         let rng = rand::rng();
         let gen_program = Program::from_instructions(vec![], SUPEROPTIMIZATION_PROGRAM_LEN);
         let original_program_effects = instruction_seq_to_effects(&original_program, isa);
-        let equality_manager = EquivalenceManager::from_left_instruction(&original_program, isa);
+        let original_concrete_program = ConcreteProgram::from_program(&original_program, isa);
+        let equality_manager = Z3EquivalenceManager::from_left_instruction(&original_program, isa);
         let perfect_matches = vec![];
+
+        let seen_programs = HashMap::new();
 
         // Generate the legal count per instruction in the ISA
         let mut instr_form_encoding_count = Vec::new();
@@ -88,6 +100,7 @@ impl<'a> SuperoptimizationCtx<'a> {
             valid_field_uses,
             counterexamples: vec![],
             original_program,
+            original_concrete_program,
             gen_program,
             gen_program_cost: f64::INFINITY,
             original_program_effects,
@@ -96,6 +109,7 @@ impl<'a> SuperoptimizationCtx<'a> {
             instr_form_encoding_count,
             rng,
             perfect_matches,
+            seen_programs,
         }
     }
 
@@ -137,6 +151,98 @@ impl<'a> SuperoptimizationCtx<'a> {
         true
     }
 
+    pub fn generate_candidates(&mut self, target_candidates: usize, max_iters: u32) {
+        self.seen_programs = HashMap::new();
+
+        let mut num_iters = 0;
+        let mut acceptance_count: f64 = 0.0;
+        loop {
+            if self.perfect_matches.len() >= target_candidates {
+                return;
+            }
+
+            if num_iters > max_iters {
+                return;
+            }
+
+            // Once we add the first counterexample, we want to use that machinestate template to
+            // add some more randomized test cases
+            if self.counterexamples.len() == 1 {
+                for _ in 0..2 {
+                    let (mut instate, _) = self.counterexamples.first().unwrap().clone();
+                    for (_ident, value) in instate.registers.iter_mut() {
+                        let width = value.width;
+                        value.value = self.rng.random::<u128>() & bit_mask(width).unwrap();
+                    }
+                    for (_location, value) in instate.memory.iter_mut() {
+                        let width = value.width;
+                        value.value = self.rng.random::<u128>() & bit_mask(width).unwrap();
+                    }
+                    let desired_output = self.original_concrete_program.execute(&instate);
+                    self.add_counterexample(instate, desired_output);
+                }
+            }
+
+            let proposal_start = Instant::now();
+            let proposal = self.generate_proposal();
+            let proposal_elapsed = proposal_start.elapsed();
+            let acceptance_start = Instant::now();
+            let accepted = self.decide_proposal_acceptance(proposal);
+            if accepted {
+                acceptance_count += 1.0;
+
+                // Insert this program into seen programs
+                let key = self.gen_program.final_write_key(self.isa);
+                let num_visits = self.seen_programs.entry(key).or_insert(0.0);
+                *num_visits += 1.0;
+            }
+            let acceptance_elapsed = acceptance_start.elapsed();
+            let proposal_acceptance_ratio =
+                proposal_elapsed.as_secs_f64() / acceptance_elapsed.as_secs_f64();
+            num_iters += 1;
+            if num_iters % 100 == 0 {
+                println!(
+                    "{} {} {} {} {} {} {} {}",
+                    num_iters,
+                    max_iters,
+                    self.gen_program.iter_instructions().count(),
+                    self.gen_program_cost,
+                    accepted,
+                    self.counterexamples.len(),
+                    proposal_acceptance_ratio,
+                    acceptance_count / f64::try_from(num_iters).unwrap() // self.gen_program.iter_instructions().map(|i| &i.fields).collect::<Vec<_>>()
+                );
+            }
+            if num_iters % 5000 == 0 {
+                self.print_current_canonical_effects(num_iters);
+            }
+        }
+    }
+
+    pub fn perfect_matches(&self) -> &[(f64, Program)] {
+        &self.perfect_matches
+    }
+
+    fn print_current_canonical_effects(&self, num_iters: u32) {
+        println!("==== current program at iteration {num_iters} ====");
+        for (idx, instruction) in self.gen_program.iter_enumerate_instructions() {
+            println!(
+                "[{idx}] {:?} bits={:?} fields={:?}",
+                instruction.name, instruction.bits, instruction.fields
+            );
+
+            let instruction_effects = instruction_effects(instruction, self.isa);
+            for (effect_idx, effect) in instruction_effects.iter().cloned().enumerate() {
+                let effect = collapse_effect_for_debug(effect, instruction);
+                if effect_guard_is_const_zero(&effect) {
+                    continue;
+                }
+                println!("  effect[{effect_idx}] {effect:#?}");
+            }
+        }
+        println!("==== end current program ====");
+    }
+
     /// Mutates the current program to return a new proposal
     /// Can do any of these with the following probabilities
     ///     - P_FIELD_CHANGE - change a random field in a random non-UNUSED instruction
@@ -172,6 +278,9 @@ impl<'a> SuperoptimizationCtx<'a> {
                     .choose(&mut self.rng)?;
                 let new_instruction =
                     self.change_selected_field(instruction, &form.fields[field_idx]);
+                if !form.when.check(&new_instruction) || !self.instruction_valid(&new_instruction) {
+                    return None;
+                }
 
                 new_program.set_instruction(idx, new_instruction);
             }
@@ -385,23 +494,38 @@ impl<'a> SuperoptimizationCtx<'a> {
             .performance_cost(&proposal)
             .try_into()
             .expect("Could not convert u32 to f64");
+        let illegal_read_cost =
+            self.sequence_illegal_read_count(&proposal) as f64 * WEIGHT_ILLEGAL_READ;
+
+        // Cost = w * ln(1 + num_visits)
+        let seen_sequence_cost = WEIGHT_REVISIT_PENALTY
+            * self
+                .seen_programs
+                .entry(proposal.final_write_key(self.isa))
+                .or_insert(0.0)
+                .ln_1p();
+        let proposal_base_cost = performance_cost + illegal_read_cost + seen_sequence_cost;
         // Preliminary cost -- not yet complete calculating
-        let mut cost = performance_cost;
+        let mut cost = proposal_base_cost;
 
         // Now, calculate random number which determines whether new sequence is selected
         let random: f64 = self.rng.random();
 
         // Currently, I am assuming that the "proposal distribution is symmetric" invariant is true
-        // If it isn't, the calculations will be slightly worse.
+        // If it isn't, the calculations will be slightly different.
         // FIXME make sure this is true givne my specific proposal distribution
 
         // We accept the new proposal iff:
         // cost' < cost - log(p) / beta, beta = 1/T (inverse temperature)
-        let mut maximum_cost: f64 = self.gen_program_cost
-            - random.ln() * f64::try_from(MCMC_TEMP).expect("Could not convert u32 to f64");
+        let mut maximum_cost: f64 = self.gen_program_cost - random.ln() * MCMC_TEMP;
 
-        for counterexample in self.counterexamples.iter() {
-            cost += self.equality_cost(&proposal, counterexample);
+        if cost > maximum_cost {
+            return false;
+        }
+
+        let proposal_concrete = ConcreteProgram::from_program(&proposal, self.isa);
+        for (counterexample, desired_output) in self.counterexamples.iter() {
+            cost += self.equality_cost(&proposal_concrete, counterexample, desired_output);
 
             // At this point, we can exit early
             if cost > maximum_cost {
@@ -409,24 +533,27 @@ impl<'a> SuperoptimizationCtx<'a> {
             }
         }
 
-        // If equality_cost == 0 (ie passes all counterexamples), we need to check the equality with a bdd
-        if cost == performance_cost {
+        // If equality_cost == 0 (ie passes all counterexamples), ask Z3 for an
+        // authoritative counterexample or proof.
+        if cost == proposal_base_cost {
+            println!("HERE");
             let result = self.compare_program(&proposal);
             if let BddEquality::Unequal(counterexample) = result {
+                let desired_output = self.original_concrete_program.execute(&counterexample);
                 // Before we add the new counterexample, we want to maintain the random component of
                 // the maximum cost
                 // This can be done by subtracting self.gen_program_cost then adding it back once
                 // it's been modified
                 maximum_cost -= self.gen_program_cost;
-                self.add_counterexample(counterexample.clone());
+                self.add_counterexample(counterexample.clone(), desired_output.clone());
                 maximum_cost += self.gen_program_cost;
 
                 // Add the cost of the new counterexample
-                cost += self.equality_cost(&proposal, &counterexample);
+                cost += self.equality_cost(&proposal_concrete, &counterexample, &desired_output);
 
-                // At this point, performance cost and cost should not be equal
+                // At this point, base cost and cost should not be equal
                 // because the equality cost of the new counterexample should be nonzero
-                assert_ne!(performance_cost, cost);
+                assert_ne!(proposal_base_cost, cost);
                 if cost > maximum_cost {
                     return false;
                 }
@@ -449,9 +576,13 @@ impl<'a> SuperoptimizationCtx<'a> {
     }
 
     /// Calculates equality cost for a sequence against a single counterexample
-    fn equality_cost(&self, sequence: &Program, counterexample: &MachineState) -> f64 {
-        let new_machinestate = self.execute_test(&sequence, &counterexample);
-        let desired_machinestate = self.execute_test(&self.original_program, &counterexample);
+    fn equality_cost(
+        &self,
+        sequence: &ConcreteProgram,
+        counterexample: &MachineState,
+        desired_output: &MachineState,
+    ) -> f64 {
+        let new_machinestate = sequence.execute(counterexample);
 
         let sp_val = counterexample
             .registers
@@ -459,7 +590,7 @@ impl<'a> SuperoptimizationCtx<'a> {
             .map(|value| value.value)
             .unwrap_or(0);
 
-        let equality_cost: f64 = desired_machinestate
+        let equality_cost: f64 = desired_output
             .compare(
                 &new_machinestate,
                 &self.protected_registers,
@@ -475,19 +606,19 @@ impl<'a> SuperoptimizationCtx<'a> {
     /// Compares a program candidate to the original program
     fn compare_program(&mut self, sequence: &Program) -> BddEquality {
         self.equality_manager.replace_right_instruction(sequence);
-        self.equality_manager
-            .compare_instructions()
-            .expect("BDD comparison allocation failed")
+        self.equality_manager.compare_instructions()
     }
 
     fn add_match(&mut self, program: Program, cost: f64) {
         self.perfect_matches.push((cost, program));
     }
 
-    fn add_counterexample(&mut self, counterexample: MachineState) {
+    fn add_counterexample(&mut self, counterexample: MachineState, desired_output: MachineState) {
         // Add the extra cost to gen_instruction_seq_cost
-        self.gen_program_cost += self.equality_cost(&self.gen_program, &counterexample);
-        self.counterexamples.push(counterexample);
+        let gen_concrete_program = ConcreteProgram::from_program(&self.gen_program, self.isa);
+        self.gen_program_cost +=
+            self.equality_cost(&gen_concrete_program, &counterexample, &desired_output);
+        self.counterexamples.push((counterexample, desired_output));
     }
 
     fn clear_counterexamples(&mut self) {
@@ -498,20 +629,14 @@ impl<'a> SuperoptimizationCtx<'a> {
             .expect("Could not convert u32 to f64");
     }
 
-    /// Checks an instruction sequence against all counterexamples
-    /// Returns true if it matches all, false if it doesnt
-    fn sequence_matches_counterexamples(&self, sequence: &Program) -> bool {
-        // todo!();
-        self.counterexamples
-            .iter()
-            // .all(|state| self.check_sequence_machinestate(sequence, state))
-            .all(|state| self.passes_test(sequence, state))
-    }
-
     /// Whether an instruction sequence passes a test
-    pub fn passes_test(&self, sequence: &Program, state: &MachineState) -> bool {
-        let original_state = self.execute_test(&self.original_program, state);
-        let generated_state = self.execute_test(sequence, state);
+    pub fn passes_test(
+        &self,
+        seq_effects: &[Effect],
+        state: &MachineState,
+        original_state: &MachineState,
+    ) -> bool {
+        let generated_state = self.execute_test(seq_effects, state);
         let sp_val = state
             .registers
             .get(&(self.isa.sp.register.identifier as u128))
@@ -527,9 +652,9 @@ impl<'a> SuperoptimizationCtx<'a> {
     }
 
     /// Runs an instruction sequence against a MachineState, and returns the resulting MachineState
-    pub fn execute_test(&self, sequence: &Program, state: &MachineState) -> MachineState {
+    pub fn execute_test(&self, effects: &[Effect], state: &MachineState) -> MachineState {
         let mut next_state = state.clone();
-        for effect in instruction_seq_to_effects(sequence, self.isa) {
+        for effect in effects {
             match effect {
                 Effect::WriteRegister {
                     guard,
@@ -560,7 +685,7 @@ impl<'a> SuperoptimizationCtx<'a> {
                     if let (Some(address), Some(value)) =
                         (evaluate_expr(&address, state), evaluate_expr(&value, state))
                     {
-                        next_state.memory.insert((address.value, width), value);
+                        write_concrete_memory_bytes(&mut next_state, address, value, *width);
                     }
                 }
             }
@@ -576,6 +701,10 @@ impl<'a> SuperoptimizationCtx<'a> {
             &self.protected_registers,
             self.isa,
         )
+    }
+
+    fn sequence_illegal_read_count(&self, sequence: &Program) -> u32 {
+        generated_program_illegal_read_count(sequence, &self.original_program_effects, self.isa)
     }
 
     fn form_field_uses_are_compatible(&self, form: &InstructionForm) -> bool {
@@ -625,6 +754,64 @@ impl ProgramMutation {
     }
 }
 
+fn instruction_effects<'a>(instruction: &DecodedInstruction, isa: &'a ISA) -> &'a [Effect] {
+    let instruction_name = instruction
+        .name
+        .as_ref()
+        .expect("Instruction should have a name");
+    &isa.instructions
+        .iter()
+        .find(|candidate| candidate.name == *instruction_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "Instruction in sequence should match an ISA instruction, but {instruction_name} did not match"
+            )
+        })
+        .effects
+}
+
+fn collapse_effect_for_debug(effect: Effect, instruction: &DecodedInstruction) -> Effect {
+    match effect {
+        Effect::WriteRegister {
+            guard,
+            register,
+            value,
+        } => Effect::WriteRegister {
+            guard: guard.collapse(instruction).canonicalize(),
+            register: register.collapse(instruction).canonicalize(),
+            value: value.collapse(instruction).canonicalize(),
+        },
+        Effect::WriteMemory {
+            guard,
+            address,
+            value,
+            width,
+        } => Effect::WriteMemory {
+            guard: guard.collapse(instruction).canonicalize(),
+            address: address.collapse(instruction).canonicalize(),
+            value: value.collapse(instruction).canonicalize(),
+            width,
+        },
+    }
+}
+
+fn effect_guard_is_const_zero(effect: &Effect) -> bool {
+    let guard = match effect {
+        Effect::WriteRegister { guard, .. } | Effect::WriteMemory { guard, .. } => guard,
+    };
+    matches!(guard, Expr::Const { value: 0, .. })
+}
+
+fn effect_destination(effect: &Effect) -> EffectDestination {
+    match effect {
+        Effect::WriteRegister { register, .. } => EffectDestination::Register(register.clone()),
+        Effect::WriteMemory { address, width, .. } => EffectDestination::Memory {
+            address: address.clone(),
+            width: *width,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramInstr {
     UNUSED,
@@ -634,6 +821,23 @@ pub enum ProgramInstr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub instructions: Vec<ProgramInstr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProgramFinalWriteKey {
+    writes: Vec<ProgramFinalWrite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProgramFinalWrite {
+    sort_key: String,
+    effect: Effect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EffectDestination {
+    Register(Expr),
+    Memory { address: Expr, width: u16 },
 }
 
 impl Program {
@@ -665,6 +869,32 @@ impl Program {
     pub fn iter_instructions(&self) -> impl Iterator<Item = &DecodedInstruction> {
         self.iter_enumerate_instructions()
             .map(|(_, instruction)| instruction)
+    }
+
+    pub fn final_write_key(&self, isa: &ISA) -> ProgramFinalWriteKey {
+        let mut final_writes = HashMap::new();
+
+        for instruction in self.iter_instructions() {
+            for effect in instruction_effects(instruction, isa).iter().cloned() {
+                let effect = collapse_effect_for_debug(effect, instruction);
+                if effect_guard_is_const_zero(&effect) {
+                    continue;
+                }
+
+                final_writes.insert(effect_destination(&effect), effect);
+            }
+        }
+
+        let mut writes: Vec<_> = final_writes
+            .into_iter()
+            .map(|(destination, effect)| ProgramFinalWrite {
+                sort_key: format!("{destination:?}"),
+                effect,
+            })
+            .collect();
+        writes.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+        ProgramFinalWriteKey { writes }
     }
 
     /// Returns a random, non UNUSED instruction
@@ -752,12 +982,17 @@ fn expand_variable_bits(bits: &[Bit]) -> Vec<Vec<Bit>> {
     expanded
 }
 
-/// Cheaply rejects generated instruction sequences that use unsupported state destinations.
+/// Cheaply rejects generated instruction sequences that use unsupported state accesses.
 ///
 /// This is intended for the superoptimization hot path. It performs only syntactic checks after
 /// lowering effects into the initial-state coordinate system:
+/// - generated reads are legal only when they read state the original program read, or state the
+///   generated program has already written earlier in the sequence,
+/// - the stack pointer is not a free general-purpose input: SP reads are ignored for illegal-read
+///   accounting only when they appear inside memory address expressions, or inside an effect that
+///   writes SP itself,
 /// - register write destinations must be constants/fixed registers,
-///     - these constant registers are not protected by some form of read dependency or convention
+///     - these constant registers are not protected by some form of read dependency or convention,
 /// - the stack pointer register may not be written,
 /// - memory writes must either target an original memory write destination exactly or an approved
 ///   SP-relative scratch byte,
@@ -770,6 +1005,10 @@ pub fn generated_sequence_meets_state_constraints(
 ) -> bool {
     let original_effects = instruction_seq_to_effects(original, isa);
     let generated_effects = instruction_seq_to_effects(generated, isa);
+
+    if generated_program_illegal_read_count(generated, &original_effects, isa) != 0 {
+        return false;
+    }
 
     generated_effects_meet_state_constraints(
         &generated_effects,
@@ -789,8 +1028,6 @@ pub fn generated_effects_meet_state_constraints(
     protected_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
-    let protected_register_identifiers: Vec<_> =
-        protected_registers.iter().map(|r| r.identifier).collect();
     if !original_effects.iter().all(|original_effect| {
         generated_effects
             .iter()
@@ -799,6 +1036,112 @@ pub fn generated_effects_meet_state_constraints(
         return false;
     }
 
+    generated_effects.iter().all(|effect| {
+        effect_write_destination_is_legal(effect, original_effects, protected_registers, isa)
+    })
+}
+
+fn generated_program_illegal_read_count(
+    generated: &Program,
+    original_effects: &[Effect],
+    isa: &ISA,
+) -> u32 {
+    let original_reads =
+        StateReads::from_effects(original_effects, Some(isa.sp.register.identifier as u128));
+    let mut written_registers = HashSet::new();
+    let mut written_memory = Vec::new();
+    let mut illegal_reads = 0;
+
+    for instruction in generated.iter_instructions() {
+        for effect in instruction_effects(instruction, isa).iter().cloned() {
+            let effect = collapse_effect_for_debug(effect, instruction);
+            if effect_guard_is_const_zero(&effect) {
+                continue;
+            }
+
+            illegal_reads += effect_illegal_read_count(
+                &effect,
+                &original_reads,
+                &written_registers,
+                &written_memory,
+                isa,
+            );
+
+            record_effect_write(&effect, &mut written_registers, &mut written_memory);
+        }
+    }
+
+    illegal_reads
+}
+
+#[derive(Default)]
+struct StateReads {
+    registers: HashSet<u128>,
+    memory: Vec<(Expr, u16)>,
+}
+
+impl StateReads {
+    fn from_effects(effects: &[Effect], sp_register: Option<u128>) -> Self {
+        let mut reads = Self::default();
+        for effect in effects {
+            collect_effect_reads(effect, &mut reads.registers, &mut reads.memory, sp_register);
+        }
+        reads
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SpReadExemption {
+    register: u128,
+    exempt_all_reads: bool,
+}
+
+fn effect_illegal_read_count(
+    effect: &Effect,
+    original_reads: &StateReads,
+    written_registers: &HashSet<u128>,
+    written_memory: &[(Expr, u16)],
+    isa: &ISA,
+) -> u32 {
+    let mut reads = StateReads::default();
+    collect_effect_reads(
+        effect,
+        &mut reads.registers,
+        &mut reads.memory,
+        Some(isa.sp.register.identifier as u128),
+    );
+
+    let illegal_register_reads = reads
+        .registers
+        .iter()
+        .filter(|register| {
+            !original_reads.registers.contains(register) && !written_registers.contains(register)
+        })
+        .count();
+    let illegal_memory_reads = reads
+        .memory
+        .iter()
+        .filter(|read| {
+            !original_reads
+                .memory
+                .iter()
+                .any(|original_read| original_read == *read)
+                && !written_memory.iter().any(|written| written == *read)
+        })
+        .count();
+
+    u32::try_from(illegal_register_reads + illegal_memory_reads)
+        .expect("illegal read count should fit into u32")
+}
+
+fn effect_write_destination_is_legal(
+    effect: &Effect,
+    original_effects: &[Effect],
+    protected_registers: &[ArchitecturalRegister],
+    isa: &ISA,
+) -> bool {
+    let protected_register_identifiers: Vec<_> =
+        protected_registers.iter().map(|r| r.identifier).collect();
     let original_memory_destinations: Vec<_> = original_effects
         .iter()
         .filter_map(|effect| match effect {
@@ -806,7 +1149,6 @@ pub fn generated_effects_meet_state_constraints(
             Effect::WriteRegister { .. } => None,
         })
         .collect();
-
     let original_register_identifiers: Vec<_> = original_effects
         .iter()
         .filter_map(|effect| match effect {
@@ -815,17 +1157,14 @@ pub fn generated_effects_meet_state_constraints(
         })
         .collect();
 
-    generated_effects.iter().all(|effect| match effect {
+    match effect {
         Effect::WriteRegister { register, .. } => {
-            // Check whether write is to an illegal destination
-            register_destination(register)
-                .is_some_and(|destination| destination != isa.sp.register.identifier as u128 && !protected_register_identifiers.contains(&(destination as u8)))
-            // but the destination is legal if it was an original register identifier
-            || original_register_identifiers
-                .iter()
-                // Register must be Some, not None
-                .any(|original_ident| register_destination(register)
-                    .is_some_and(|r| Some(r) == *original_ident))
+            register_destination(register).is_some_and(|destination| {
+                destination != isa.sp.register.identifier as u128
+                    && !protected_register_identifiers.contains(&(destination as u8))
+            }) || original_register_identifiers.iter().any(|original_ident| {
+                register_destination(register).is_some_and(|r| Some(r) == *original_ident)
+            })
         }
         Effect::WriteMemory { address, .. } => {
             original_memory_destinations
@@ -833,7 +1172,195 @@ pub fn generated_effects_meet_state_constraints(
                 .any(|original_address| *original_address == address)
                 || is_allowed_stack_scratch_address(address, isa)
         }
-    })
+    }
+}
+
+fn record_effect_write(
+    effect: &Effect,
+    written_registers: &mut HashSet<u128>,
+    written_memory: &mut Vec<(Expr, u16)>,
+) {
+    match effect {
+        Effect::WriteRegister { register, .. } => {
+            if let Some(register) = register_destination(register) {
+                written_registers.insert(register);
+            }
+        }
+        Effect::WriteMemory { address, width, .. } => {
+            written_memory.push((address.clone(), *width));
+        }
+    }
+}
+
+fn collect_effect_reads(
+    effect: &Effect,
+    registers: &mut HashSet<u128>,
+    memory: &mut Vec<(Expr, u16)>,
+    sp_register: Option<u128>,
+) {
+    let sp_exemption = sp_register.map(|register| SpReadExemption {
+        register,
+        exempt_all_reads: effect_writes_register(effect, register),
+    });
+
+    match effect {
+        Effect::WriteRegister {
+            guard,
+            register,
+            value,
+        } => {
+            collect_expr_reads(guard, registers, memory, sp_exemption);
+            collect_expr_reads(register, registers, memory, sp_exemption);
+            collect_expr_reads(value, registers, memory, sp_exemption);
+        }
+        Effect::WriteMemory {
+            guard,
+            address,
+            value,
+            ..
+        } => {
+            collect_expr_reads(guard, registers, memory, sp_exemption);
+            collect_address_expr_reads(address, registers, memory, sp_exemption);
+            collect_expr_reads(value, registers, memory, sp_exemption);
+        }
+    }
+}
+
+fn collect_expr_reads(
+    expr: &Expr,
+    registers: &mut HashSet<u128>,
+    memory: &mut Vec<(Expr, u16)>,
+    sp_exemption: Option<SpReadExemption>,
+) {
+    match expr {
+        Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => {}
+        Expr::ReadRegister { register, .. } => {
+            collect_expr_reads(register, registers, memory, sp_exemption);
+            if let Some(register) = register_destination(register) {
+                if !sp_exemption.is_some_and(|exemption| {
+                    exemption.exempt_all_reads && register == exemption.register
+                }) {
+                    registers.insert(register);
+                }
+            }
+        }
+        Expr::ReadMemory { address, width } => {
+            collect_address_expr_reads(address, registers, memory, sp_exemption);
+            record_memory_read(memory, address, *width);
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Xor(lhs, rhs)
+        | Expr::ShiftLeft(lhs, rhs)
+        | Expr::LogicalShiftRight(lhs, rhs)
+        | Expr::ArithmeticShiftRight(lhs, rhs)
+        | Expr::RotateRight(lhs, rhs)
+        | Expr::Equal(lhs, rhs)
+        | Expr::UnsignedLessThan(lhs, rhs)
+        | Expr::SignedLessThan(lhs, rhs) => {
+            collect_expr_reads(lhs, registers, memory, sp_exemption);
+            collect_expr_reads(rhs, registers, memory, sp_exemption);
+        }
+        Expr::Not(value)
+        | Expr::Extract { value, .. }
+        | Expr::ZeroExtend { value, .. }
+        | Expr::SignExtend { value, .. }
+        | Expr::CountOnes(value) => collect_expr_reads(value, registers, memory, sp_exemption),
+        Expr::Concat(values) => {
+            for value in values {
+                collect_expr_reads(value, registers, memory, sp_exemption);
+            }
+        }
+        Expr::AddCarryOut {
+            lhs, rhs, carry_in, ..
+        }
+        | Expr::AddOverflow {
+            lhs, rhs, carry_in, ..
+        } => {
+            collect_expr_reads(lhs, registers, memory, sp_exemption);
+            collect_expr_reads(rhs, registers, memory, sp_exemption);
+            collect_expr_reads(carry_in, registers, memory, sp_exemption);
+        }
+        Expr::SubCarryOut {
+            lhs,
+            rhs,
+            borrow_in,
+            ..
+        }
+        | Expr::SubOverflow {
+            lhs,
+            rhs,
+            borrow_in,
+            ..
+        } => {
+            collect_expr_reads(lhs, registers, memory, sp_exemption);
+            collect_expr_reads(rhs, registers, memory, sp_exemption);
+            collect_expr_reads(borrow_in, registers, memory, sp_exemption);
+        }
+        Expr::Select {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_expr_reads(condition, registers, memory, sp_exemption);
+            collect_expr_reads(when_true, registers, memory, sp_exemption);
+            collect_expr_reads(when_false, registers, memory, sp_exemption);
+        }
+    }
+}
+
+fn collect_address_expr_reads(
+    expr: &Expr,
+    registers: &mut HashSet<u128>,
+    memory: &mut Vec<(Expr, u16)>,
+    sp_exemption: Option<SpReadExemption>,
+) {
+    collect_expr_reads(
+        expr,
+        registers,
+        memory,
+        sp_exemption.map(|exemption| SpReadExemption {
+            exempt_all_reads: true,
+            ..exemption
+        }),
+    );
+}
+
+fn record_memory_read(memory: &mut Vec<(Expr, u16)>, address: &Expr, width: u16) {
+    let address = address.clone().canonicalize();
+    if width % 8 != 0 {
+        memory.push((address, width));
+        return;
+    }
+
+    for byte_offset in 0..(width / 8) {
+        let byte_address = if byte_offset == 0 {
+            address.clone()
+        } else {
+            Expr::Add(
+                Box::new(address.clone()),
+                Box::new(Expr::Const {
+                    value: byte_offset as u128,
+                    width: 32,
+                }),
+            )
+            .canonicalize()
+        };
+        memory.push((byte_address, 8));
+    }
+}
+
+fn effect_writes_register(effect: &Effect, register: u128) -> bool {
+    matches!(
+        effect,
+        Effect::WriteRegister {
+            register: destination,
+            ..
+        } if register_destination(destination) == Some(register)
+    )
 }
 
 fn effect_destinations_match(left: &Effect, right: &Effect) -> bool {
@@ -966,9 +1493,12 @@ mod tests {
     use super::*;
     use crate::{
         bit::BitPattern,
-        instruction_semantics::{Register, add, constant, fixed_register, read_register, sub},
+        instruction_semantics::{
+            Register, add, constant, fixed_register, read_memory, read_register, sub,
+        },
         isa_specification::{
-            Instruction, InstructionField, InstructionForm, StackPointer, field_eq,
+            Instruction, InstructionField, InstructionForm, StackPointer, field_eq, field_in, not,
+            or,
         },
         semantic_matching::BitWord,
     };
@@ -1044,6 +1574,14 @@ mod tests {
         Program::from_instructions(vec![decode_one(isa, bits, expected_name)], 1)
     }
 
+    fn effects(isa: &ISA, program: &Program) -> Vec<Effect> {
+        instruction_seq_to_effects(program, isa)
+    }
+
+    fn desired_output(ctx: &SuperoptimizationCtx<'_>, state: &MachineState) -> MachineState {
+        ctx.execute_test(&ctx.original_program_effects, state)
+    }
+
     fn variable_bits_use(name: &str, pattern: &str) -> (FieldName, FieldUses) {
         (
             name.to_owned(),
@@ -1055,6 +1593,14 @@ mod tests {
     }
 
     fn uses_field(name: &str, patterns: &[&str]) -> (FieldName, FieldUses) {
+        let len = patterns
+            .first()
+            .map(|pattern| pattern.len())
+            .expect("Uses test helper requires at least one pattern");
+        assert!(
+            patterns.iter().all(|pattern| pattern.len() == len),
+            "Uses test helper patterns must have the same length"
+        );
         (
             name.to_owned(),
             FieldUses::Uses {
@@ -1063,6 +1609,7 @@ mod tests {
                     .iter()
                     .map(|pattern| BitPattern::parse(pattern))
                     .collect(),
+                len,
             },
         )
     }
@@ -1308,6 +1855,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("FIRST"), Some("SECOND")]
         );
+    }
+
+    #[test]
+    fn final_write_key_ignores_unused_slots() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "A",
+                    "0",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "B",
+                    "1",
+                    vec![Effect::write_register(fixed_reg(2), constant(2, 32))],
+                ),
+            ],
+        );
+        let a = decode_one(&isa, "0", "A");
+        let b = decode_one(&isa, "1", "B");
+        let left = Program {
+            instructions: vec![
+                ProgramInstr::Instruction(a.clone()),
+                ProgramInstr::UNUSED,
+                ProgramInstr::Instruction(b.clone()),
+            ],
+        };
+        let right = Program {
+            instructions: vec![
+                ProgramInstr::UNUSED,
+                ProgramInstr::Instruction(a),
+                ProgramInstr::Instruction(b),
+            ],
+        };
+        let mut seen = HashSet::new();
+        seen.insert(left.final_write_key(&isa));
+
+        assert_eq!(left.final_write_key(&isa), right.final_write_key(&isa));
+        assert!(seen.contains(&right.final_write_key(&isa)));
+    }
+
+    #[test]
+    fn final_write_key_keeps_only_last_write_to_each_destination() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "OLD",
+                    "0",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "FINAL",
+                    "1",
+                    vec![Effect::write_register(fixed_reg(1), constant(2, 32))],
+                ),
+            ],
+        );
+        let old = decode_one(&isa, "0", "OLD");
+        let final_write = decode_one(&isa, "1", "FINAL");
+        let with_overwrite = Program::from_instructions(vec![old, final_write.clone()], 2);
+        let final_only = Program::from_instructions(vec![final_write], 1);
+
+        assert_eq!(
+            with_overwrite.final_write_key(&isa),
+            final_only.final_write_key(&isa)
+        );
+    }
+
+    #[test]
+    fn final_write_key_ignores_order_for_different_destinations() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "A",
+                    "0",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "B",
+                    "1",
+                    vec![Effect::write_register(fixed_reg(2), constant(2, 32))],
+                ),
+            ],
+        );
+        let a = decode_one(&isa, "0", "A");
+        let b = decode_one(&isa, "1", "B");
+        let ab = Program::from_instructions(vec![a.clone(), b.clone()], 2);
+        let ba = Program::from_instructions(vec![b, a], 2);
+
+        assert_eq!(ab.final_write_key(&isa), ba.final_write_key(&isa));
     }
 
     #[test]
@@ -1672,6 +2312,58 @@ mod tests {
     }
 
     #[test]
+    fn field_change_proposal_rejects_mutation_that_fails_not_field_in_predicate() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![instruction_with_form(
+                "CANDIDATE",
+                InstructionForm::new("candidate")
+                    .field(InstructionField::variable("mode", 2).merge_mode_uses())
+                    .when(not(field_in("mode", ["10"]))),
+                vec![],
+            )],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "CANDIDATE"),
+            HashMap::from([uses_field("mode", &["10"])]),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(vec![decode_one(&isa, "00", "CANDIDATE")], 1);
+
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::FieldChange),
+            None
+        );
+    }
+
+    #[test]
+    fn field_change_proposal_rejects_mutation_that_fails_or_predicate() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![instruction_with_form(
+                "CANDIDATE",
+                InstructionForm::new("candidate")
+                    .field(InstructionField::variable("mode", 2).merge_mode_uses())
+                    .when(or([field_eq("mode", "00"), field_eq("mode", "11")])),
+                vec![],
+            )],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "CANDIDATE"),
+            HashMap::from([uses_field("mode", &["10"])]),
+            &isa,
+            vec![],
+        );
+        ctx.gen_program = Program::from_instructions(vec![decode_one(&isa, "00", "CANDIDATE")], 1);
+
+        assert_eq!(
+            ctx.generate_proposal_for_mutation(ProgramMutation::FieldChange),
+            None
+        );
+    }
+
+    #[test]
     fn insert_unused_proposal_removes_one_existing_instruction_and_preserves_current_program() {
         let isa = test_isa(
             StackDirection::Downwards,
@@ -2006,7 +2698,9 @@ mod tests {
         assert_eq!(ctx.gen_program, proposal);
         assert_eq!(ctx.gen_program_cost, WEIGHT_PROG_LEN as f64);
 
-        ctx.add_counterexample(MachineState::default());
+        let counterexample = MachineState::default();
+        let desired_output = desired_output(&ctx, &counterexample);
+        ctx.add_counterexample(counterexample, desired_output);
         assert_eq!(ctx.counterexamples.len(), 1);
         assert_eq!(ctx.gen_program_cost, WEIGHT_PROG_LEN as f64);
 
@@ -2137,7 +2831,9 @@ mod tests {
         assert!(ctx.decide_proposal_acceptance(proposal.clone()));
 
         assert_eq!(ctx.counterexamples.len(), 1);
-        assert!(!ctx.passes_test(&proposal, &ctx.counterexamples[0]));
+        let (counterexample, desired_output) = &ctx.counterexamples[0];
+        let proposal_effects = effects(&isa, &proposal);
+        assert!(!ctx.passes_test(&proposal_effects, counterexample, desired_output));
         assert!(ctx.perfect_matches.is_empty());
         assert_eq!(ctx.gen_program, proposal);
         assert!(ctx.gen_program_cost > WEIGHT_PROG_LEN as f64);
@@ -2187,40 +2883,6 @@ mod tests {
     }
 
     #[test]
-    fn sequence_matches_counterexamples_requires_all_tests_to_pass() {
-        let isa = test_isa(
-            StackDirection::Downwards,
-            vec![
-                encoded_instruction(
-                    "ORIGINAL",
-                    "00",
-                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
-                ),
-                encoded_instruction(
-                    "MATCHING",
-                    "01",
-                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
-                ),
-                encoded_instruction(
-                    "DIFFERENT",
-                    "10",
-                    vec![Effect::write_register(fixed_reg(1), constant(2, 32))],
-                ),
-            ],
-        );
-        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
-            decode_one(&isa, "00", "ORIGINAL"),
-            HashMap::new(),
-            &isa,
-            vec![],
-        );
-        ctx.counterexamples.push(MachineState::default());
-
-        assert!(ctx.sequence_matches_counterexamples(&sequence(&isa, "01", "MATCHING")));
-        assert!(!ctx.sequence_matches_counterexamples(&sequence(&isa, "10", "DIFFERENT")));
-    }
-
-    #[test]
     fn sequence_meets_state_constraints_accepts_matching_destinations() {
         let isa = test_isa(
             StackDirection::Downwards,
@@ -2245,6 +2907,243 @@ mod tests {
         );
 
         assert!(ctx.sequence_meets_state_constraints(&sequence(&isa, "01", "GENERATED")));
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_counts_unwritten_unoriginal_register_reads() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(fixed_reg(1), read_reg(0))],
+                ),
+                encoded_instruction(
+                    "READS_EXTRA",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(1), read_reg(2))],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READS_EXTRA")),
+            1
+        );
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_allows_reads_from_generated_scratch_writes() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(fixed_reg(1), read_reg(0))],
+                ),
+                encoded_instruction(
+                    "WRITE_SCRATCH",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(2), read_reg(0))],
+                ),
+                encoded_instruction(
+                    "READ_SCRATCH",
+                    "10",
+                    vec![Effect::write_register(fixed_reg(1), read_reg(2))],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+        let generated = Program::from_instructions(
+            vec![
+                decode_one(&isa, "01", "WRITE_SCRATCH"),
+                decode_one(&isa, "10", "READ_SCRATCH"),
+            ],
+            2,
+        );
+
+        assert_eq!(ctx.sequence_illegal_read_count(&generated), 0);
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_counts_stack_pointer_value_reads() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "READ_SP_VALUE",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(1), sp_value())],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_SP_VALUE")),
+            1
+        );
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_allows_stack_pointer_address_reads() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "WRITE_STACK",
+                    "01",
+                    vec![Effect::write_memory(
+                        sub(sp_value(), constant(4, 32)),
+                        constant(0xaa, 8),
+                        8,
+                    )],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "WRITE_STACK")),
+            0
+        );
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_allows_stack_pointer_nested_memory_address_reads() {
+        let stack_address = sub(sp_value(), constant(4, 32));
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(
+                        fixed_reg(1),
+                        read_memory(stack_address.clone(), 32),
+                    )],
+                ),
+                encoded_instruction(
+                    "READ_STACK",
+                    "01",
+                    vec![Effect::write_register(
+                        fixed_reg(1),
+                        read_memory(stack_address, 32),
+                    )],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_STACK")),
+            0
+        );
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_does_not_treat_original_stack_address_as_sp_value_read() {
+        let stack_address = sub(sp_value(), constant(4, 32));
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(
+                        fixed_reg(1),
+                        read_memory(stack_address, 32),
+                    )],
+                ),
+                encoded_instruction(
+                    "READ_SP_VALUE",
+                    "01",
+                    vec![Effect::write_register(fixed_reg(1), sp_value())],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_SP_VALUE")),
+            1
+        );
+    }
+
+    #[test]
+    fn proposal_state_access_penalty_allows_stack_pointer_reads_when_writing_stack_pointer() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![
+                encoded_instruction(
+                    "ORIGINAL",
+                    "00",
+                    vec![Effect::write_register(fixed_reg(1), constant(1, 32))],
+                ),
+                encoded_instruction(
+                    "WRITE_SP",
+                    "01",
+                    vec![Effect::write_register(
+                        fixed_reg(SP_ID),
+                        add(sp_value(), constant(4, 32)),
+                    )],
+                ),
+            ],
+        );
+        let ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "00", "ORIGINAL"),
+            HashMap::new(),
+            &isa,
+            vec![],
+        );
+
+        assert_eq!(
+            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "WRITE_SP")),
+            0
+        );
     }
 
     #[test]
@@ -2444,7 +3343,9 @@ mod tests {
             memory: HashMap::from([((0x100, 8), BitWord::new(0x11, 8))]),
         };
 
-        let next_state = ctx.execute_test(&sequence(&isa, "0001", "GENERATED"), &state);
+        let generated = sequence(&isa, "0001", "GENERATED");
+        let generated_effects = effects(&isa, &generated);
+        let next_state = ctx.execute_test(&generated_effects, &state);
 
         assert_eq!(next_state.registers.get(&0), Some(&BitWord::new(7, 32)));
         assert_eq!(next_state.registers.get(&1), Some(&BitWord::new(12, 32)));
@@ -2487,7 +3388,9 @@ mod tests {
             memory: HashMap::from([((0x100, 8), BitWord::new(0x34, 8))]),
         };
 
-        let next_state = ctx.execute_test(&sequence(&isa, "0001", "GUARDED"), &state);
+        let guarded = sequence(&isa, "0001", "GUARDED");
+        let guarded_effects = effects(&isa, &guarded);
+        let next_state = ctx.execute_test(&guarded_effects, &state);
 
         assert_eq!(next_state, state);
     }
@@ -2526,7 +3429,11 @@ mod tests {
             memory: HashMap::new(),
         };
 
-        assert!(ctx.passes_test(&sequence(&isa, "0001", "GENERATED"), &state));
+        let generated = sequence(&isa, "0001", "GENERATED");
+        let generated_effects = effects(&isa, &generated);
+        let original_state = desired_output(&ctx, &state);
+
+        assert!(ctx.passes_test(&generated_effects, &state, &original_state));
     }
 
     #[test]
@@ -2554,7 +3461,11 @@ mod tests {
         );
         let state = MachineState::default();
 
-        assert!(!ctx.passes_test(&sequence(&isa, "0001", "GENERATED"), &state));
+        let generated = sequence(&isa, "0001", "GENERATED");
+        let generated_effects = effects(&isa, &generated);
+        let original_state = desired_output(&ctx, &state);
+
+        assert!(!ctx.passes_test(&generated_effects, &state, &original_state));
     }
 
     #[test]
@@ -2592,9 +3503,16 @@ mod tests {
         );
         let state = MachineState::default();
         let generated = sequence(&isa, "0001", "GENERATED");
+        let generated_effects = effects(&isa, &generated);
+        let unprotected_original_state = desired_output(&unprotected_ctx, &state);
+        let protected_original_state = desired_output(&protected_ctx, &state);
 
-        assert!(unprotected_ctx.passes_test(&generated, &state));
-        assert!(!protected_ctx.passes_test(&generated, &state));
+        assert!(unprotected_ctx.passes_test(
+            &generated_effects,
+            &state,
+            &unprotected_original_state
+        ));
+        assert!(!protected_ctx.passes_test(&generated_effects, &state, &protected_original_state));
     }
 
     #[test]

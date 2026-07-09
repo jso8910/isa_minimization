@@ -21,7 +21,7 @@ use crate::{
 /// combines different widths, `Select` has a 1-bit condition plus equal-width
 /// result arms, and carry/borrow helpers have a separate 1-bit flag input.
 /// Some width errors are detected only after fields have been collapsed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Expr {
     /// Literal bit-vector value with an explicit width.
     ///
@@ -1973,7 +1973,7 @@ pub type FieldName = String;
 ///
 /// Operand references name bits from the instruction encoding. They are not
 /// mutable state and do not themselves read architectural registers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum OperandRef {
     /// Register-number operand.
     ///
@@ -1990,7 +1990,7 @@ pub enum OperandRef {
 }
 
 /// Source for a register identifier used by `OperandRef::RegisterField`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum RegisterRef {
     /// A fixed architectural or virtual register identifier.
     ///
@@ -2025,7 +2025,7 @@ pub struct Register(
 /// "virtual" register addresses
 /// For example, while ARM, in reality, only has r0-r15, it also has the NZCV flags.
 /// The behavior of these can be modeled by saying that the register with FieldId = 16 is eg the negative flag
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Effect {
     /// Conditionally write an architectural or virtual register.
     ///

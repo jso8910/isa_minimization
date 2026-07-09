@@ -21,10 +21,15 @@ petgraph = "0.8.3"
 oxidd = "0.11.0"
 itertools = "0.15.0"
 rand = "0.10.2"
+z3 = { version = "0.20", features = ["bundled"] }
 
 [dev-dependencies]
 criterion = "0.5"
 
 [[bench]]
 name = "simulate"
+harness = false
+
+[[bench]]
+name = "generate_candidates"
 harness = false

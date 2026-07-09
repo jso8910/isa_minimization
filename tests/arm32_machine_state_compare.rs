@@ -10,7 +10,9 @@ use isa_minimization::{
     isa_specification::{
         DecodedField, DecodedInstruction, FieldUses, ISA, MergeMode, StackDirection, StackPointer,
     },
-    semantic_matching::{BddEquality, BitWord, EquivalenceManager, MachineState},
+    semantic_matching::{
+        BddEquality, BitWord, EquivalenceManager, MachineState, instruction_seq_to_effects,
+    },
     superoptimization::{Program, SuperoptimizationCtx},
 };
 
@@ -49,6 +51,7 @@ fn field_uses_from(program: &[DecodedInstruction]) -> HashMap<FieldName, FieldUs
                 MergeMode::Uses => FieldUses::Uses {
                     name: name.clone(),
                     patterns: [value.clone()].into_iter().collect(),
+                    len: value.len(),
                 },
                 MergeMode::VariableBits => FieldUses::VariableBits {
                     name: name.clone(),
@@ -160,11 +163,13 @@ fn execute_both(
     let ctx = ctx_for_execute(isa, left.clone(), protected_registers);
     let left = program_from(left);
     let right = program_from(right);
+    let left_effects = instruction_seq_to_effects(&left, isa);
+    let right_effects = instruction_seq_to_effects(&right, isa);
 
     (
         counterexample.clone(),
-        ctx.execute_test(&left, &counterexample),
-        ctx.execute_test(&right, &counterexample),
+        ctx.execute_test(&left_effects, &counterexample),
+        ctx.execute_test(&right_effects, &counterexample),
     )
 }
 
@@ -179,11 +184,13 @@ fn execute_both_with_sp(
     let ctx = ctx_for_execute(isa, left.clone(), vec![]);
     let left = program_from(left);
     let right = program_from(right);
+    let left_effects = instruction_seq_to_effects(&left, isa);
+    let right_effects = instruction_seq_to_effects(&right, isa);
 
     (
         counterexample.clone(),
-        ctx.execute_test(&left, &counterexample),
-        ctx.execute_test(&right, &counterexample),
+        ctx.execute_test(&left_effects, &counterexample),
+        ctx.execute_test(&right_effects, &counterexample),
     )
 }
 
@@ -228,8 +235,10 @@ fn bdd_counterexample_execute_test_and_compare_cover_scratch_and_protected_regis
     let ctx = ctx_for_execute(&isa, left.clone(), vec![arm32::gpr(8)]);
     let left = program_from(left);
     let right = program_from(right);
-    let left_state = ctx.execute_test(&left, &counterexample);
-    let right_state = ctx.execute_test(&right, &counterexample);
+    let left_effects = instruction_seq_to_effects(&left, &isa);
+    let right_effects = instruction_seq_to_effects(&right, &isa);
+    let left_state = ctx.execute_test(&left_effects, &counterexample);
+    let right_state = ctx.execute_test(&right_effects, &counterexample);
 
     assert_eq!(register_value(&left_state, 1), BitWord::new(1, 32));
     assert_eq!(register_value(&right_state, 1), BitWord::new(2, 32));

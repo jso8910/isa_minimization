@@ -14,12 +14,18 @@ const RIGHT_EXPR: bool = false;
 use std::{
     collections::{HashMap, HashSet},
     ops::{BitAnd, BitOr, BitXor},
+    time::{Duration, Instant},
 };
 
 use oxidd::{
     BooleanFunction, BooleanFunctionQuant, Manager, ManagerRef,
     bcdd::{BCDDFunction, BCDDManagerRef},
     util::{AllocResult, OptBool},
+};
+use z3::{
+    Config as Z3Config, Model as Z3Model, SatResult, Solver, Sort,
+    ast::{Array as Z3Array, BV, Bool},
+    with_z3_config,
 };
 
 use crate::{
@@ -35,6 +41,39 @@ use crate::{
 };
 
 pub type InstructionIdx = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectExprRole {
+    Guard,
+    Destination,
+    Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InstructionSeqToEffectsProfile {
+    pub total: Duration,
+    pub instruction_lookup: Duration,
+    pub lowering_total: Duration,
+    pub collapse: Duration,
+    pub lower_memory_reads: Duration,
+    pub substitute: Duration,
+    pub canonicalize: Duration,
+    pub combine_total: Duration,
+
+    pub instructions: usize,
+    pub source_effects: usize,
+    pub source_register_effects: usize,
+    pub source_memory_effects: usize,
+    pub lowered_effects: usize,
+    pub lowered_register_effects: usize,
+    pub lowered_memory_effects: usize,
+    pub combine_attempts: usize,
+    pub combine_matches: usize,
+    pub max_accumulated_effects: usize,
+    pub final_effects: usize,
+    pub source_expr_nodes: usize,
+    pub lowered_expr_nodes: usize,
+}
 
 /// A table of all state uses
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,8 +173,12 @@ impl<'a> EquivalenceManager<'a> {
     }
 
     pub fn replace_right_instruction(&mut self, new_right: &Program) {
-        self.right_effects =
-            Self::canonical_effects(instruction_seq_to_effects(new_right, self.isa));
+        let right_effects = instruction_seq_to_effects(new_right, self.isa);
+        self.replace_right_effects(&right_effects);
+    }
+
+    pub fn replace_right_effects(&mut self, new_right_effects: &[Effect]) {
+        self.right_effects = Self::canonical_effects(new_right_effects.to_vec());
         for (idx, effect) in self.left_effects.iter().enumerate() {
             let (left_ident, is_memory) = Self::effect_ident(effect);
 
@@ -265,6 +308,719 @@ impl<'a> EquivalenceManager<'a> {
         width: u16,
     ) -> Expr {
         select(guard, value, read_register(register, width)).canonicalize()
+    }
+}
+
+/// Z3-backed equivalence checker for decoded instruction sequences.
+///
+/// The BDD checker compares collapsed final effects. This checker symbolically
+/// executes each instruction in order, keeping register files and memory as Z3
+/// arrays, then asks whether any original/left write destination can differ in
+/// the final state.
+pub struct Z3EquivalenceManager<'a> {
+    left: Program,
+    right: Program,
+    isa: &'a ISA,
+    timeout: Option<Duration>,
+}
+
+impl<'a> Z3EquivalenceManager<'a> {
+    pub fn from_instructions(left: &Program, right: &Program, isa: &'a ISA) -> Self {
+        Self {
+            left: left.clone(),
+            right: right.clone(),
+            isa,
+            timeout: Some(Duration::from_millis(5_000)),
+        }
+    }
+
+    pub fn from_left_instruction(left: &Program, isa: &'a ISA) -> Self {
+        Self::from_instructions(left, left, isa)
+    }
+
+    pub fn replace_right_instruction(&mut self, new_right: &Program) {
+        self.right = new_right.clone();
+    }
+
+    pub fn replace_right_effects(&mut self, new_right_effects: &[Effect]) {
+        let _ = new_right_effects;
+        panic!("Z3EquivalenceManager executes Programs directly; use replace_right_instruction")
+    }
+
+    pub fn compare_instructions(&mut self) -> BddEquality {
+        let mut cfg = Z3Config::new();
+        if let Some(timeout) = self.timeout {
+            cfg.set_timeout_msec(timeout.as_millis().try_into().unwrap_or(u64::MAX));
+        }
+
+        with_z3_config(&cfg, || {
+            let initial = Z3State::new();
+            let (left_final, observations) = initial.execute_program(&self.left, self.isa, true);
+            let (right_final, _) = initial.execute_program(&self.right, self.isa, false);
+            let solver = Solver::new();
+
+            let differences =
+                self.destination_differences(&observations, &left_final, &right_final);
+            if differences.is_empty() {
+                return BddEquality::Equal;
+            }
+
+            let difference_refs = differences.iter().collect::<Vec<_>>();
+            solver.assert(&Bool::or(&difference_refs));
+
+            match solver.check() {
+                SatResult::Unsat => BddEquality::Equal,
+                SatResult::Sat => {
+                    let model = solver
+                        .get_model()
+                        .expect("SAT result should provide a Z3 model");
+                    BddEquality::Unequal(self.model_to_machine_state(&model, &initial))
+                }
+                SatResult::Unknown => {
+                    panic!("Z3 equivalence query returned unknown")
+                }
+            }
+        })
+    }
+
+    fn destination_differences(
+        &self,
+        observations: &[Z3Observation],
+        left_final: &Z3State,
+        right_final: &Z3State,
+    ) -> Vec<Bool> {
+        observations
+            .iter()
+            .map(|observation| match observation {
+                Z3Observation::Register { selector, width } => {
+                    let left_value = left_final.read_register(selector, *width);
+                    let right_value = right_final.read_register(selector, *width);
+                    left_value.ne(&right_value)
+                }
+                Z3Observation::Memory { address, width } => {
+                    let left_value = left_final.read_memory(address, *width);
+                    let right_value = right_final.read_memory(address, *width);
+                    left_value.ne(&right_value)
+                }
+            })
+            .collect()
+    }
+
+    fn model_to_machine_state(&self, model: &Z3Model, initial: &Z3State) -> MachineState {
+        let mut state = MachineState::default();
+
+        for register in &self.isa.registers {
+            let selector = bv_const(
+                register.identifier as u128,
+                register.identifier_width.into(),
+            );
+            let value = initial.read_register(&selector, register.width.into());
+            if let Some(value) = eval_model_bv(model, &value) {
+                state.registers.insert(register.identifier as u128, value);
+            }
+        }
+
+        self.add_program_state_points(&mut state, model, initial, &self.left);
+        self.add_program_state_points(&mut state, model, initial, &self.right);
+
+        state
+    }
+
+    fn add_program_state_points(
+        &self,
+        state: &mut MachineState,
+        model: &Z3Model,
+        initial: &Z3State,
+        program: &Program,
+    ) {
+        let mut symbolic_state = initial.clone();
+        for instruction in program.iter_instructions() {
+            let before = symbolic_state.clone();
+            let mut after = symbolic_state.clone();
+            for effect in instruction_effects(instruction, self.isa).iter().cloned() {
+                let effect = collapse_effect(effect, instruction);
+                self.add_effect_state_points(state, model, initial, &before, &effect);
+                after.apply_collapsed_effect(&effect, &before);
+            }
+            symbolic_state = after;
+        }
+    }
+
+    fn add_effect_state_points(
+        &self,
+        state: &mut MachineState,
+        model: &Z3Model,
+        initial: &Z3State,
+        context: &Z3State,
+        effect: &Effect,
+    ) {
+        match effect {
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } => {
+                self.add_expr_state_points(state, model, initial, context, guard);
+                self.add_expr_state_points(state, model, initial, context, register);
+                self.add_expr_state_points(state, model, initial, context, value);
+                self.add_register_point(
+                    state,
+                    model,
+                    initial,
+                    context,
+                    register,
+                    value.expr_width(),
+                );
+            }
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } => {
+                self.add_expr_state_points(state, model, initial, context, guard);
+                self.add_expr_state_points(state, model, initial, context, address);
+                self.add_expr_state_points(state, model, initial, context, value);
+                self.add_memory_point(state, model, initial, context, address, *width);
+            }
+        }
+    }
+
+    fn add_expr_state_points(
+        &self,
+        state: &mut MachineState,
+        model: &Z3Model,
+        initial: &Z3State,
+        context: &Z3State,
+        expr: &Expr,
+    ) {
+        match expr {
+            Expr::ReadRegister { register, width } => {
+                self.add_expr_state_points(state, model, initial, context, register);
+                self.add_register_point(state, model, initial, context, register, Some(*width));
+            }
+            Expr::ReadMemory { address, width } => {
+                self.add_expr_state_points(state, model, initial, context, address);
+                self.add_memory_point(state, model, initial, context, address, *width);
+            }
+            Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => {}
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Xor(lhs, rhs)
+            | Expr::ShiftLeft(lhs, rhs)
+            | Expr::LogicalShiftRight(lhs, rhs)
+            | Expr::ArithmeticShiftRight(lhs, rhs)
+            | Expr::RotateRight(lhs, rhs)
+            | Expr::Equal(lhs, rhs)
+            | Expr::UnsignedLessThan(lhs, rhs)
+            | Expr::SignedLessThan(lhs, rhs) => {
+                self.add_expr_state_points(state, model, initial, context, lhs);
+                self.add_expr_state_points(state, model, initial, context, rhs);
+            }
+            Expr::Not(value)
+            | Expr::CountOnes(value)
+            | Expr::Extract { value, .. }
+            | Expr::ZeroExtend { value, .. }
+            | Expr::SignExtend { value, .. } => {
+                self.add_expr_state_points(state, model, initial, context, value);
+            }
+            Expr::Concat(values) => {
+                for value in values {
+                    self.add_expr_state_points(state, model, initial, context, value);
+                }
+            }
+            Expr::AddCarryOut {
+                lhs, rhs, carry_in, ..
+            }
+            | Expr::AddOverflow {
+                lhs, rhs, carry_in, ..
+            }
+            | Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in: carry_in,
+                ..
+            }
+            | Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in: carry_in,
+                ..
+            } => {
+                self.add_expr_state_points(state, model, initial, context, lhs);
+                self.add_expr_state_points(state, model, initial, context, rhs);
+                self.add_expr_state_points(state, model, initial, context, carry_in);
+            }
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                self.add_expr_state_points(state, model, initial, context, condition);
+                self.add_expr_state_points(state, model, initial, context, when_true);
+                self.add_expr_state_points(state, model, initial, context, when_false);
+            }
+        }
+    }
+
+    fn add_register_point(
+        &self,
+        state: &mut MachineState,
+        model: &Z3Model,
+        initial: &Z3State,
+        context: &Z3State,
+        register: &Expr,
+        value_width: Option<u16>,
+    ) {
+        let Some(width) = value_width else {
+            return;
+        };
+        let selector = Z3State::lower_expr(register, context);
+        let Some(selector_value) = eval_model_bv(model, &selector) else {
+            return;
+        };
+        let value = initial.read_register(&selector, width);
+        if let Some(value) = eval_model_bv(model, &value) {
+            state.registers.insert(selector_value.value, value);
+        }
+    }
+
+    fn add_memory_point(
+        &self,
+        state: &mut MachineState,
+        model: &Z3Model,
+        initial: &Z3State,
+        context: &Z3State,
+        address: &Expr,
+        width: u16,
+    ) {
+        let address = Z3State::lower_expr(address, context);
+
+        assert_eq!(width % 8, 0, "Memory width must be byte-aligned");
+        for byte_index in 0..(width / 8) {
+            let byte_address = bv_add_const(&address, byte_index as u128);
+            let byte_value = initial.read_memory(&byte_address, 8);
+            if let (Some(byte_address), Some(byte_value)) = (
+                eval_model_bv(model, &byte_address),
+                eval_model_bv(model, &byte_value),
+            ) {
+                state
+                    .memory
+                    .insert((byte_address.value, 8), BitWord::new(byte_value.value, 8));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Z3State {
+    registers: HashMap<(u16, u16), Z3Array>,
+    memory: HashMap<u16, Z3Array>,
+}
+
+enum Z3Observation {
+    Register { selector: BV, width: u16 },
+    Memory { address: BV, width: u16 },
+}
+
+impl Z3State {
+    fn new() -> Self {
+        Self {
+            registers: HashMap::new(),
+            memory: HashMap::new(),
+        }
+    }
+
+    fn execute_program(
+        &self,
+        program: &Program,
+        isa: &ISA,
+        collect_observations: bool,
+    ) -> (Self, Vec<Z3Observation>) {
+        let mut state = self.clone();
+        let mut observations = Vec::new();
+
+        for instruction in program.iter_instructions() {
+            let before = state.clone();
+            let mut after = state.clone();
+
+            for effect in instruction_effects(instruction, isa).iter().cloned() {
+                let effect = collapse_effect(effect, instruction);
+                if collect_observations {
+                    observations.push(Self::observe_effect_destination(&effect, &before));
+                }
+                after.apply_collapsed_effect(&effect, &before);
+            }
+
+            state = after;
+        }
+
+        (state, observations)
+    }
+
+    fn observe_effect_destination(effect: &Effect, before: &Self) -> Z3Observation {
+        match effect {
+            Effect::WriteRegister {
+                register, value, ..
+            } => Z3Observation::Register {
+                selector: Self::lower_expr(register, before),
+                width: value
+                    .expr_width()
+                    .expect("Register write value needs width"),
+            },
+            Effect::WriteMemory { address, width, .. } => Z3Observation::Memory {
+                address: Self::lower_expr(address, before),
+                width: *width,
+            },
+        }
+    }
+
+    fn apply_collapsed_effect(&mut self, effect: &Effect, before: &Self) {
+        match effect {
+            Effect::WriteRegister {
+                guard,
+                register,
+                value,
+            } => {
+                let guard = Self::lower_guard(guard, before);
+                let register = Self::lower_expr(register, before);
+                let value = Self::lower_expr(value, before);
+                let key = (register.get_size() as u16, value.get_size() as u16);
+                let old_file = self.register_file(key.0, key.1);
+                let written_file = old_file.store(&register, &value);
+                let next_file = guard.ite(&written_file, &old_file);
+                self.registers.insert(key, next_file);
+            }
+            Effect::WriteMemory {
+                guard,
+                address,
+                value,
+                width,
+            } => {
+                let guard = Self::lower_guard(guard, before);
+                let address = Self::lower_expr(address, before);
+                let value = Self::lower_expr(value, before);
+                let address_width = address.get_size() as u16;
+                let old_memory = self.memory_array(address_width);
+                let written_memory =
+                    self.write_memory_unconditional(&old_memory, &address, &value, *width);
+                let next_memory = guard.ite(&written_memory, &old_memory);
+                self.memory.insert(address_width, next_memory);
+            }
+        }
+    }
+
+    fn lower_expr(expr: &Expr, state: &Self) -> BV {
+        match expr {
+            Expr::Const { value, width } => bv_const(*value, *width),
+            Expr::Operand(OperandRef::RegisterField(RegisterRef::Fixed {
+                register,
+                identifier_width,
+            })) => bv_const(register.0 as u128, *identifier_width),
+            Expr::Operand(_) | Expr::DerivedValue(_) => {
+                unreachable!("Z3 lowering expects collapsed effects, got {expr:?}")
+            }
+            Expr::ReadRegister { register, width } => {
+                let register = Self::lower_expr(register, state);
+                state.read_register(&register, *width)
+            }
+            Expr::ReadMemory { address, width } => {
+                let address = Self::lower_expr(address, state);
+                state.read_memory(&address, *width)
+            }
+            Expr::Add(lhs, rhs) => {
+                Self::lower_expr(lhs, state).bvadd(&Self::lower_expr(rhs, state))
+            }
+            Expr::Sub(lhs, rhs) => {
+                Self::lower_expr(lhs, state).bvsub(&Self::lower_expr(rhs, state))
+            }
+            Expr::Mul(lhs, rhs) => {
+                Self::lower_expr(lhs, state).bvmul(&Self::lower_expr(rhs, state))
+            }
+            Expr::And(lhs, rhs) => {
+                Self::lower_expr(lhs, state).bvand(&Self::lower_expr(rhs, state))
+            }
+            Expr::Or(lhs, rhs) => Self::lower_expr(lhs, state).bvor(&Self::lower_expr(rhs, state)),
+            Expr::Xor(lhs, rhs) => {
+                Self::lower_expr(lhs, state).bvxor(&Self::lower_expr(rhs, state))
+            }
+            Expr::Not(value) => Self::lower_expr(value, state).bvnot(),
+            Expr::ShiftLeft(value, amount) => {
+                Self::lower_expr(value, state).bvshl(&Self::lower_expr(amount, state))
+            }
+            Expr::LogicalShiftRight(value, amount) => {
+                Self::lower_expr(value, state).bvlshr(&Self::lower_expr(amount, state))
+            }
+            Expr::ArithmeticShiftRight(value, amount) => {
+                Self::lower_expr(value, state).bvashr(&Self::lower_expr(amount, state))
+            }
+            Expr::RotateRight(value, amount) => {
+                Self::lower_expr(value, state).bvrotr(&Self::lower_expr(amount, state))
+            }
+            Expr::Equal(lhs, rhs) => {
+                bool_to_bv(&Self::lower_expr(lhs, state).eq(&Self::lower_expr(rhs, state)))
+            }
+            Expr::UnsignedLessThan(lhs, rhs) => {
+                bool_to_bv(&Self::lower_expr(lhs, state).bvult(&Self::lower_expr(rhs, state)))
+            }
+            Expr::SignedLessThan(lhs, rhs) => {
+                bool_to_bv(&Self::lower_expr(lhs, state).bvslt(&Self::lower_expr(rhs, state)))
+            }
+            Expr::Extract { value, high, low } => {
+                Self::lower_expr(value, state).extract((*high).into(), (*low).into())
+            }
+            Expr::Concat(values) => {
+                let mut values = values.iter().map(|value| Self::lower_expr(value, state));
+                let first = values
+                    .next()
+                    .expect("Concat must contain at least one value");
+                values.fold(first, |acc, value| acc.concat(&value))
+            }
+            Expr::ZeroExtend { value, to_width } => {
+                let value = Self::lower_expr(value, state);
+                value.zero_ext(u32::from(*to_width) - value.get_size())
+            }
+            Expr::SignExtend { value, to_width } => {
+                let value = Self::lower_expr(value, state);
+                value.sign_ext(u32::from(*to_width) - value.get_size())
+            }
+            Expr::CountOnes(value) => {
+                let value = Self::lower_expr(value, state);
+                let width = value.get_size();
+                (0..width).fold(BV::from_u64(0, width), |sum, bit| {
+                    let bit_value = value.extract(bit, bit).zero_ext(width - 1);
+                    sum.bvadd(&bit_value)
+                })
+            }
+            Expr::AddCarryOut {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => {
+                let lhs = Self::lower_expr(lhs, state).zero_ext(1);
+                let rhs = Self::lower_expr(rhs, state).zero_ext(1);
+                let carry_in = Self::lower_expr(carry_in, state).zero_ext(u32::from(*width));
+                let sum = lhs.bvadd(&rhs).bvadd(&carry_in);
+                sum.extract(u32::from(*width), u32::from(*width))
+            }
+            Expr::AddOverflow {
+                lhs,
+                rhs,
+                carry_in,
+                width,
+            } => {
+                let lhs = Self::lower_expr(lhs, state);
+                let rhs = Self::lower_expr(rhs, state);
+                let carry_in = Self::lower_expr(carry_in, state).zero_ext(u32::from(*width) - 1);
+                let result = lhs.bvadd(&rhs).bvadd(&carry_in);
+                signed_add_overflow(&lhs, &rhs, &result, *width)
+            }
+            Expr::SubCarryOut {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => {
+                let lhs = Self::lower_expr(lhs, state).zero_ext(1);
+                let rhs = Self::lower_expr(rhs, state).zero_ext(1);
+                let borrow_in = Self::lower_expr(borrow_in, state).zero_ext(u32::from(*width));
+                bool_to_bv(&rhs.bvadd(&borrow_in).bvule(&lhs))
+            }
+            Expr::SubOverflow {
+                lhs,
+                rhs,
+                borrow_in,
+                width,
+            } => {
+                let lhs = Self::lower_expr(lhs, state);
+                let rhs = Self::lower_expr(rhs, state);
+                let borrow_in = Self::lower_expr(borrow_in, state).zero_ext(u32::from(*width) - 1);
+                let result = lhs.bvsub(&rhs).bvsub(&borrow_in);
+                signed_sub_overflow(&lhs, &rhs, &result, *width)
+            }
+            Expr::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let condition = Self::lower_guard(condition, state);
+                let when_true = Self::lower_expr(when_true, state);
+                let when_false = Self::lower_expr(when_false, state);
+                condition.ite(&when_true, &when_false)
+            }
+        }
+    }
+
+    fn lower_guard(expr: &Expr, state: &Self) -> Bool {
+        let value = Self::lower_expr(expr, state);
+        assert_eq!(value.get_size(), 1, "Guard expressions must be 1 bit");
+        value.eq(BV::from_u64(1, 1))
+    }
+
+    fn read_register(&self, selector: &BV, width: u16) -> BV {
+        self.register_file(selector.get_size() as u16, width)
+            .select(selector)
+            .as_bv()
+            .expect("Register file select should produce a bit-vector")
+    }
+
+    fn read_memory(&self, address: &BV, width: u16) -> BV {
+        assert_eq!(width % 8, 0, "Memory read width must be byte-aligned");
+        if width == 8 {
+            return self
+                .memory_array(address.get_size() as u16)
+                .select(address)
+                .as_bv()
+                .expect("Memory select should produce an 8-bit bit-vector");
+        }
+
+        let bytes = (0..(width / 8)).rev().map(|byte_index| {
+            let byte_address = bv_add_const(address, byte_index as u128);
+            self.memory_array(address.get_size() as u16)
+                .select(&byte_address)
+                .as_bv()
+                .expect("Memory select should produce an 8-bit bit-vector")
+        });
+        concat_bvs(bytes)
+    }
+
+    fn write_memory_unconditional(
+        &self,
+        memory: &Z3Array,
+        address: &BV,
+        value: &BV,
+        width: u16,
+    ) -> Z3Array {
+        assert_eq!(width % 8, 0, "Memory write width must be byte-aligned");
+        let value = if value.get_size() < u32::from(width) {
+            value.zero_ext(u32::from(width) - value.get_size())
+        } else {
+            value.clone()
+        };
+        let mut written = memory.clone();
+        for byte_index in 0..(width / 8) {
+            let low = u32::from(byte_index * 8);
+            let byte = value.extract(low + 7, low);
+            let byte_address = bv_add_const(address, byte_index as u128);
+            written = written.store(&byte_address, &byte);
+        }
+        written
+    }
+
+    fn register_file(&self, identifier_width: u16, value_width: u16) -> Z3Array {
+        self.registers
+            .get(&(identifier_width, value_width))
+            .cloned()
+            .unwrap_or_else(|| {
+                Z3Array::new_const(
+                    format!("initial_reg_{identifier_width}_{value_width}"),
+                    &Sort::bitvector(identifier_width.into()),
+                    &Sort::bitvector(value_width.into()),
+                )
+            })
+    }
+
+    fn memory_array(&self, address_width: u16) -> Z3Array {
+        self.memory.get(&address_width).cloned().unwrap_or_else(|| {
+            Z3Array::new_const(
+                format!("initial_mem_{address_width}"),
+                &Sort::bitvector(address_width.into()),
+                &Sort::bitvector(8),
+            )
+        })
+    }
+}
+
+fn bool_to_bv(value: &Bool) -> BV {
+    value.ite(&BV::from_u64(1, 1), &BV::from_u64(0, 1))
+}
+
+fn bv_const(value: u128, width: u16) -> BV {
+    let value = value & bit_mask(width);
+    if let Ok(value) = u64::try_from(value) {
+        BV::from_u64(value, width.into())
+    } else {
+        BV::from_str(width.into(), &value.to_string())
+            .expect("u128 decimal literal should construct a Z3 bit-vector")
+    }
+}
+
+fn bv_add_const(value: &BV, rhs: u128) -> BV {
+    value.bvadd(&bv_const(rhs, value.get_size() as u16))
+}
+
+fn concat_bvs(values: impl IntoIterator<Item = BV>) -> BV {
+    let mut values = values.into_iter();
+    let first = values.next().expect("At least one bit-vector is required");
+    values.fold(first, |acc, value| acc.concat(&value))
+}
+
+fn signed_add_overflow(lhs: &BV, rhs: &BV, result: &BV, width: u16) -> BV {
+    let sign_bit = u32::from(width - 1);
+    let lhs_sign = lhs.extract(sign_bit, sign_bit);
+    let rhs_sign = rhs.extract(sign_bit, sign_bit);
+    let result_sign = result.extract(sign_bit, sign_bit);
+    let signs_same = lhs_sign.bvxor(&rhs_sign).eq(BV::from_u64(0, 1));
+    let result_changed = lhs_sign.bvxor(&result_sign).eq(BV::from_u64(1, 1));
+    bool_to_bv(&Bool::and(&[&signs_same, &result_changed]))
+}
+
+fn signed_sub_overflow(lhs: &BV, rhs: &BV, result: &BV, width: u16) -> BV {
+    let sign_bit = u32::from(width - 1);
+    let lhs_sign = lhs.extract(sign_bit, sign_bit);
+    let rhs_sign = rhs.extract(sign_bit, sign_bit);
+    let result_sign = result.extract(sign_bit, sign_bit);
+    let signs_differ = lhs_sign.bvxor(&rhs_sign).eq(BV::from_u64(1, 1));
+    let result_changed = lhs_sign.bvxor(&result_sign).eq(BV::from_u64(1, 1));
+    bool_to_bv(&Bool::and(&[&signs_differ, &result_changed]))
+}
+
+fn eval_model_bv(model: &Z3Model, value: &BV) -> Option<BitWord> {
+    let evaluated = model.eval(value, true)?;
+    z3_bv_to_u128(&evaluated).map(|value| BitWord::new(value, evaluated.get_size() as u16))
+}
+
+fn z3_bv_to_u128(value: &BV) -> Option<u128> {
+    if let Some(value) = value.as_u64() {
+        return Some(value.into());
+    }
+
+    let text = value.to_string();
+    if let Some(hex) = text.strip_prefix("#x") {
+        return u128::from_str_radix(hex, 16).ok();
+    }
+    if let Some(binary) = text.strip_prefix("#b") {
+        return u128::from_str_radix(binary, 2).ok();
+    }
+    text.parse().ok()
+}
+
+fn collapse_effect(effect: Effect, instruction: &DecodedInstruction) -> Effect {
+    match effect {
+        Effect::WriteRegister {
+            guard,
+            register,
+            value,
+        } => Effect::WriteRegister {
+            guard: guard.collapse(instruction).canonicalize(),
+            register: register.collapse(instruction).canonicalize(),
+            value: value.collapse(instruction).canonicalize(),
+        },
+        Effect::WriteMemory {
+            guard,
+            address,
+            value,
+            width,
+        } => Effect::WriteMemory {
+            guard: guard.collapse(instruction).canonicalize(),
+            address: address.collapse(instruction).canonicalize(),
+            value: value.collapse(instruction).canonicalize(),
+            width,
+        },
     }
 }
 
@@ -611,7 +1367,7 @@ pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
         }
         Expr::ReadMemory { address, width } => {
             let address = evaluate_expr(address, state)?;
-            state.memory.get(&(address.value, *width)).copied()
+            read_concrete_memory(state, address, *width)
         }
         Expr::Add(lhs, rhs) => {
             let lhs = evaluate_expr(lhs, state)?;
@@ -865,6 +1621,49 @@ pub fn evaluate_expr(expr: &Expr, state: &MachineState) -> Option<BitWord> {
                 when_false
             })
         }
+    }
+}
+
+fn read_concrete_memory(state: &MachineState, address: BitWord, width: u16) -> Option<BitWord> {
+    if let Some(value) = state.memory.get(&(address.value, width)) {
+        return Some(*value);
+    }
+    if width == 8 || width % 8 != 0 {
+        return None;
+    }
+
+    let mut value = 0u128;
+    for byte_index in 0..(width / 8) {
+        let byte_address = (address.value + u128::from(byte_index)) & bit_mask(address.width);
+        let byte = state.memory.get(&(byte_address, 8))?;
+        if byte.width != 8 {
+            return None;
+        }
+        value |= (byte.value & 0xff) << u32::from(byte_index * 8);
+    }
+    Some(BitWord::new(value, width))
+}
+
+pub fn write_concrete_memory_bytes(
+    state: &mut MachineState,
+    address: BitWord,
+    value: BitWord,
+    width: u16,
+) {
+    if width % 8 != 0 {
+        state
+            .memory
+            .insert((address.value, width), BitWord::new(value.value, width));
+        return;
+    }
+
+    let value = BitWord::new(value.value, width);
+    for byte_index in 0..(width / 8) {
+        let byte_address = (address.value + u128::from(byte_index)) & bit_mask(address.width);
+        let byte_value = (value.value >> u32::from(byte_index * 8)) & 0xff;
+        state
+            .memory
+            .insert((byte_address, 8), BitWord::new(byte_value, 8));
     }
 }
 
@@ -1458,9 +2257,15 @@ impl BddManager {
             };
             let address = Self::evaluate_bdd_word_under_cube(address, &assignment);
             let value = Self::evaluate_bdd_word_under_cube(&read.value_variables, &assignment);
-            state
-                .memory
-                .insert((address, read.width), BitWord::new(value, read.width));
+            write_concrete_memory_bytes(
+                &mut state,
+                BitWord::new(
+                    address,
+                    read.lowered_address.as_ref().unwrap().bits.len() as u16,
+                ),
+                BitWord::new(value, read.width),
+                read.width,
+            );
         }
 
         state
@@ -1469,6 +2274,7 @@ impl BddManager {
     /// Compares the equality of the left and right expressions using a BDD
     /// Returns a counterexample if they are not equal
     pub fn compare(&mut self) -> AllocResult<BddEquality> {
+        println!("{:?}", self.right_expr);
         let (left, right) = self.lower_left_and_right();
 
         // Lower the memory of both expressions
@@ -2232,20 +3038,65 @@ impl BitAnd for BddWord {
 /// Includes lowering memory accesses to single-byte accesses
 /// This effectively collapses instructions.len() = k instructions into a single state update u where s(t0+k) = u(s(t0))
 pub fn instruction_seq_to_effects(instructions: &Program, isa: &ISA) -> Vec<Effect> {
+    instruction_seq_to_effects_impl(instructions, isa, None)
+}
+
+pub fn instruction_seq_to_effects_profiled(
+    instructions: &Program,
+    isa: &ISA,
+) -> (Vec<Effect>, InstructionSeqToEffectsProfile) {
+    let mut profile = InstructionSeqToEffectsProfile::default();
+    let start = Instant::now();
+    let effects = instruction_seq_to_effects_impl(instructions, isa, Some(&mut profile));
+    profile.total = start.elapsed();
+    profile.final_effects = effects.len();
+    (effects, profile)
+}
+
+fn instruction_seq_to_effects_impl(
+    instructions: &Program,
+    isa: &ISA,
+    mut profile: Option<&mut InstructionSeqToEffectsProfile>,
+) -> Vec<Effect> {
     let mut seq_effects = vec![];
     for instruction in instructions.iter_instructions() {
-        let lowered_effects = instruction_to_lowered_effects(instruction, isa, &seq_effects);
+        if let Some(profile) = profile.as_mut() {
+            profile.instructions += 1;
+        }
+
+        let lowered_effects = instruction_to_lowered_effects_impl(
+            instruction,
+            isa,
+            &seq_effects,
+            profile.as_deref_mut(),
+        );
+        if let Some(profile) = profile.as_mut() {
+            profile.lowered_effects += lowered_effects.len();
+            profile.max_accumulated_effects =
+                profile.max_accumulated_effects.max(seq_effects.len());
+        }
 
         // We want to combine the effects of this instruction with the existing effects in seq_effects
         // The variable name effect_2 refers to the fact that it takes place after the effect_1s that we are comparing it to
         for effect_2 in lowered_effects {
             // Whether we've found an effect in seq_effects which writes to the same place as effect_2
             let mut found_same_write = false;
+            let combine_start = profile.as_ref().map(|_| Instant::now());
             for effect_1 in seq_effects.iter_mut() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.combine_attempts += 1;
+                }
                 if let Some(new_effect) = combine_effects(effect_1, &effect_2) {
                     *effect_1 = new_effect;
                     found_same_write = true;
+                    if let Some(profile) = profile.as_mut() {
+                        profile.combine_matches += 1;
+                    }
+                    break;
                 }
+            }
+            if let (Some(profile), Some(start)) = (profile.as_mut(), combine_start) {
+                profile.combine_total += start.elapsed();
             }
 
             // If effect_2 didn't contribute itself to an existing effect in seq_effects, we want to add it
@@ -2259,6 +3110,10 @@ pub fn instruction_seq_to_effects(instructions: &Program, isa: &ISA) -> Vec<Effe
                     seq_effects.push(effect_2);
                 }
             }
+            if let Some(profile) = profile.as_mut() {
+                profile.max_accumulated_effects =
+                    profile.max_accumulated_effects.max(seq_effects.len());
+            }
         }
     }
     seq_effects
@@ -2269,11 +3124,138 @@ pub fn instruction_to_lowered_effects(
     isa: &ISA,
     previous_effects: &[Effect],
 ) -> Vec<Effect> {
+    instruction_to_lowered_effects_impl(instruction, isa, previous_effects, None)
+}
+
+pub fn execute_program_concrete(
+    instructions: &Program,
+    isa: &ISA,
+    state: &MachineState,
+) -> MachineState {
+    ConcreteProgram::from_program(instructions, isa).execute(state)
+}
+
+#[derive(Clone, Debug)]
+pub struct ConcreteProgram {
+    instructions: Vec<Vec<Effect>>,
+}
+
+impl ConcreteProgram {
+    pub fn from_program(instructions: &Program, isa: &ISA) -> Self {
+        Self {
+            instructions: instructions
+                .iter_instructions()
+                .map(|instruction| {
+                    instruction_effects(instruction, isa)
+                        .iter()
+                        .cloned()
+                        .map(|effect| collapse_effect_for_concrete_execution(effect, instruction))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    pub fn execute(&self, state: &MachineState) -> MachineState {
+        let mut current_state = state.clone();
+
+        for instruction_effects in &self.instructions {
+            let mut register_writes = Vec::new();
+            let mut memory_writes = Vec::new();
+
+            for effect in instruction_effects.iter() {
+                match effect {
+                    Effect::WriteRegister {
+                        guard,
+                        register,
+                        value,
+                    } => {
+                        if evaluate_expr(&guard, &current_state)
+                            .is_none_or(|guard| guard.value == 0)
+                        {
+                            continue;
+                        }
+
+                        if let (Some(register), Some(value)) = (
+                            evaluate_expr(&register, &current_state),
+                            evaluate_expr(&value, &current_state),
+                        ) {
+                            register_writes.push((register.value, value));
+                        }
+                    }
+                    Effect::WriteMemory {
+                        guard,
+                        address,
+                        value,
+                        width,
+                    } => {
+                        if evaluate_expr(&guard, &current_state)
+                            .is_none_or(|guard| guard.value == 0)
+                        {
+                            continue;
+                        }
+
+                        if let (Some(address), Some(value)) = (
+                            evaluate_expr(&address, &current_state),
+                            evaluate_expr(&value, &current_state),
+                        ) {
+                            collect_concrete_memory_writes(
+                                &mut memory_writes,
+                                address,
+                                value,
+                                *width,
+                            );
+                        }
+                    }
+                }
+            }
+
+            for (register, value) in register_writes {
+                current_state.registers.insert(register, value);
+            }
+            for (key, value) in memory_writes {
+                current_state.memory.insert(key, value);
+            }
+        }
+
+        current_state
+    }
+}
+
+fn collapse_effect_for_concrete_execution(
+    effect: Effect,
+    instruction: &DecodedInstruction,
+) -> Effect {
+    match effect {
+        Effect::WriteRegister {
+            guard,
+            register,
+            value,
+        } => Effect::WriteRegister {
+            guard: guard.collapse(instruction),
+            register: register.collapse(instruction),
+            value: value.collapse(instruction),
+        },
+        Effect::WriteMemory {
+            guard,
+            address,
+            value,
+            width,
+        } => Effect::WriteMemory {
+            guard: guard.collapse(instruction),
+            address: address.collapse(instruction),
+            value: value.collapse(instruction),
+            width,
+        },
+    }
+}
+
+fn instruction_effects<'a>(instruction: &DecodedInstruction, isa: &'a ISA) -> &'a [Effect] {
     let instruction_name = instruction
         .name
         .as_ref()
         .expect("Instruction should have a name");
-    let instruction_effects = &isa.instructions
+    &isa.instructions
         .iter()
         .find(|candidate| candidate.name == *instruction_name)
         .unwrap_or_else(|| {
@@ -2281,9 +3263,65 @@ pub fn instruction_to_lowered_effects(
                 "Instruction in sequence should match with an instruction in the ISA, but {instruction_name} did not match!"
             )
         })
-        .effects;
+        .effects
+}
+
+fn collect_concrete_memory_writes(
+    writes: &mut Vec<((u128, u16), BitWord)>,
+    address: BitWord,
+    value: BitWord,
+    width: u16,
+) {
+    if width == 8 {
+        writes.push(((address.value, 8), BitWord::new(value.value, 8)));
+        return;
+    }
+
+    assert_eq!(width % 8, 0, "Memory write width must be byte-aligned");
+    for byte_index in 0..(width / 8) {
+        let byte_address = (address.value + u128::from(byte_index)) & bit_mask(address.width);
+        let byte_value = (value.value >> u32::from(byte_index * 8)) & 0xff;
+        writes.push(((byte_address, 8), BitWord::new(byte_value, 8)));
+    }
+}
+
+fn instruction_to_lowered_effects_impl(
+    instruction: &DecodedInstruction,
+    isa: &ISA,
+    previous_effects: &[Effect],
+    mut profile: Option<&mut InstructionSeqToEffectsProfile>,
+) -> Vec<Effect> {
+    let lookup_start = profile.as_ref().map(|_| Instant::now());
+    let instruction_effects = instruction_effects(instruction, isa);
+    if let (Some(profile), Some(start)) = (profile.as_mut(), lookup_start) {
+        profile.instruction_lookup += start.elapsed();
+        profile.source_effects += instruction_effects.len();
+    }
     let mut lowered_effects = Vec::with_capacity(instruction_effects.len());
     for effect in instruction_effects.iter().cloned() {
+        if let Some(profile) = profile.as_mut() {
+            match &effect {
+                Effect::WriteMemory {
+                    guard,
+                    address,
+                    value,
+                    ..
+                } => {
+                    profile.source_memory_effects += 1;
+                    profile.source_expr_nodes +=
+                        expr_node_count(guard) + expr_node_count(address) + expr_node_count(value);
+                }
+                Effect::WriteRegister {
+                    guard,
+                    register,
+                    value,
+                } => {
+                    profile.source_register_effects += 1;
+                    profile.source_expr_nodes +=
+                        expr_node_count(guard) + expr_node_count(register) + expr_node_count(value);
+                }
+            }
+        }
         match effect {
             Effect::WriteMemory {
                 guard,
@@ -2291,10 +3329,38 @@ pub fn instruction_to_lowered_effects(
                 value,
                 width,
             } => {
-                let guard = collapse_lower_substitute(guard, instruction, previous_effects);
-                let address = collapse_lower_substitute(address, instruction, previous_effects);
-                let value = collapse_lower_substitute(value, instruction, previous_effects);
+                let lowering_start = profile.as_ref().map(|_| Instant::now());
+                let guard = collapse_lower_substitute_profiled(
+                    guard,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Guard,
+                    profile.as_deref_mut(),
+                );
+                let address = collapse_lower_substitute_profiled(
+                    address,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Destination,
+                    profile.as_deref_mut(),
+                );
+                let value = collapse_lower_substitute_profiled(
+                    value,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Value,
+                    profile.as_deref_mut(),
+                );
+                if let (Some(profile), Some(start)) = (profile.as_mut(), lowering_start) {
+                    profile.lowering_total += start.elapsed();
+                }
                 if width == 8 {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.lowered_memory_effects += 1;
+                        profile.lowered_expr_nodes += expr_node_count(&guard)
+                            + expr_node_count(&address)
+                            + expr_node_count(&value);
+                    }
                     lowered_effects.push(Effect::WriteMemory {
                         guard,
                         address,
@@ -2308,10 +3374,18 @@ pub fn instruction_to_lowered_effects(
                         .expect("Memory address should have established width");
                     for byte_index in 0..(width / 8) {
                         let low = byte_index * 8;
+                        let byte_address = byte_address(&address, byte_index, address_width);
+                        let byte_value = extract(value.clone(), low + 7, low);
+                        if let Some(profile) = profile.as_mut() {
+                            profile.lowered_memory_effects += 1;
+                            profile.lowered_expr_nodes += expr_node_count(&guard)
+                                + expr_node_count(&byte_address)
+                                + expr_node_count(&byte_value);
+                        }
                         lowered_effects.push(Effect::WriteMemory {
                             guard: guard.clone(),
-                            address: byte_address(&address, byte_index, address_width),
-                            value: extract(value.clone(), low + 7, low),
+                            address: byte_address,
+                            value: byte_value,
                             width: 8,
                         });
                     }
@@ -2322,9 +3396,35 @@ pub fn instruction_to_lowered_effects(
                 register,
                 value,
             } => {
-                let guard = collapse_lower_substitute(guard, instruction, previous_effects);
-                let register = collapse_lower_substitute(register, instruction, previous_effects);
-                let value = collapse_lower_substitute(value, instruction, previous_effects);
+                let lowering_start = profile.as_ref().map(|_| Instant::now());
+                let guard = collapse_lower_substitute_profiled(
+                    guard,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Guard,
+                    profile.as_deref_mut(),
+                );
+                let register = collapse_lower_substitute_profiled(
+                    register,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Destination,
+                    profile.as_deref_mut(),
+                );
+                let value = collapse_lower_substitute_profiled(
+                    value,
+                    instruction,
+                    previous_effects,
+                    EffectExprRole::Value,
+                    profile.as_deref_mut(),
+                );
+                if let (Some(profile), Some(start)) = (profile.as_mut(), lowering_start) {
+                    profile.lowering_total += start.elapsed();
+                    profile.lowered_register_effects += 1;
+                    profile.lowered_expr_nodes += expr_node_count(&guard)
+                        + expr_node_count(&register)
+                        + expr_node_count(&value);
+                }
                 lowered_effects.push(Effect::WriteRegister {
                     guard,
                     register,
@@ -2337,14 +3437,93 @@ pub fn instruction_to_lowered_effects(
     lowered_effects
 }
 
-fn collapse_lower_substitute(
+fn collapse_lower_substitute_profiled(
     expr: Expr,
     instruction: &DecodedInstruction,
     previous_effects: &[Effect],
+    role: EffectExprRole,
+    mut profile: Option<&mut InstructionSeqToEffectsProfile>,
 ) -> Expr {
-    lower_memory_reads(expr.collapse(instruction))
-        .substitute(previous_effects)
-        .canonicalize()
+    let start = profile.as_ref().map(|_| Instant::now());
+    let expr = expr.collapse(instruction);
+    if let (Some(profile), Some(start)) = (profile.as_mut(), start) {
+        profile.collapse += start.elapsed();
+    }
+
+    let start = profile.as_ref().map(|_| Instant::now());
+    let expr = lower_memory_reads(expr);
+    if let (Some(profile), Some(start)) = (profile.as_mut(), start) {
+        profile.lower_memory_reads += start.elapsed();
+    }
+
+    let start = profile.as_ref().map(|_| Instant::now());
+    let expr = expr.substitute(previous_effects);
+    if let (Some(profile), Some(start)) = (profile.as_mut(), start) {
+        profile.substitute += start.elapsed();
+    }
+
+    let expr = match role {
+        EffectExprRole::Guard | EffectExprRole::Destination => {
+            let start = profile.as_ref().map(|_| Instant::now());
+            let expr = expr.canonicalize();
+            if let (Some(profile), Some(start)) = (profile.as_mut(), start) {
+                profile.canonicalize += start.elapsed();
+            }
+            expr
+        }
+        EffectExprRole::Value => expr,
+    };
+
+    expr
+}
+
+fn expr_node_count(expr: &Expr) -> usize {
+    1 + match expr {
+        Expr::Const { .. } | Expr::Operand(_) | Expr::DerivedValue(_) => 0,
+        Expr::ReadRegister { register, .. } => expr_node_count(register),
+        Expr::ReadMemory { address, .. } => expr_node_count(address),
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Xor(lhs, rhs)
+        | Expr::ShiftLeft(lhs, rhs)
+        | Expr::LogicalShiftRight(lhs, rhs)
+        | Expr::ArithmeticShiftRight(lhs, rhs)
+        | Expr::RotateRight(lhs, rhs)
+        | Expr::Equal(lhs, rhs)
+        | Expr::UnsignedLessThan(lhs, rhs)
+        | Expr::SignedLessThan(lhs, rhs) => expr_node_count(lhs) + expr_node_count(rhs),
+        Expr::Not(value) | Expr::CountOnes(value) => expr_node_count(value),
+        Expr::Extract { value, .. }
+        | Expr::ZeroExtend { value, .. }
+        | Expr::SignExtend { value, .. } => expr_node_count(value),
+        Expr::Concat(values) => values.iter().map(expr_node_count).sum(),
+        Expr::AddCarryOut {
+            lhs, rhs, carry_in, ..
+        }
+        | Expr::AddOverflow {
+            lhs, rhs, carry_in, ..
+        }
+        | Expr::SubCarryOut {
+            lhs,
+            rhs,
+            borrow_in: carry_in,
+            ..
+        }
+        | Expr::SubOverflow {
+            lhs,
+            rhs,
+            borrow_in: carry_in,
+            ..
+        } => expr_node_count(lhs) + expr_node_count(rhs) + expr_node_count(carry_in),
+        Expr::Select {
+            condition,
+            when_true,
+            when_false,
+        } => expr_node_count(condition) + expr_node_count(when_true) + expr_node_count(when_false),
+    }
 }
 
 fn lower_memory_reads(expr: Expr) -> Expr {
@@ -2539,6 +3718,7 @@ mod tests {
         },
         isa_specification::{Instruction, InstructionForm, StackDirection, StackPointer},
     };
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     fn decoded(name: &str) -> DecodedInstruction {
         DecodedInstruction {
@@ -3539,6 +4719,41 @@ mod tests {
     }
 
     #[test]
+    fn equivalence_manager_canonicalizes_values_before_bdd_lowering() {
+        let r0 = read_register(reg(0), 4);
+        let isa = equivalence_test_isa(
+            4,
+            vec![
+                isa_instruction(
+                    "WRITE_R0_DIRECT",
+                    vec![Effect::write_register(reg(0), r0.clone())],
+                ),
+                isa_instruction(
+                    "WRITE_R0_UNCANONICAL",
+                    vec![Effect::write_register(
+                        reg(0),
+                        Expr::Sub(
+                            Box::new(or_expr(r0, constant(0, 4))),
+                            Box::new(constant(0, 4)),
+                        ),
+                    )],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["WRITE_R0_DIRECT"]);
+        let right = decoded_sequence(&["WRITE_R0_UNCANONICAL"]);
+
+        let mut manager = EquivalenceManager::from_instructions(&left, &right, &isa);
+
+        assert_eq!(
+            manager
+                .compare_instructions()
+                .expect("canonicalized value comparison should allocate"),
+            BddEquality::Equal
+        );
+    }
+
+    #[test]
     fn equivalence_manager_from_left_then_replace_right_register_sequences() {
         let r0 = read_register(reg(0), 4);
         let r1 = read_register(reg(1), 4);
@@ -3716,6 +4931,236 @@ mod tests {
     }
 
     #[test]
+    fn z3_equivalence_manager_compares_register_effects() {
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "WRITE_R0_ONE",
+                    vec![Effect::write_register(reg(0), constant(1, 8))],
+                ),
+                isa_instruction(
+                    "WRITE_R0_ONE_AGAIN",
+                    vec![Effect::write_register(reg(0), constant(1, 8))],
+                ),
+                isa_instruction(
+                    "WRITE_R0_TWO",
+                    vec![Effect::write_register(reg(0), constant(2, 8))],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["WRITE_R0_ONE"]);
+        let equal_right = decoded_sequence(&["WRITE_R0_ONE_AGAIN"]);
+        let unequal_right = decoded_sequence(&["WRITE_R0_TWO"]);
+        let mut manager = Z3EquivalenceManager::from_instructions(&left, &equal_right, &isa);
+
+        assert_eq!(manager.compare_instructions(), BddEquality::Equal);
+
+        manager.replace_right_instruction(&unequal_right);
+        let BddEquality::Unequal(counterexample) = manager.compare_instructions() else {
+            panic!("expected Z3 to find a register counterexample");
+        };
+        assert_eq!(
+            execute_program_concrete(&left, &isa, &counterexample).registers[&0].value,
+            1
+        );
+        assert_eq!(
+            execute_program_concrete(&unequal_right, &isa, &counterexample).registers[&0].value,
+            2
+        );
+    }
+
+    #[test]
+    fn z3_equivalence_manager_handles_wide_memory_write_aliasing() {
+        let address = constant(0x20, 8);
+        let value = constant(0x4433_2211, 32);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "STORE32",
+                    vec![Effect::write_memory(address.clone(), value.clone(), 32)],
+                ),
+                isa_instruction(
+                    "STORE32_BYTES",
+                    vec![
+                        Effect::write_memory(address.clone(), extract(value.clone(), 7, 0), 8),
+                        Effect::write_memory(
+                            add(address.clone(), constant(1, 8)),
+                            extract(value.clone(), 15, 8),
+                            8,
+                        ),
+                        Effect::write_memory(
+                            add(address.clone(), constant(2, 8)),
+                            extract(value.clone(), 23, 16),
+                            8,
+                        ),
+                        Effect::write_memory(
+                            add(address.clone(), constant(3, 8)),
+                            extract(value.clone(), 31, 24),
+                            8,
+                        ),
+                    ],
+                ),
+                isa_instruction(
+                    "STORE32_BAD_BYTE_1",
+                    vec![
+                        Effect::write_memory(address.clone(), extract(value.clone(), 7, 0), 8),
+                        Effect::write_memory(
+                            add(address.clone(), constant(1, 8)),
+                            constant(0, 8),
+                            8,
+                        ),
+                        Effect::write_memory(
+                            add(address.clone(), constant(2, 8)),
+                            extract(value.clone(), 23, 16),
+                            8,
+                        ),
+                        Effect::write_memory(
+                            add(address.clone(), constant(3, 8)),
+                            extract(value, 31, 24),
+                            8,
+                        ),
+                    ],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["STORE32"]);
+        let equal_right = decoded_sequence(&["STORE32_BYTES"]);
+        let unequal_right = decoded_sequence(&["STORE32_BAD_BYTE_1"]);
+        let mut manager = Z3EquivalenceManager::from_instructions(&left, &equal_right, &isa);
+
+        assert_eq!(manager.compare_instructions(), BddEquality::Equal);
+
+        manager.replace_right_instruction(&unequal_right);
+        let BddEquality::Unequal(counterexample) = manager.compare_instructions() else {
+            panic!("expected Z3 to find a memory counterexample");
+        };
+        let left_output = execute_program_concrete(&left, &isa, &counterexample);
+        let right_output = execute_program_concrete(&unequal_right, &isa, &counterexample);
+
+        assert_eq!(left_output.memory[&(0x21, 8)].value, 0x22);
+        assert_eq!(right_output.memory[&(0x21, 8)].value, 0);
+    }
+
+    #[test]
+    fn z3_equivalence_manager_random_counterexamples_match_concrete_execution() {
+        let r0 = read_register(reg(0), 8);
+        let r1 = read_register(reg(1), 8);
+        let r2 = read_register(reg(2), 8);
+        let mem20 = read_memory(constant(0x20, 8), 8);
+        let mem21 = read_memory(constant(0x21, 8), 8);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "MOV_R0_R1",
+                    vec![Effect::write_register(reg(0), r1.clone())],
+                ),
+                isa_instruction(
+                    "MOV_R0_R2",
+                    vec![Effect::write_register(reg(0), r2.clone())],
+                ),
+                isa_instruction(
+                    "ADD_R0_R1_R2",
+                    vec![Effect::write_register(reg(0), add(r1.clone(), r2.clone()))],
+                ),
+                isa_instruction(
+                    "SUB_R0_R1_R2",
+                    vec![Effect::write_register(reg(0), sub(r1.clone(), r2.clone()))],
+                ),
+                isa_instruction(
+                    "XOR_R0_R1_R2",
+                    vec![Effect::write_register(
+                        reg(0),
+                        xor_expr(r1.clone(), r2.clone()),
+                    )],
+                ),
+                isa_instruction(
+                    "LOW_R0",
+                    vec![Effect::write_register(reg(0), constant(0x3c, 8))],
+                ),
+                isa_instruction(
+                    "HIGH_R0",
+                    vec![Effect::write_register(reg(0), constant(0xc3, 8))],
+                ),
+                isa_instruction(
+                    "GUARDED_R0",
+                    vec![Effect::write_register_if(
+                        unsigned_less_than(r1.clone(), r2.clone()),
+                        reg(0),
+                        constant(0x5a, 8),
+                    )],
+                ),
+                isa_instruction(
+                    "STORE20_R0",
+                    vec![Effect::write_memory(constant(0x20, 8), r0.clone(), 8)],
+                ),
+                isa_instruction(
+                    "STORE21_R1",
+                    vec![Effect::write_memory(constant(0x21, 8), r1.clone(), 8)],
+                ),
+                isa_instruction(
+                    "LOAD20_R0",
+                    vec![Effect::write_register(reg(0), mem20.clone())],
+                ),
+                isa_instruction(
+                    "LOAD21_R0",
+                    vec![Effect::write_register(reg(0), mem21.clone())],
+                ),
+            ],
+        );
+        let instruction_names = [
+            "MOV_R0_R1",
+            "MOV_R0_R2",
+            "ADD_R0_R1_R2",
+            "SUB_R0_R1_R2",
+            "XOR_R0_R1_R2",
+            "LOW_R0",
+            "HIGH_R0",
+            "GUARDED_R0",
+            "STORE20_R0",
+            "STORE21_R1",
+            "LOAD20_R0",
+            "LOAD21_R0",
+        ];
+        let mut rng = StdRng::seed_from_u64(0x5a3c_2026);
+        let mut checked_counterexamples = 0;
+
+        for _ in 0..96 {
+            let left = random_decoded_sequence(&instruction_names, &mut rng);
+            let right = random_decoded_sequence(&instruction_names, &mut rng);
+            let mut manager = Z3EquivalenceManager::from_instructions(&left, &right, &isa);
+
+            if let BddEquality::Unequal(counterexample) = manager.compare_instructions() {
+                let left_output = execute_program_concrete(&left, &isa, &counterexample);
+                let right_output = execute_program_concrete(&right, &isa, &counterexample);
+                assert_ne!(
+                    left_output, right_output,
+                    "Z3 counterexample did not separate left={left:?} right={right:?} state={counterexample:?}"
+                );
+                checked_counterexamples += 1;
+            }
+        }
+
+        assert!(
+            checked_counterexamples > 0,
+            "randomized Z3/concrete test should exercise at least one counterexample"
+        );
+    }
+
+    fn random_decoded_sequence(instruction_names: &[&str], rng: &mut StdRng) -> Program {
+        let len = rng.random_range(1..=4);
+        let instructions = (0..len)
+            .map(|_| {
+                let idx = rng.random_range(0..instruction_names.len());
+                decoded(instruction_names[idx])
+            })
+            .collect();
+        Program::from_instructions(instructions, len)
+    }
+
+    #[test]
     fn equivalence_manager_replace_right_instruction_allows_extra_memory_effect_changes() {
         let address_a = constant(0x20, 8);
         let address_b = constant(0x30, 8);
@@ -3803,6 +5248,24 @@ mod tests {
         assert_eq!(
             evaluate_expr(&selected, &state),
             Some(BitWord::new(0x12, 8))
+        );
+    }
+
+    #[test]
+    fn evaluate_expr_reads_wide_memory_from_bytes() {
+        let state = machine_state(
+            &[],
+            &[
+                ((0x20, 8), BitWord::new(0x11, 8)),
+                ((0x21, 8), BitWord::new(0x22, 8)),
+                ((0x22, 8), BitWord::new(0x33, 8)),
+                ((0x23, 8), BitWord::new(0x44, 8)),
+            ],
+        );
+
+        assert_eq!(
+            evaluate_expr(&read_memory(constant(0x20, 8), 32), &state),
+            Some(BitWord::new(0x4433_2211, 32))
         );
     }
 
@@ -5301,9 +6764,18 @@ mod tests {
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
-        assert_eq!(register_write_value(&effects, 0), &single_add);
-        assert_eq!(register_write_value(&effects, 1), &single_add);
-        assert_ne!(register_write_value(&effects, 1), &double_substituted);
+        assert_eq!(
+            register_write_value(&effects, 0).clone().canonicalize(),
+            single_add
+        );
+        assert_eq!(
+            register_write_value(&effects, 1).clone().canonicalize(),
+            single_add
+        );
+        assert_ne!(
+            register_write_value(&effects, 1).clone().canonicalize(),
+            double_substituted
+        );
     }
 
     #[test]
@@ -5399,8 +6871,8 @@ mod tests {
         };
 
         assert_eq!(
-            register_write_value(&effects, 0),
-            &concat([
+            register_write_value(&effects, 0).clone().canonicalize(),
+            concat([
                 forwarded_byte(add(address.clone(), constant(3, 32))),
                 forwarded_byte(add(address.clone(), constant(2, 32))),
                 forwarded_byte(add(address.clone(), constant(1, 32))),
@@ -5441,8 +6913,8 @@ mod tests {
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
         assert_eq!(
-            register_write_value(&effects, 2),
-            &select(
+            register_write_value(&effects, 2).clone().canonicalize(),
+            select(
                 forwarding_condition(bool_const(true), read_address.clone(), write_address),
                 write_value,
                 read_memory(read_address, 8),
@@ -5533,7 +7005,10 @@ mod tests {
 
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
-        assert_eq!(register_write_value(&effects, 5), &expected);
+        assert_eq!(
+            register_write_value(&effects, 5).clone().canonicalize(),
+            expected
+        );
     }
 
     #[test]
@@ -5571,8 +7046,8 @@ mod tests {
         let effects = instruction_seq_to_effects(&sequence, &isa);
 
         assert_eq!(
-            register_write_value(&effects, 2),
-            &select(
+            register_write_value(&effects, 2).clone().canonicalize(),
+            select(
                 forwarding_condition(guard, read_address.clone(), write_address),
                 write_value,
                 read_memory(read_address, 8),

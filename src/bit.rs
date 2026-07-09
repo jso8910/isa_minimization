@@ -1,6 +1,6 @@
 use regex::Regex;
 use rhai::{CustomType, Engine, Scope, TypeBuilder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 /// Enum for the Bit type used in symbolic simulation
@@ -15,6 +15,15 @@ pub enum Bit {
     /// Test value to test whether an operand affects the output of an expression
     /// Behaves the same as Variable but with higher precedence
     Test,
+}
+
+impl Bit {
+    pub fn is_concrete(&self) -> bool {
+        match self {
+            Bit::High | Bit::Low => true,
+            Bit::Var | Bit::Test => false,
+        }
+    }
 }
 
 // rhai custom type implementation
@@ -123,12 +132,15 @@ impl BitPattern {
         }
     }
 
-    pub fn matches_bits(&self, bits: &[Bit]) -> bool {
-        if self.bits.len() != bits.len() {
+    pub fn matches_prefix(&self, prefix: &[Bit]) -> bool {
+        // Checks whether a k bit prefix matches the first k bits of an n bit BitPattern, k<n
+        let prefix_len = prefix.len();
+        if prefix_len > self.len() {
             return false;
         }
 
-        for (pattern_bit, bit) in self.bits.iter().zip(bits) {
+        // By default, zip takes the shorter length, which should be `prefix`
+        for (pattern_bit, bit) in self.bits.iter().zip(prefix) {
             match pattern_bit {
                 Bit::Low => {
                     if *bit != Bit::Low {
@@ -145,6 +157,14 @@ impl BitPattern {
             }
         }
         true
+    }
+
+    pub fn matches_bits(&self, bits: &[Bit]) -> bool {
+        if self.bits.len() != bits.len() {
+            return false;
+        }
+
+        self.matches_prefix(bits)
     }
 
     pub fn num_high(&self) -> usize {
@@ -209,6 +229,63 @@ impl BitPattern {
                 _ => panic!("BitPattern must have no Var or Test"),
             })
             .sum()
+    }
+
+    /// Cube subtraction/sharp operation. For A # B, the result is the part of cube A not covered by
+    /// cube B.
+    /// The sharp product is described in
+    /// Roth, J. Paul. “Algebraic Topological Methods for the Synthesis of Switching Systems. I.”
+    /// Transactions of the American Mathematical Society 88, no. 2 (1958): 301–26.
+    /// https://doi.org/10.2307/1993216.
+    pub fn cube_subtract(&self, other: &BitPattern) -> HashSet<BitPattern> {
+        if self.len() != other.len() {
+            panic!("Cube subtract must have same length!");
+        }
+        if self.cube_disjoint(other) {
+            return HashSet::from([self.clone()]);
+        }
+
+        if other.cube_covers(self) {
+            return HashSet::new();
+        }
+
+        for (idx, (bit, other_bit)) in self.bits.iter().zip(&other.bits).enumerate() {
+            if !bit.is_concrete() && other_bit.is_concrete() {
+                // Now we have two cases: where `self` is outside `other` (bit == !other_bit)
+                // and where `self` is inside `other`
+                // When `self` is outside `other`, it is a part of A not covered by B
+                // When `self is inside `other`, we can recursively call subtract
+                let mut outside = self.clone();
+                outside.bits[idx] = !*other_bit;
+                let mut res = HashSet::from([outside]);
+
+                let mut inside = self.clone();
+                inside.bits[idx] = *other_bit;
+
+                res.extend(inside.cube_subtract(other));
+                return res;
+            }
+        }
+
+        panic!(
+            "If `self` is not either covered by or disjoint with `other`, there should be at least one index where `self` has a variable bit and `other` has a concrete bit"
+        );
+    }
+
+    /// Returns whether two cubes are disjoint
+    fn cube_disjoint(&self, other: &BitPattern) -> bool {
+        self.bits
+            .iter()
+            .zip(&other.bits)
+            .any(|(x, y)| matches!((x, y), (Bit::Low, Bit::High) | (Bit::High, Bit::Low)))
+    }
+
+    /// Returns whether `self` covers `other`
+    fn cube_covers(&self, other: &BitPattern) -> bool {
+        self.bits
+            .iter()
+            .zip(&other.bits)
+            .all(|(x, y)| *x == Bit::Var || x == y)
     }
 }
 
@@ -373,6 +450,7 @@ impl LookupTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn bit_pattern_to_int() {
@@ -388,6 +466,138 @@ mod tests {
     #[should_panic]
     fn fail_if_variable_bit() {
         BitPattern::parse("100x0").to_int();
+    }
+
+    #[test]
+    fn matches_prefix_accepts_matching_concrete_prefix() {
+        let pattern = BitPattern::parse("1010");
+
+        assert!(pattern.matches_prefix(&[Bit::High, Bit::Low]));
+        assert!(pattern.matches_prefix(&[Bit::High, Bit::Low, Bit::High, Bit::Low]));
+    }
+
+    #[test]
+    fn matches_prefix_rejects_mismatched_or_too_long_prefix() {
+        let pattern = BitPattern::parse("1010");
+
+        assert!(!pattern.matches_prefix(&[Bit::High, Bit::High]));
+        assert!(!pattern.matches_prefix(&[Bit::High, Bit::Low, Bit::High, Bit::Low, Bit::Low,]));
+    }
+
+    #[test]
+    fn matches_prefix_treats_pattern_var_and_test_bits_as_wildcards() {
+        let pattern = BitPattern::new(vec![Bit::High, Bit::Var, Bit::Test, Bit::Low]);
+
+        assert!(pattern.matches_prefix(&[Bit::High, Bit::Low, Bit::High, Bit::Low]));
+        assert!(pattern.matches_prefix(&[Bit::High, Bit::High, Bit::Low, Bit::Low]));
+        assert!(!pattern.matches_prefix(&[Bit::Low]));
+    }
+
+    #[test]
+    fn matches_bits_requires_equal_length() {
+        let pattern = BitPattern::parse("10xx");
+
+        assert!(pattern.matches_bits(&[Bit::High, Bit::Low, Bit::Low, Bit::High]));
+        assert!(!pattern.matches_bits(&[Bit::High, Bit::Low]));
+        assert!(!pattern.matches_bits(&[Bit::High, Bit::Low, Bit::Low, Bit::High, Bit::Low,]));
+    }
+
+    #[test]
+    fn matches_bits_rejects_concrete_mismatches() {
+        let pattern = BitPattern::parse("10x1");
+
+        assert!(!pattern.matches_bits(&[Bit::High, Bit::High, Bit::Low, Bit::High]));
+        assert!(!pattern.matches_bits(&[Bit::High, Bit::Low, Bit::High, Bit::Low]));
+    }
+
+    fn bit_pattern_string(pattern: &BitPattern) -> String {
+        pattern
+            .bits
+            .iter()
+            .map(|bit| match bit {
+                Bit::Low => '0',
+                Bit::High => '1',
+                Bit::Var => 'x',
+                Bit::Test => 't',
+            })
+            .collect()
+    }
+
+    fn cube_subtract_patterns(lhs: &str, rhs: &str) -> HashSet<String> {
+        let lhs = BitPattern::parse(lhs);
+        let rhs = BitPattern::parse(rhs);
+
+        lhs.cube_subtract(&rhs)
+            .into_iter()
+            .map(|pattern| bit_pattern_string(&pattern))
+            .collect()
+    }
+
+    fn pattern_set(patterns: &[&str]) -> HashSet<String> {
+        patterns.iter().map(|pattern| pattern.to_string()).collect()
+    }
+
+    #[test]
+    fn cube_subtract_returns_original_cube_when_disjoint() {
+        assert_eq!(cube_subtract_patterns("0x", "1x"), pattern_set(&["0x"]));
+    }
+
+    #[test]
+    fn cube_subtract_returns_empty_when_cubes_are_identical() {
+        assert!(cube_subtract_patterns("10x", "10x").is_empty());
+    }
+
+    #[test]
+    fn cube_subtract_returns_empty_when_rhs_covers_lhs() {
+        assert!(cube_subtract_patterns("100", "1xx").is_empty());
+    }
+
+    #[test]
+    fn cube_subtract_splits_single_variable_against_concrete_bit() {
+        assert_eq!(cube_subtract_patterns("xx", "0x"), pattern_set(&["1x"]));
+    }
+
+    #[test]
+    fn cube_subtract_splits_on_later_variable_when_prefix_matches() {
+        assert_eq!(cube_subtract_patterns("1xx", "10x"), pattern_set(&["11x"]));
+    }
+
+    #[test]
+    fn cube_subtract_fragments_two_constrained_bits() {
+        assert_eq!(
+            cube_subtract_patterns("xxx", "010"),
+            pattern_set(&["1xx", "00x", "011"])
+        );
+    }
+
+    #[test]
+    fn cube_subtract_handles_rhs_with_variable_suffix() {
+        assert_eq!(
+            cube_subtract_patterns("xxxx", "10xx"),
+            pattern_set(&["0xxx", "11xx"])
+        );
+    }
+
+    #[test]
+    fn cube_subtract_preserves_unrelated_concrete_bits_in_fragments() {
+        assert_eq!(
+            cube_subtract_patterns("x1x0", "1100"),
+            pattern_set(&["01x0", "1110"])
+        );
+    }
+
+    #[test]
+    fn cube_subtract_removes_one_point_from_two_bit_cube() {
+        assert_eq!(
+            cube_subtract_patterns("xx", "00"),
+            pattern_set(&["1x", "01"])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Cube subtract must have same length!")]
+    fn cube_subtract_panics_for_mismatched_lengths() {
+        BitPattern::parse("xx").cube_subtract(&BitPattern::parse("xxx"));
     }
 
     mod bit {

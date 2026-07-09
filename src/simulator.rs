@@ -10,7 +10,7 @@ use petgraph::{
 };
 
 use crate::{
-    bit::Bit,
+    bit::{Bit, BitPattern},
     parser::{Expr, ModuleNetlist, parse_netlist},
     stdcell_library::StandardCellLibrary,
 };
@@ -45,6 +45,7 @@ pub struct Simulator {
 
     // Compiled simulation fields using node indices
     // compiled_gates is sorted by the topological sort order of the digraph
+    input_wire_names: Vec<String>,
     wire_ids: HashMap<String, WireId>,
     wire_names: Vec<String>,
     alias_wire_ids: Vec<Vec<WireId>>,
@@ -185,6 +186,7 @@ impl Simulator {
 
         Self {
             top_mod_output_wire_ids,
+            input_wire_names: netlist.inputs,
             wire_ids,
             wire_names,
             alias_wire_ids,
@@ -194,6 +196,50 @@ impl Simulator {
             sequential_input_wires,
             constant_writes,
         }
+    }
+
+    pub fn input_wire_names(&self) -> &[String] {
+        &self.input_wire_names
+    }
+
+    pub fn pattern_to_sim_inputs(
+        &self,
+        pattern: &BitPattern,
+        instruction_input_name: &str,
+    ) -> HashMap<String, Bit> {
+        let mut sim_inputs = HashMap::new();
+        let indexed_prefix = format!("{}[", instruction_input_name);
+        let mut saw_instruction_input = false;
+
+        for input in &self.input_wire_names {
+            if let Some(inst_idx) = input
+                .strip_prefix(&indexed_prefix)
+                .and_then(|rest| rest.strip_suffix("]"))
+                .and_then(|idx| idx.parse::<usize>().ok())
+            {
+                assert!(
+                    inst_idx < pattern.bits.len(),
+                    "Instruction input {} is outside the {}-bit pattern",
+                    input,
+                    pattern.bits.len()
+                );
+                sim_inputs.insert(
+                    input.clone(),
+                    pattern.bits[pattern.bits.len() - 1 - inst_idx],
+                );
+                saw_instruction_input = true;
+            } else {
+                sim_inputs.insert(input.clone(), Bit::Var);
+            }
+        }
+
+        assert!(
+            saw_instruction_input,
+            "No primary inputs matched instruction input {}",
+            instruction_input_name
+        );
+
+        sim_inputs
     }
 
     pub fn optimization_workspace(&self) -> OptimizationWorkspace {
@@ -1313,6 +1359,50 @@ mod tests {
             .iter()
             .map(|(name, value)| ((*name).to_string(), *value))
             .collect()
+    }
+
+    #[test]
+    fn exposes_primary_input_wire_names() {
+        let verilog = r#"
+            module top(input [3:0] a, input b, output y);
+                assign y = a[0];
+            endmodule
+        "#;
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+
+        assert_eq!(
+            simulator.input_wire_names(),
+            &[
+                "a[0]".to_string(),
+                "a[1]".to_string(),
+                "a[2]".to_string(),
+                "a[3]".to_string(),
+                "b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_instruction_pattern_to_primary_sim_inputs() {
+        let verilog = r#"
+            module top(input [3:0] instruction_word, input ready, output y);
+                assign y = instruction_word[0];
+            endmodule
+        "#;
+        let netlist_path = write_temp_file("netlist", verilog);
+        let simulator =
+            Simulator::from_file(&netlist_path, "examples/NangateOpenCellLibrary_typical.lib");
+
+        let sim_inputs =
+            simulator.pattern_to_sim_inputs(&BitPattern::parse("1010"), "instruction_word");
+
+        assert_eq!(sim_inputs["instruction_word[0]"], Bit::Low);
+        assert_eq!(sim_inputs["instruction_word[1]"], Bit::High);
+        assert_eq!(sim_inputs["instruction_word[2]"], Bit::Low);
+        assert_eq!(sim_inputs["instruction_word[3]"], Bit::High);
+        assert_eq!(sim_inputs["ready"], Bit::Var);
     }
 
     #[test]

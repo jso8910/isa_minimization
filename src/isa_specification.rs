@@ -3,7 +3,7 @@ use std::{
     io,
 };
 
-use crate::instruction_semantics::{Effect, Expr, ValueName};
+use crate::instruction_semantics::{Effect, Expr, FieldName, ValueName};
 
 use super::bit::{Bit, BitPattern};
 
@@ -303,19 +303,19 @@ impl InstructionForm {
     ) -> Vec<BitPattern> {
         let mut encodings = Vec::new();
 
-        let mut num_permutations = 1;
-        for field in self.fields.iter() {
-            let Some(name) = &field.name else { continue };
-            let Some(field_use) = field_values.get(name) else {
-                continue;
-            };
-            print!("{name}\t");
-            println!("{:?}", field_use);
-            if let FieldUses::Uses { patterns, .. } = field_use {
-                num_permutations *= patterns.len();
-            }
-        }
-        println!("{num_permutations}");
+        // let mut num_permutations = 1;
+        // for field in self.fields.iter() {
+        //     let Some(name) = &field.name else { continue };
+        //     let Some(field_use) = field_values.get(name) else {
+        //         continue;
+        //     };
+        //     print!("{name}\t");
+        //     println!("{:?}", field_use);
+        //     if let FieldUses::Uses { patterns, .. } = field_use {
+        //         num_permutations *= patterns.len();
+        //     }
+        // }
+        // println!("{num_permutations}");
 
         // We approach this problem by walking through each field in in the instruction form
         // If a field is MergeMode::VariableBits, we don't need to expand anything
@@ -377,12 +377,25 @@ impl InstructionForm {
                         // If the field cannot satisfy the predicate, we should abandon this specific encoding, since it is not valid
                     }
                 }
-                (MergeMode::Uses, FieldUses::Uses { name: _, patterns }) => {
+                (
+                    MergeMode::Uses,
+                    FieldUses::Uses {
+                        name: _,
+                        patterns,
+                        len,
+                    },
+                ) => {
+                    assert_eq!(
+                        *len,
+                        field.pattern.len(),
+                        "FieldUses::Uses length must match instruction field width"
+                    );
                     let merged_patterns;
                     let patterns = if field.is_register_read && !field.is_register_write {
                         merged_patterns = FieldUses::Uses {
                             name: field.name.clone().unwrap_or_default(),
                             patterns: patterns.clone(),
+                            len: *len,
                         }
                         .merge();
                         match &merged_patterns {
@@ -440,6 +453,8 @@ impl InstructionForm {
     }
 
     /// Elaborates variable bits in a BitPattern to satisfy the predicate of InstructionForm::when
+    /// This does not fully satisfy predicates, so after selecting specific bits, you should make
+    /// sure to call the actual predicate.
     /// Arguments:
     /// * `pattern` - the BitPattern to elaborate.
     /// * `pattern_idx` - the starting index of the pattern in the overall instruction encoding (used for checking BitEq predicates)
@@ -540,6 +555,7 @@ pub enum FieldUses {
     Uses {
         name: String,
         patterns: HashSet<BitPattern>,
+        len: usize,
     },
 }
 
@@ -551,8 +567,16 @@ impl FieldUses {
                 name: name.clone(),
                 pattern: pattern.clone(),
             },
-            FieldUses::Uses { name, patterns } => {
+            FieldUses::Uses {
+                name,
+                patterns,
+                len,
+            } => {
                 let mut patterns = patterns.clone();
+                assert!(
+                    patterns.iter().all(|pattern| pattern.len() == *len),
+                    "All FieldUses::Uses patterns must match len"
+                );
                 loop {
                     let mut used = HashSet::new();
                     let mut new_strings = HashSet::new();
@@ -588,6 +612,7 @@ impl FieldUses {
                 FieldUses::Uses {
                     name: name.clone(),
                     patterns: patterns,
+                    len: *len,
                 }
             }
         }
@@ -609,7 +634,7 @@ pub enum MergeMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionField {
-    pub name: Option<String>,
+    pub name: Option<FieldName>,
     pub pattern: BitPattern,
     pub merge_mode: MergeMode,
     pub is_immediate: bool,
@@ -1046,6 +1071,7 @@ mod tests {
                     .iter()
                     .cloned()
                     .collect(),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1069,6 +1095,7 @@ mod tests {
                         .iter()
                         .cloned()
                         .collect(),
+                    len: 2,
                 },
             );
             field_values.insert(
@@ -1099,6 +1126,7 @@ mod tests {
                         .iter()
                         .cloned()
                         .collect(),
+                    len: 2,
                 },
             );
             field_values.insert(
@@ -1116,6 +1144,7 @@ mod tests {
                         .iter()
                         .cloned()
                         .collect(),
+                    len: 3,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1140,6 +1169,7 @@ mod tests {
                         .iter()
                         .cloned()
                         .collect(),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1188,6 +1218,7 @@ mod tests {
                     .iter()
                     .cloned()
                     .collect(),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1211,6 +1242,7 @@ mod tests {
                         .iter()
                         .cloned()
                         .collect(),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1238,6 +1270,7 @@ mod tests {
                     .iter()
                     .cloned()
                     .collect(),
+                    len: 2,
                 },
             );
             field_values.insert(
@@ -1268,13 +1301,20 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect(),
+                len: 2,
             };
             let merged = field_uses.merge();
             // 00, 01, and 11 can be merged into 0x and x1, but it will still be FieldUses::Uses
-            let FieldUses::Uses { name, patterns } = merged else {
+            let FieldUses::Uses {
+                name,
+                patterns,
+                len,
+            } = merged
+            else {
                 panic!("Merged FieldUses should be MergeMode::Uses");
             };
             assert_eq!(name, "field1".to_string());
+            assert_eq!(len, 2);
             assert_eq!(patterns.len(), 2);
             assert!(patterns.contains(&BitPattern::parse("0x")));
             assert!(patterns.contains(&BitPattern::parse("x1")));
@@ -1288,6 +1328,7 @@ mod tests {
                     .iter()
                     .cloned()
                     .collect(),
+                len: 2,
             };
             let merged = field_uses.merge();
             assert_eq!(
@@ -1297,7 +1338,8 @@ mod tests {
                     patterns: [BitPattern::parse("00"), BitPattern::parse("11")]
                         .iter()
                         .cloned()
-                        .collect()
+                        .collect(),
+                    len: 2,
                 }
             );
         }
@@ -1314,12 +1356,19 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect(),
+                len: 3,
             };
             let merged = field_uses.merge();
-            let FieldUses::Uses { name, patterns } = merged else {
+            let FieldUses::Uses {
+                name,
+                patterns,
+                len,
+            } = merged
+            else {
                 panic!("Merged FieldUses should be MergeMode::Uses");
             };
             assert_eq!(name, "field1".to_string());
+            assert_eq!(len, 3);
             assert_eq!(patterns.len(), 2);
             assert!(patterns.contains(&BitPattern::parse("00x")));
             assert!(patterns.contains(&BitPattern::parse("111")));
@@ -1342,12 +1391,19 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect(),
+                len: 3,
             };
             let merged = field_uses.merge();
-            let FieldUses::Uses { name, patterns } = merged else {
+            let FieldUses::Uses {
+                name,
+                patterns,
+                len,
+            } = merged
+            else {
                 panic!("Merged FieldUses should be MergeMode::Uses");
             };
             assert_eq!(name, "field1".to_string());
+            assert_eq!(len, 3);
             assert_eq!(patterns.len(), 1);
             assert!(patterns.contains(&BitPattern::parse("xxx")));
         }

@@ -21,7 +21,6 @@ use isa_minimization::isa_specification::{
     Instruction, InstructionField, InstructionForm, MergeMode, Predicate, StackDirection,
     StackPointer, and, bit_eq, c, field_eq, field_in, not,
 };
-use isa_minimization::parser::parse_netlist;
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
 use isa_minimization::simulator::{GateOutputAssignment, Simulator};
 
@@ -63,6 +62,8 @@ const DPROC_OPCODE_TST_BITS: &str = "1000";
 const DPROC_OPCODE_TEQ_BITS: &str = "1001";
 const DPROC_OPCODE_CMP_BITS: &str = "1010";
 const DPROC_OPCODE_CMN_BITS: &str = "1011";
+const DPROC_OPCODE_MOV_BITS: &str = "1101";
+const DPROC_OPCODE_MVN_BITS: &str = "1111";
 
 const HWTFR_SH_INVALID_BITS: &str = "00";
 const HWTFR_SH_UNSIGNED_HALFWORD: u128 = 0b01;
@@ -88,6 +89,7 @@ const COND_AL: u128 = 0b1110;
 
 const BIT_CLEAR: &str = "0";
 const BIT_SET: &str = "1";
+const REG_ZERO_BITS: &str = "0000";
 const REG_PC_BITS: &str = "1111";
 const EMPTY_BLOCK_REGLIST_BITS: &str = "0000000000000000";
 
@@ -1241,6 +1243,27 @@ fn dproc_valid_predicate() -> Predicate {
             ),
             field_eq("set_flags", BIT_CLEAR),
         ])),
+        // TST, TEQ, CMP, CMN do not write Rd; ARM encodes the ignored field as 0000.
+        not(and([
+            field_in(
+                "data_proc_opcode",
+                [
+                    DPROC_OPCODE_TST_BITS,
+                    DPROC_OPCODE_TEQ_BITS,
+                    DPROC_OPCODE_CMP_BITS,
+                    DPROC_OPCODE_CMN_BITS,
+                ],
+            ),
+            not(field_eq("rd_addr", REG_ZERO_BITS)),
+        ])),
+        // MOV and MVN do not read Rn; ARM encodes the ignored field as 0000.
+        not(and([
+            field_in(
+                "data_proc_opcode",
+                [DPROC_OPCODE_MOV_BITS, DPROC_OPCODE_MVN_BITS],
+            ),
+            not(field_eq("rn_addr", REG_ZERO_BITS)),
+        ])),
         not(and([
             field_eq("set_flags", BIT_SET),
             field_eq("rd_addr", REG_PC_BITS),
@@ -1693,30 +1716,6 @@ pub fn registers() -> Vec<ArchitecturalRegister> {
     gprs().into_iter().chain(flags()).collect()
 }
 
-fn pattern_to_sim_inputs(pattern: &BitPattern, primary_inputs: &[String]) -> HashMap<String, Bit> {
-    assert_eq!(
-        pattern.bits.len(),
-        32,
-        "ARM32 instruction encodings must be 32 bits"
-    );
-
-    let mut sim_inputs = HashMap::new();
-
-    for input in primary_inputs {
-        if let Some(inst_idx) = input
-            .strip_prefix("inst[")
-            .and_then(|rest| rest.strip_suffix("]"))
-            .and_then(|idx| idx.parse::<usize>().ok())
-        {
-            sim_inputs.insert(input.clone(), pattern.bits[31 - inst_idx]);
-        } else {
-            sim_inputs.insert(input.clone(), Bit::Var);
-        }
-    }
-
-    sim_inputs
-}
-
 fn instance_name_on_line(line: &str) -> Option<&str> {
     let before_connections = line.split_once('(')?.0.trim_end();
     let mut tokens = before_connections.split_whitespace();
@@ -1834,6 +1833,7 @@ fn main() {
                 MergeMode::Uses => FieldUses::Uses {
                     name: name.clone(),
                     patterns: [value.clone()].iter().cloned().collect(),
+                    len: value.len(),
                 },
                 MergeMode::VariableBits => FieldUses::VariableBits {
                     name: name.clone(),
@@ -1841,7 +1841,12 @@ fn main() {
                 },
             };
             match field_values.entry(name.clone()).or_insert(default_val) {
-                FieldUses::Uses { name: _, patterns } => {
+                FieldUses::Uses {
+                    name: _,
+                    patterns,
+                    len,
+                } => {
+                    assert_eq!(*len, value.len());
                     let new_pattern = value.clone();
                     patterns.insert(new_pattern);
                 }
@@ -1869,11 +1874,17 @@ fn main() {
 
     // Merge patterns for fields with merge_mode_uses, to reduce the number of encodings we need to generate
     for (_, field_uses) in field_values.iter_mut() {
-        if let FieldUses::Uses { name: _, patterns } = field_uses {
+        if let FieldUses::Uses {
+            name: _,
+            patterns,
+            len,
+        } = field_uses
+        {
             // Merge the patterns to reduce the number of encodings we need to generate
             let merged = FieldUses::Uses {
                 name: "__".to_string(),
                 patterns: patterns.clone(),
+                len: *len,
             }
             .merge();
             *field_uses = merged;
@@ -1923,7 +1934,9 @@ fn main() {
     for (field_name, field_uses) in &field_values {
         println!("  Field: {}", field_name);
         match field_uses {
-            FieldUses::Uses { name: _, patterns } => {
+            FieldUses::Uses {
+                name: _, patterns, ..
+            } => {
                 for pattern in patterns {
                     let pattern_str: String = pattern
                         .bits
@@ -1958,11 +1971,10 @@ fn main() {
         }
     }
 
-    let verilog = fs::read_to_string(NETLIST_PATH).unwrap();
-    let netlist = parse_netlist(&verilog).unwrap();
+    let simulator = Simulator::from_file(NETLIST_PATH, STDCELL_PATH);
     let sim_inputs: Vec<_> = valid_encodings
         .iter()
-        .map(|encoding| pattern_to_sim_inputs(encoding, &netlist.inputs))
+        .map(|encoding| simulator.pattern_to_sim_inputs(encoding, "inst"))
         .collect();
 
     println!(
@@ -1970,7 +1982,6 @@ fn main() {
         sim_inputs.len()
     );
 
-    let simulator = Simulator::from_file(NETLIST_PATH, STDCELL_PATH);
     let compiled_sim_inputs = simulator.compile_optimization_inputs(&sim_inputs);
     let mut optimization_workspace = simulator.optimization_workspace();
     let optimization_started = Instant::now();

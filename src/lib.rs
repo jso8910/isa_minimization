@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub mod bit;
 pub mod constants;
 pub mod instruction_semantics;
+pub mod isa_optimization;
 pub mod isa_specification;
 pub mod parser;
 pub mod semantic_matching;
