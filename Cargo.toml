@@ -21,6 +21,7 @@ petgraph = "0.8.3"
 oxidd = "0.11.0"
 itertools = "0.15.0"
 rand = "0.10.2"
+rayon = "1.12.0"
 z3 = { version = "0.20", features = ["bundled"] }
 
 [dev-dependencies]
@@ -33,3 +34,7 @@ harness = false
 [[bench]]
 name = "generate_candidates"
 harness = false
+
+[[bin]]
+name = "generate_greenthumb_restriction_superopt"
+path = "tools/greenthumb_restriction_superopt/generate.rs"

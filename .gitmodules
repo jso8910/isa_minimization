@@ -1,0 +1,3 @@
+[submodule "greenthumb"]
+	path = greenthumb
+	url = https://github.com/jso8910/greenthumb

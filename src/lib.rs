@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod bit;
 pub mod constants;
+pub mod greenthumb_restrictions;
 pub mod instruction_semantics;
 pub mod isa_optimization;
 pub mod isa_specification;

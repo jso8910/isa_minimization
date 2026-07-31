@@ -19,7 +19,7 @@ use isa_minimization::instruction_semantics::{
 use isa_minimization::isa_specification::{
     ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA,
     Instruction, InstructionField, InstructionForm, MergeMode, Predicate, StackDirection,
-    StackPointer, and, bit_eq, c, field_eq, field_in, not,
+    StackPointer, and, bit_eq, c, field_eq, field_in,
 };
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
 use isa_minimization::simulator::{GateOutputAssignment, Simulator};
@@ -58,15 +58,8 @@ const DPROC_OPCODE_MOV: u128 = 0b1101;
 const DPROC_OPCODE_BIC: u128 = 0b1110;
 const DPROC_OPCODE_MVN: u128 = 0b1111;
 
-const DPROC_OPCODE_TST_BITS: &str = "1000";
-const DPROC_OPCODE_TEQ_BITS: &str = "1001";
-const DPROC_OPCODE_CMP_BITS: &str = "1010";
-const DPROC_OPCODE_CMN_BITS: &str = "1011";
-const DPROC_OPCODE_MOV_BITS: &str = "1101";
-const DPROC_OPCODE_MVN_BITS: &str = "1111";
-
-const HWTFR_SH_INVALID_BITS: &str = "00";
 const HWTFR_SH_UNSIGNED_HALFWORD: u128 = 0b01;
+const HWTFR_SH_UNSIGNED_HALFWORD_BITS: &str = "01";
 const HWTFR_SH_SIGNED_BYTE: u128 = 0b10;
 const HWTFR_SH_SIGNED_BYTE_BITS: &str = "10";
 const HWTFR_SH_SIGNED_HALFWORD_BITS: &str = "11";
@@ -91,7 +84,26 @@ const BIT_CLEAR: &str = "0";
 const BIT_SET: &str = "1";
 const REG_ZERO_BITS: &str = "0000";
 const REG_PC_BITS: &str = "1111";
-const EMPTY_BLOCK_REGLIST_BITS: &str = "0000000000000000";
+const COND_VALID_PATTERNS: [&str; 4] = ["0xxx", "x0xx", "xx0x", "xxx0"];
+const REG_NON_PC_PATTERNS: [&str; 4] = ["0xxx", "x0xx", "xx0x", "xxx0"];
+const BLOCK_REGLIST_NON_EMPTY_PATTERNS: [&str; 16] = [
+    "1xxxxxxxxxxxxxxx",
+    "x1xxxxxxxxxxxxxx",
+    "xx1xxxxxxxxxxxxx",
+    "xxx1xxxxxxxxxxxx",
+    "xxxx1xxxxxxxxxxx",
+    "xxxxx1xxxxxxxxxx",
+    "xxxxxx1xxxxxxxxx",
+    "xxxxxxx1xxxxxxxx",
+    "xxxxxxxx1xxxxxxx",
+    "xxxxxxxxx1xxxxxx",
+    "xxxxxxxxxx1xxxxx",
+    "xxxxxxxxxxx1xxxx",
+    "xxxxxxxxxxxx1xxx",
+    "xxxxxxxxxxxxx1xx",
+    "xxxxxxxxxxxxxx1x",
+    "xxxxxxxxxxxxxxx1",
+];
 
 const ENC_BIT_LOW: &str = "0";
 const ENC_BIT_HIGH: &str = "1";
@@ -572,13 +584,33 @@ fn is_dproc_arithmetic_opcode() -> Expr {
     )
 }
 
-fn dproc_effects() -> Vec<Effect> {
+#[derive(Clone, Copy)]
+enum FlagMode {
+    FromField,
+    AlwaysSet,
+    AlwaysClear,
+}
+
+#[derive(Clone, Copy)]
+enum TransferMode {
+    Load,
+    Store,
+}
+
+fn flag_guard(guard: Expr, mode: FlagMode) -> Expr {
+    match mode {
+        FlagMode::FromField => guard_all([guard, if_field("set_flags", 1)]),
+        FlagMode::AlwaysSet => guard,
+        FlagMode::AlwaysClear => bool_const(false),
+    }
+}
+
+fn dproc_effects(flag_mode: FlagMode) -> Vec<Effect> {
     let result = dproc_result();
     let should_execute = cond_guard();
     let writes_result = guard_all([should_execute.clone(), not_expr(is_dproc_test_opcode())]);
     let writes_flags = guard_all([
-        should_execute,
-        if_field("set_flags", 1),
+        flag_guard(should_execute, flag_mode),
         field_not("rd_addr", 15, 4),
     ]);
     let arithmetic_flags = guard_and(writes_flags.clone(), is_dproc_arithmetic_opcode());
@@ -747,12 +779,18 @@ fn byte_or_word_store_value() -> Expr {
     )
 }
 
-fn data_transfer_effects() -> Vec<Effect> {
+fn data_transfer_effects(mode: TransferMode) -> Vec<Effect> {
     let guard = cond_guard();
     let address = derived("address");
     let writeback_address = derived("writeback_address");
-    let load_guard = guard_all([guard.clone(), if_field("is_load", 1)]);
-    let store_guard = guard_all([guard.clone(), if_field("is_load", 0)]);
+    let load_guard = match mode {
+        TransferMode::Load => guard.clone(),
+        TransferMode::Store => bool_const(false),
+    };
+    let store_guard = match mode {
+        TransferMode::Load => bool_const(false),
+        TransferMode::Store => guard.clone(),
+    };
     let writeback_guard = guard_all([guard, transfer_writes_back("is_pre_idx", "do_writeback")]);
 
     // Non-simplified ARM7TDMI word-load behavior for little-endian unaligned addresses:
@@ -799,16 +837,21 @@ fn hwtfr_load_value(address: Expr) -> Expr {
     )
 }
 
-fn hwtfr_effects() -> Vec<Effect> {
+fn hwtfr_effects(mode: TransferMode) -> Vec<Effect> {
     let guard = cond_guard();
     let address = derived("address");
     let writeback_address = derived("writeback_address");
-    let load_guard = guard_all([guard.clone(), if_field("is_load", 1)]);
-    let store_guard = guard_all([
-        guard.clone(),
-        if_field("is_load", 0),
-        field_is("sh_bits", HWTFR_SH_UNSIGNED_HALFWORD, 2),
-    ]);
+    let load_guard = match mode {
+        TransferMode::Load => guard.clone(),
+        TransferMode::Store => bool_const(false),
+    };
+    let store_guard = match mode {
+        TransferMode::Load => bool_const(false),
+        TransferMode::Store => guard_all([
+            guard.clone(),
+            field_is("sh_bits", HWTFR_SH_UNSIGNED_HALFWORD, 2),
+        ]),
+    };
     let writeback_guard = guard_all([guard, transfer_writes_back("is_pre_idx", "do_writeback")]);
 
     // Non-simplified ARM7TDMI halfword behavior depends on BIGEND and returns
@@ -895,10 +938,16 @@ fn block_store_register_value(register: u8) -> Expr {
     }
 }
 
-fn block_tfr_effects() -> Vec<Effect> {
+fn block_tfr_effects(mode: TransferMode) -> Vec<Effect> {
     let guard = cond_guard();
-    let load_guard = guard_all([guard.clone(), if_field("is_load_block", 1)]);
-    let store_guard = guard_all([guard.clone(), if_field("is_load_block", 0)]);
+    let load_guard = match mode {
+        TransferMode::Load => guard.clone(),
+        TransferMode::Store => bool_const(false),
+    };
+    let store_guard = match mode {
+        TransferMode::Load => bool_const(false),
+        TransferMode::Store => guard.clone(),
+    };
     let writeback_guard = guard_all([guard, if_field("do_writeback_block", 1)]);
     let mut effects = vec![Effect::write_register_if(
         writeback_guard,
@@ -1083,10 +1132,6 @@ pub fn data_proc_opcode() -> InstructionField {
     InstructionField::variable("data_proc_opcode", 4).merge_mode_uses()
 }
 
-pub fn has_imm() -> InstructionField {
-    InstructionField::variable("has_imm", 1)
-}
-
 pub fn op2_imm_shift_amt() -> InstructionField {
     InstructionField::variable("op2_imm_shift_amt", 5).immediate()
 }
@@ -1135,14 +1180,6 @@ pub fn do_writeback() -> InstructionField {
     InstructionField::variable("do_writeback", 1)
 }
 
-pub fn is_load() -> InstructionField {
-    InstructionField::variable("is_load", 1)
-}
-
-pub fn has_imm_offset() -> InstructionField {
-    InstructionField::variable("has_imm_offset", 1)
-}
-
 pub fn sh_bits() -> InstructionField {
     // Cannot have value 00
     InstructionField::variable("sh_bits", 2).merge_mode_uses()
@@ -1172,16 +1209,8 @@ pub fn is_up_offset_block() -> InstructionField {
     InstructionField::variable("is_up_offset_block", 1)
 }
 
-pub fn do_load_psr() -> InstructionField {
-    InstructionField::variable("do_load_psr", 1)
-}
-
 pub fn do_writeback_block() -> InstructionField {
     InstructionField::variable("do_writeback_block", 1)
-}
-
-pub fn is_load_block() -> InstructionField {
-    InstructionField::variable("is_load_block", 1)
 }
 
 pub fn block_reglist() -> InstructionField {
@@ -1197,201 +1226,448 @@ pub fn branch_offset() -> InstructionField {
 }
 
 // Instruction definitions
-pub fn dproc_prefix() -> Vec<InstructionField> {
+fn dproc_prefix(
+    has_imm_bits: &'static str,
+    set_flags_field: InstructionField,
+) -> Vec<InstructionField> {
     vec![
         cond(),
         c(ENC_DATA_PROC_CLASS),
-        has_imm(),
+        c(has_imm_bits), // I bit: fixed by operand form.
         data_proc_opcode(),
-        set_flags(),
+        set_flags_field,
         rn_addr(),
         rd_addr(),
     ]
 }
 
-pub fn data_tfr_prefix() -> Vec<InstructionField> {
+fn data_tfr_prefix(
+    has_imm_offset_bits: &'static str,
+    is_load_bits: &'static str,
+) -> Vec<InstructionField> {
     vec![
         cond(),
         c(ENC_DATA_TRANSFER_CLASS),
-        has_imm_offset(),
+        c(has_imm_offset_bits), // I bit: register offset when set, immediate offset when clear.
         is_pre_idx(),
         is_up_offset(),
         is_byte_tfr(),
         do_writeback(),
-        is_load(),
+        c(is_load_bits), // L bit: fixed by the load/store/branch bucket.
         rn_addr_read_write(),
         rd_addr_read_write(),
     ]
 }
 
+fn cond_valid_predicate() -> Predicate {
+    field_in("cond", COND_VALID_PATTERNS)
+}
+
 fn dproc_valid_predicate() -> Predicate {
-    and([
-        // TST, TEQ, CMP, CMN must set flags.
-        //
-        // Invalid:
-        // data_proc_opcode in {1000, 1001, 1010, 1011}
-        // AND set_flags == 0
-        not(and([
-            field_in(
-                "data_proc_opcode",
-                [
-                    DPROC_OPCODE_TST_BITS,
-                    DPROC_OPCODE_TEQ_BITS,
-                    DPROC_OPCODE_CMP_BITS,
-                    DPROC_OPCODE_CMN_BITS,
-                ],
-            ),
-            field_eq("set_flags", BIT_CLEAR),
-        ])),
-        // TST, TEQ, CMP, CMN do not write Rd; ARM encodes the ignored field as 0000.
-        not(and([
-            field_in(
-                "data_proc_opcode",
-                [
-                    DPROC_OPCODE_TST_BITS,
-                    DPROC_OPCODE_TEQ_BITS,
-                    DPROC_OPCODE_CMP_BITS,
-                    DPROC_OPCODE_CMN_BITS,
-                ],
-            ),
-            not(field_eq("rd_addr", REG_ZERO_BITS)),
-        ])),
-        // MOV and MVN do not read Rn; ARM encodes the ignored field as 0000.
-        not(and([
-            field_in(
-                "data_proc_opcode",
-                [DPROC_OPCODE_MOV_BITS, DPROC_OPCODE_MVN_BITS],
-            ),
-            not(field_eq("rn_addr", REG_ZERO_BITS)),
-        ])),
-        not(and([
-            field_eq("set_flags", BIT_SET),
-            field_eq("rd_addr", REG_PC_BITS),
-        ])),
-    ])
+    cond_valid_predicate()
+}
+
+fn data_tfr_valid_predicate() -> Predicate {
+    cond_valid_predicate()
 }
 
 fn hwtfr_valid_predicate() -> Predicate {
-    and([
-        // sh_bits must not be 00.
-        not(field_eq("sh_bits", HWTFR_SH_INVALID_BITS)),
-        not(and([
-            field_eq("is_load", BIT_CLEAR),
-            field_in(
-                "sh_bits",
-                [HWTFR_SH_SIGNED_BYTE_BITS, HWTFR_SH_SIGNED_HALFWORD_BITS],
-            ),
-        ])),
-    ])
+    cond_valid_predicate()
 }
 
 fn block_tfr_valid_predicate() -> Predicate {
     and([
-        not(field_eq("block_reglist", EMPTY_BLOCK_REGLIST_BITS)),
-        field_eq("do_load_psr", BIT_CLEAR),
+        cond_valid_predicate(),
+        field_in("block_reglist", BLOCK_REGLIST_NON_EMPTY_PATTERNS),
+        field_in("rn_addr", REG_NON_PC_PATTERNS),
     ])
 }
 
-pub fn dproc() -> Instruction {
-    with_effects(
-        Instruction::new("dproc", 32)
-            .form(
-                InstructionForm::new("register_shifted_register")
-                    .fields(dproc_prefix())
-                    .fields([
-                        rs_addr(),
-                        c(ENC_BIT_LOW),
-                        op2_shift_type(),
-                        c(ENC_BIT_HIGH),
-                        rm_addr(),
-                    ])
-                    .derived_value(dv(
-                        "operand1",
-                        read_register_field_with_pc_delta("rn_addr", 4),
-                    ))
-                    .derived_value(dv(
-                        "operand2",
-                        arm_shift(
-                            read_register_field_with_pc_delta("rm_addr", 4),
-                            immediate_field("op2_shift_type"),
-                            extract(read_register_field("rs_addr", 32), 7, 0),
-                            true,
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "shifter_carry_out",
-                        arm_shift_carry_out(
-                            read_register_field_with_pc_delta("rm_addr", 4),
-                            immediate_field("op2_shift_type"),
-                            extract(read_register_field("rs_addr", 32), 7, 0),
-                            true,
-                        ),
-                    ))
-                    .when(and([bit_eq(6, Bit::Low), dproc_valid_predicate()])),
-            )
-            .form(
-                InstructionForm::new("register_immediate_shift")
-                    .fields(dproc_prefix())
-                    .fields([
-                        op2_imm_shift_amt(),
-                        op2_shift_type(),
-                        c(ENC_BIT_LOW),
-                        rm_addr(),
-                    ])
-                    .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
-                    .derived_value(dv(
-                        "operand2",
-                        arm_shift(
-                            read_register_field("rm_addr", 32),
-                            immediate_field("op2_shift_type"),
-                            immediate_field("op2_imm_shift_amt"),
-                            false,
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "shifter_carry_out",
-                        arm_shift_carry_out(
-                            read_register_field("rm_addr", 32),
-                            immediate_field("op2_shift_type"),
-                            immediate_field("op2_imm_shift_amt"),
-                            false,
-                        ),
-                    ))
-                    .when(and([bit_eq(6, Bit::Low), dproc_valid_predicate()])),
-            )
-            .form(
-                InstructionForm::new("immediate")
-                    .fields(dproc_prefix())
-                    .fields([imm_ror_amt(), imm8()])
-                    .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
-                    .derived_value(dv(
-                        "operand2",
-                        rotate_right(
-                            zero_extend(immediate_field("imm8"), 32),
-                            shift_left(
-                                zero_extend(immediate_field("imm_ror_amt"), 32),
-                                constant(1, 32),
-                            ),
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "shifter_carry_out",
-                        select(
-                            field_is("imm_ror_amt", 0, 4),
-                            read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1),
-                            bit31(rotate_right(
-                                zero_extend(immediate_field("imm8"), 32),
-                                shift_left(
-                                    zero_extend(immediate_field("imm_ror_amt"), 32),
-                                    constant(1, 32),
-                                ),
-                            )),
-                        ),
-                    ))
-                    .when(and([bit_eq(6, Bit::High), dproc_valid_predicate()])),
+fn swp_valid_predicate() -> Predicate {
+    and([
+        cond_valid_predicate(),
+        field_in("rn_addr", REG_NON_PC_PATTERNS),
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+        field_in("rm_addr", REG_NON_PC_PATTERNS),
+    ])
+}
+
+fn data_tfr_normal_base_predicate() -> Predicate {
+    field_in("rn_addr", REG_NON_PC_PATTERNS)
+}
+
+fn data_tfr_pc_base_predicate() -> Predicate {
+    and([
+        field_eq("rn_addr", REG_PC_BITS),
+        field_eq("is_pre_idx", BIT_SET),
+        field_eq("do_writeback", BIT_CLEAR),
+    ])
+}
+
+fn dproc_operand_predicate(mnemonic: &str) -> Predicate {
+    match mnemonic {
+        "tst" | "teq" | "cmp" | "cmn" => field_eq("rd_addr", REG_ZERO_BITS),
+        "mov" | "mvn" => field_eq("rn_addr", REG_ZERO_BITS),
+        _ => Predicate::Always,
+    }
+}
+
+fn dproc_register_shifted_register_form(
+    name: String,
+    opcode_bits: &'static str,
+    set_flags_field: InstructionField,
+    set_flags_predicate: Predicate,
+    rd_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields(dproc_prefix(BIT_CLEAR, set_flags_field))
+        .fields([
+            rs_addr(),
+            c(ENC_BIT_LOW),
+            op2_shift_type(),
+            c(ENC_BIT_HIGH),
+            rm_addr(),
+        ])
+        .derived_value(dv(
+            "operand1",
+            read_register_field_with_pc_delta("rn_addr", 4),
+        ))
+        .derived_value(dv(
+            "operand2",
+            arm_shift(
+                read_register_field_with_pc_delta("rm_addr", 4),
+                immediate_field("op2_shift_type"),
+                extract(read_register_field("rs_addr", 32), 7, 0),
+                true,
             ),
-        dproc_effects(),
+        ))
+        .derived_value(dv(
+            "shifter_carry_out",
+            arm_shift_carry_out(
+                read_register_field_with_pc_delta("rm_addr", 4),
+                immediate_field("op2_shift_type"),
+                extract(read_register_field("rs_addr", 32), 7, 0),
+                true,
+            ),
+        ))
+        .when(and([
+            field_eq("data_proc_opcode", opcode_bits),
+            set_flags_predicate,
+            rd_predicate,
+            dproc_valid_predicate(),
+        ]))
+}
+
+fn dproc_register_immediate_shift_form(
+    name: String,
+    opcode_bits: &'static str,
+    set_flags_field: InstructionField,
+    set_flags_predicate: Predicate,
+    rd_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields(dproc_prefix(BIT_CLEAR, set_flags_field))
+        .fields([
+            op2_imm_shift_amt(),
+            op2_shift_type(),
+            c(ENC_BIT_LOW),
+            rm_addr(),
+        ])
+        .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
+        .derived_value(dv(
+            "operand2",
+            arm_shift(
+                read_register_field("rm_addr", 32),
+                immediate_field("op2_shift_type"),
+                immediate_field("op2_imm_shift_amt"),
+                false,
+            ),
+        ))
+        .derived_value(dv(
+            "shifter_carry_out",
+            arm_shift_carry_out(
+                read_register_field("rm_addr", 32),
+                immediate_field("op2_shift_type"),
+                immediate_field("op2_imm_shift_amt"),
+                false,
+            ),
+        ))
+        .when(and([
+            field_eq("data_proc_opcode", opcode_bits),
+            set_flags_predicate,
+            rd_predicate,
+            dproc_valid_predicate(),
+        ]))
+}
+
+fn dproc_immediate_form(
+    name: String,
+    opcode_bits: &'static str,
+    set_flags_field: InstructionField,
+    set_flags_predicate: Predicate,
+    rd_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields(dproc_prefix(BIT_SET, set_flags_field))
+        .fields([imm_ror_amt(), imm8()])
+        .derived_value(dv("operand1", read_register_field("rn_addr", 32)))
+        .derived_value(dv(
+            "operand2",
+            rotate_right(
+                zero_extend(immediate_field("imm8"), 32),
+                shift_left(
+                    zero_extend(immediate_field("imm_ror_amt"), 32),
+                    constant(1, 32),
+                ),
+            ),
+        ))
+        .derived_value(dv(
+            "shifter_carry_out",
+            select(
+                field_is("imm_ror_amt", 0, 4),
+                read_fixed_register(REG_C, VIRTUAL_REGISTER_IDENTIFIER_WIDTH, 1),
+                bit31(rotate_right(
+                    zero_extend(immediate_field("imm8"), 32),
+                    shift_left(
+                        zero_extend(immediate_field("imm_ror_amt"), 32),
+                        constant(1, 32),
+                    ),
+                )),
+            ),
+        ))
+        .when(and([
+            field_eq("data_proc_opcode", opcode_bits),
+            set_flags_predicate,
+            rd_predicate,
+            dproc_valid_predicate(),
+        ]))
+}
+
+fn dproc_category_reg_op2(
+    name: &str,
+    opcodes: &[(&'static str, &'static str)],
+    set_flags_bits: &'static str,
+    rd_predicate: Predicate,
+) -> Instruction {
+    let mut instruction = Instruction::new(name, 32);
+    for (mnemonic, opcode_bits) in opcodes {
+        let extra_predicate = and([rd_predicate.clone(), dproc_operand_predicate(mnemonic)]);
+        let set_flags_field = c(set_flags_bits); // S bit: fixed by this data-processing bucket.
+        instruction = instruction
+            .form(dproc_register_shifted_register_form(
+                format!("{mnemonic}_register_shifted_register"),
+                opcode_bits,
+                set_flags_field.clone(),
+                Predicate::Always,
+                extra_predicate.clone(),
+            ))
+            .form(dproc_register_immediate_shift_form(
+                format!("{mnemonic}_register_immediate_shift"),
+                opcode_bits,
+                set_flags_field.clone(),
+                Predicate::Always,
+                extra_predicate.clone(),
+            ));
+    }
+
+    let flag_mode = if set_flags_bits == BIT_SET {
+        FlagMode::AlwaysSet
+    } else {
+        FlagMode::AlwaysClear
+    };
+    with_effects(instruction, dproc_effects(flag_mode))
+}
+
+fn dproc_category_imm_op2(
+    name: &str,
+    opcodes: &[(&'static str, &'static str)],
+    set_flags_bits: &'static str,
+    rd_predicate: Predicate,
+) -> Instruction {
+    let mut instruction = Instruction::new(name, 32);
+    for (mnemonic, opcode_bits) in opcodes {
+        let extra_predicate = and([rd_predicate.clone(), dproc_operand_predicate(mnemonic)]);
+        let set_flags_field = c(set_flags_bits); // S bit: fixed by this data-processing bucket.
+        instruction = instruction.form(dproc_immediate_form(
+            format!("{mnemonic}_immediate"),
+            opcode_bits,
+            set_flags_field,
+            Predicate::Always,
+            extra_predicate,
+        ));
+    }
+
+    let flag_mode = if set_flags_bits == BIT_SET {
+        FlagMode::AlwaysSet
+    } else {
+        FlagMode::AlwaysClear
+    };
+    with_effects(instruction, dproc_effects(flag_mode))
+}
+
+const DPROC_ARITHMETIC_OPCODES: &[(&str, &str)] = &[
+    ("sub", "0010"),
+    ("rsb", "0011"),
+    ("add", "0100"),
+    ("adc", "0101"),
+    ("sbc", "0110"),
+    ("rsc", "0111"),
+];
+
+const DPROC_LOGICAL_OPCODES: &[(&str, &str)] = &[
+    ("and", "0000"),
+    ("eor", "0001"),
+    ("orr", "1100"),
+    ("bic", "1110"),
+];
+
+const DPROC_MOVE_OPCODES: &[(&str, &str)] = &[("mov", "1101"), ("mvn", "1111")];
+
+const DPROC_FLAG_OPCODES: &[(&str, &str)] = &[
+    ("and", "0000"),
+    ("eor", "0001"),
+    ("sub", "0010"),
+    ("rsb", "0011"),
+    ("add", "0100"),
+    ("adc", "0101"),
+    ("sbc", "0110"),
+    ("rsc", "0111"),
+    ("tst", "1000"),
+    ("teq", "1001"),
+    ("cmp", "1010"),
+    ("cmn", "1011"),
+    ("orr", "1100"),
+    ("mov", "1101"),
+    ("bic", "1110"),
+    ("mvn", "1111"),
+];
+
+const DPROC_RESULT_OPCODES: &[(&str, &str)] = &[
+    ("and", "0000"),
+    ("eor", "0001"),
+    ("sub", "0010"),
+    ("rsb", "0011"),
+    ("add", "0100"),
+    ("adc", "0101"),
+    ("sbc", "0110"),
+    ("rsc", "0111"),
+    ("orr", "1100"),
+    ("mov", "1101"),
+    ("bic", "1110"),
+    ("mvn", "1111"),
+];
+
+pub fn arithmetic_s0_reg_op2() -> Instruction {
+    dproc_category_reg_op2(
+        "arithmetic_s0_reg_op2",
+        DPROC_ARITHMETIC_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
     )
+}
+
+pub fn arithmetic_s0_imm_op2() -> Instruction {
+    dproc_category_imm_op2(
+        "arithmetic_s0_imm_op2",
+        DPROC_ARITHMETIC_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn logical_s0_reg_op2() -> Instruction {
+    dproc_category_reg_op2(
+        "logical_s0_reg_op2",
+        DPROC_LOGICAL_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn logical_s0_imm_op2() -> Instruction {
+    dproc_category_imm_op2(
+        "logical_s0_imm_op2",
+        DPROC_LOGICAL_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn move_s0_reg_op2() -> Instruction {
+    dproc_category_reg_op2(
+        "move_s0_reg_op2",
+        DPROC_MOVE_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn move_s0_imm_op2() -> Instruction {
+    dproc_category_imm_op2(
+        "move_s0_imm_op2",
+        DPROC_MOVE_OPCODES,
+        BIT_CLEAR,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn dproc_s1_reg_op2() -> Instruction {
+    dproc_category_reg_op2(
+        "dproc_s1_reg_op2",
+        DPROC_FLAG_OPCODES,
+        BIT_SET,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn dproc_s1_imm_op2() -> Instruction {
+    dproc_category_imm_op2(
+        "dproc_s1_imm_op2",
+        DPROC_FLAG_OPCODES,
+        BIT_SET,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn branch_ops_dproc() -> Instruction {
+    let mut instruction = Instruction::new("branch_ops_dproc", 32);
+    for set_flags_bits in [BIT_CLEAR, BIT_SET] {
+        for (mnemonic, opcode_bits) in DPROC_RESULT_OPCODES {
+            let form_prefix = if set_flags_bits == BIT_SET {
+                format!("{mnemonic}s")
+            } else {
+                (*mnemonic).to_string()
+            };
+            let extra_predicate = and([
+                field_eq("rd_addr", REG_PC_BITS),
+                dproc_operand_predicate(mnemonic),
+            ]);
+            instruction = instruction
+                .form(dproc_register_shifted_register_form(
+                    format!("{form_prefix}_register_shifted_register"),
+                    opcode_bits,
+                    set_flags(),
+                    field_eq("set_flags", set_flags_bits),
+                    extra_predicate.clone(),
+                ))
+                .form(dproc_register_immediate_shift_form(
+                    format!("{form_prefix}_register_immediate_shift"),
+                    opcode_bits,
+                    set_flags(),
+                    field_eq("set_flags", set_flags_bits),
+                    extra_predicate.clone(),
+                ))
+                .form(dproc_immediate_form(
+                    format!("{form_prefix}_immediate"),
+                    opcode_bits,
+                    set_flags(),
+                    field_eq("set_flags", set_flags_bits),
+                    extra_predicate,
+                ));
+        }
+    }
+
+    with_effects(instruction, dproc_effects(FlagMode::FromField))
 }
 
 pub fn mul() -> Instruction {
@@ -1409,10 +1685,17 @@ pub fn mul() -> Instruction {
                     c(ENC_MUL_FIXED_SUFFIX),
                     rm_addr(),
                 ])
-                .derived_value(dv("result", mul_result())),
+                .derived_value(dv("result", mul_result()))
+                .when(cond_valid_predicate()),
         ),
         mul_effects(),
     )
+}
+
+pub fn multiply_ops_mul() -> Instruction {
+    let mut instruction = mul();
+    instruction.name = "multiply_ops_mul".to_string();
+    instruction
 }
 
 pub fn mull() -> Instruction {
@@ -1431,10 +1714,17 @@ pub fn mull() -> Instruction {
                     c(ENC_MUL_FIXED_SUFFIX),
                     rm_addr(),
                 ])
-                .derived_value(dv("result", mull_result())),
+                .derived_value(dv("result", mull_result()))
+                .when(cond_valid_predicate()),
         ),
         mull_effects(),
     )
+}
+
+pub fn multiply_ops_mull() -> Instruction {
+    let mut instruction = mull();
+    instruction.name = "multiply_ops_mull".to_string();
+    instruction
 }
 
 pub fn swp() -> Instruction {
@@ -1459,10 +1749,17 @@ pub fn swp() -> Instruction {
                         zero_extend(read_memory(derived("address"), 8), 32),
                         read_memory(derived("address"), 32),
                     ),
-                )),
+                ))
+                .when(swp_valid_predicate()),
         ),
         swp_effects(),
     )
+}
+
+pub fn swap_ops() -> Instruction {
+    let mut instruction = swp();
+    instruction.name = "swap_ops".to_string();
+    instruction
 }
 
 pub fn bx() -> Instruction {
@@ -1470,195 +1767,370 @@ pub fn bx() -> Instruction {
         Instruction::new("bx", 32).form(
             InstructionForm::new("base")
                 .fields([cond(), c(ENC_BX_FIXED), rn_addr()])
-                .derived_value(dv("target", read_register_field("rn_addr", 32))),
+                .derived_value(dv("target", read_register_field("rn_addr", 32)))
+                .when(cond_valid_predicate()),
         ),
         bx_effects(),
     )
 }
 
-pub fn hwtfr_reg_offset() -> Instruction {
-    with_effects(
-        Instruction::new("hwtfr_reg_offset", 32).form(
-            InstructionForm::new("base")
-                .fields([
-                    cond(),
-                    c(ENC_HWTFR_FIXED_PREFIX),
-                    is_pre_idx(),
-                    is_up_offset(),
-                    c(ENC_BIT_LOW),
-                    do_writeback(),
-                    is_load(),
-                    rn_addr_read_write(),
-                    rd_addr_read_write(),
-                    c(ENC_HWTFR_REG_MARKER),
-                    sh_bits(),
-                    c(ENC_BIT_HIGH),
-                    rm_addr(),
-                ])
-                .derived_value(dv("offset", read_register_field("rm_addr", 32)))
-                .derived_value(dv(
-                    "address",
-                    transfer_address(
-                        read_register_field("rn_addr", 32),
-                        derived("offset"),
-                        "is_pre_idx",
-                        "is_up_offset",
-                    ),
-                ))
-                .derived_value(dv(
-                    "writeback_address",
-                    transfer_writeback_address(
-                        read_register_field("rn_addr", 32),
-                        derived("offset"),
-                        "is_up_offset",
-                    ),
-                ))
-                .when(hwtfr_valid_predicate()),
-        ),
-        hwtfr_effects(),
-    )
+pub fn branch_ops_bx() -> Instruction {
+    let mut instruction = bx();
+    instruction.name = "branch_ops_bx".to_string();
+    instruction
 }
 
-pub fn hwtfr_imm_offset() -> Instruction {
-    with_effects(
-        Instruction::new("hwtfr_imm_offset", 32).form(
-            InstructionForm::new("base")
-                .fields([
-                    cond(),
-                    c(ENC_HWTFR_FIXED_PREFIX),
-                    is_pre_idx(),
-                    is_up_offset(),
-                    c(ENC_BIT_HIGH),
-                    do_writeback(),
-                    is_load(),
-                    rn_addr_read_write(),
-                    rd_addr_read_write(),
-                    imm8_high(),
-                    c(ENC_BIT_HIGH),
-                    sh_bits(),
-                    c(ENC_BIT_HIGH),
-                    imm8_low(),
-                ])
-                .derived_value(dv(
-                    "offset",
-                    zero_extend(
-                        concat([immediate_field("imm8_high"), immediate_field("imm8_low")]),
-                        32,
-                    ),
-                ))
-                .derived_value(dv(
-                    "address",
-                    transfer_address(
-                        read_register_field("rn_addr", 32),
-                        derived("offset"),
-                        "is_pre_idx",
-                        "is_up_offset",
-                    ),
-                ))
-                .derived_value(dv(
-                    "writeback_address",
-                    transfer_writeback_address(
-                        read_register_field("rn_addr", 32),
-                        derived("offset"),
-                        "is_up_offset",
-                    ),
-                ))
-                .when(hwtfr_valid_predicate()),
-        ),
-        hwtfr_effects(),
-    )
-}
-
-pub fn data_tfr() -> Instruction {
-    with_effects(
-        Instruction::new("data_tfr", 32)
-            .form(
-                InstructionForm::new("register_offset")
-                    .fields(data_tfr_prefix())
-                    .fields([
-                        op2_imm_shift_amt(),
-                        op2_shift_type(),
-                        c(ENC_BIT_LOW),
-                        rm_addr(),
-                    ])
-                    .derived_value(dv(
-                        "offset",
-                        arm_shift(
-                            read_register_field("rm_addr", 32),
-                            immediate_field("op2_shift_type"),
-                            immediate_field("op2_imm_shift_amt"),
-                            false,
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "address",
-                        transfer_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_pre_idx",
-                            "is_up_offset",
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "writeback_address",
-                        transfer_writeback_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_up_offset",
-                        ),
-                    ))
-                    .when(bit_eq(6, Bit::High)),
-            )
-            .form(
-                InstructionForm::new("immediate_offset")
-                    .fields(data_tfr_prefix())
-                    .fields([imm12()])
-                    .derived_value(dv("offset", zero_extend(immediate_field("imm12"), 32)))
-                    .derived_value(dv(
-                        "address",
-                        transfer_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_pre_idx",
-                            "is_up_offset",
-                        ),
-                    ))
-                    .derived_value(dv(
-                        "writeback_address",
-                        transfer_writeback_address(
-                            read_register_field("rn_addr", 32),
-                            derived("offset"),
-                            "is_up_offset",
-                        ),
-                    ))
-                    .when(bit_eq(6, Bit::Low)),
+fn hwtfr_reg_offset_form(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields([
+            cond(),
+            c(ENC_HWTFR_FIXED_PREFIX),
+            is_pre_idx(),
+            is_up_offset(),
+            c(ENC_BIT_LOW),
+            do_writeback(),
+            c(is_load_bits), // L bit: fixed by the load/store/branch bucket.
+            rn_addr_read_write(),
+            rd_addr_read_write(),
+            c(ENC_HWTFR_REG_MARKER),
+            sh_bits(),
+            c(ENC_BIT_HIGH),
+            rm_addr(),
+        ])
+        .derived_value(dv("offset", read_register_field("rm_addr", 32)))
+        .derived_value(dv(
+            "address",
+            transfer_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_pre_idx",
+                "is_up_offset",
             ),
-        data_transfer_effects(),
+        ))
+        .derived_value(dv(
+            "writeback_address",
+            transfer_writeback_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_up_offset",
+            ),
+        ))
+        .when(and([
+            hwtfr_valid_predicate(),
+            field_in("rm_addr", REG_NON_PC_PATTERNS),
+            extra_predicate,
+        ]))
+}
+
+fn hwtfr_imm_offset_form(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields([
+            cond(),
+            c(ENC_HWTFR_FIXED_PREFIX),
+            is_pre_idx(),
+            is_up_offset(),
+            c(ENC_BIT_HIGH),
+            do_writeback(),
+            c(is_load_bits), // L bit: fixed by the load/store/branch bucket.
+            rn_addr_read_write(),
+            rd_addr_read_write(),
+            imm8_high(),
+            c(ENC_BIT_HIGH),
+            sh_bits(),
+            c(ENC_BIT_HIGH),
+            imm8_low(),
+        ])
+        .derived_value(dv(
+            "offset",
+            zero_extend(
+                concat([immediate_field("imm8_high"), immediate_field("imm8_low")]),
+                32,
+            ),
+        ))
+        .derived_value(dv(
+            "address",
+            transfer_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_pre_idx",
+                "is_up_offset",
+            ),
+        ))
+        .derived_value(dv(
+            "writeback_address",
+            transfer_writeback_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_up_offset",
+            ),
+        ))
+        .when(and([hwtfr_valid_predicate(), extra_predicate]))
+}
+
+fn hwtfr_category(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> Instruction {
+    let mode = if is_load_bits == BIT_SET {
+        TransferMode::Load
+    } else {
+        TransferMode::Store
+    };
+    with_effects(
+        Instruction::new(name, 32)
+            .form(hwtfr_reg_offset_form(
+                "register_offset",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_normal_base_predicate()]),
+            ))
+            .form(hwtfr_reg_offset_form(
+                "register_offset_pc_base",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_pc_base_predicate()]),
+            ))
+            .form(hwtfr_imm_offset_form(
+                "immediate_offset",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_normal_base_predicate()]),
+            ))
+            .form(hwtfr_imm_offset_form(
+                "immediate_offset_pc_base",
+                is_load_bits,
+                and([extra_predicate, data_tfr_pc_base_predicate()]),
+            )),
+        hwtfr_effects(mode),
     )
 }
 
-pub fn block_tfr() -> Instruction {
-    with_effects(
-        Instruction::new("block_tfr", 32).form(
-            InstructionForm::new("base")
-                .fields([
-                    cond(),
-                    c(ENC_BLOCK_TRANSFER_CLASS),
-                    is_pre_idx_block(),
-                    is_up_offset_block(),
-                    do_load_psr(),
-                    do_writeback_block(),
-                    is_load_block(),
-                    rn_addr_read_write(),
-                    block_reglist(),
-                ])
-                .derived_value(dv("transfer_count", block_transfer_count()))
-                .derived_value(dv("start_address", block_start_address()))
-                .derived_value(dv("writeback_address", block_writeback_address()))
-                .when(block_tfr_valid_predicate()),
-        ),
-        block_tfr_effects(),
+pub fn hwtfr_load_ops() -> Instruction {
+    hwtfr_category(
+        "hwtfr_load_ops",
+        BIT_SET,
+        and([
+            field_in("rd_addr", REG_NON_PC_PATTERNS),
+            field_in(
+                "sh_bits",
+                [
+                    HWTFR_SH_UNSIGNED_HALFWORD_BITS,
+                    HWTFR_SH_SIGNED_BYTE_BITS,
+                    HWTFR_SH_SIGNED_HALFWORD_BITS,
+                ],
+            ),
+        ]),
     )
+}
+
+pub fn hwtfr_store_ops() -> Instruction {
+    hwtfr_category(
+        "hwtfr_store_ops",
+        BIT_CLEAR,
+        and([field_eq("sh_bits", HWTFR_SH_UNSIGNED_HALFWORD_BITS)]),
+    )
+}
+
+pub fn branch_ops_hwtfr() -> Instruction {
+    hwtfr_category(
+        "branch_ops_hwtfr",
+        BIT_SET,
+        and([
+            field_eq("rd_addr", REG_PC_BITS),
+            field_in(
+                "sh_bits",
+                [
+                    HWTFR_SH_UNSIGNED_HALFWORD_BITS,
+                    HWTFR_SH_SIGNED_BYTE_BITS,
+                    HWTFR_SH_SIGNED_HALFWORD_BITS,
+                ],
+            ),
+        ]),
+    )
+}
+
+fn data_tfr_register_offset_form(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields(data_tfr_prefix(BIT_SET, is_load_bits))
+        .fields([
+            op2_imm_shift_amt(),
+            op2_shift_type(),
+            c(ENC_BIT_LOW),
+            rm_addr(),
+        ])
+        .derived_value(dv(
+            "offset",
+            arm_shift(
+                read_register_field("rm_addr", 32),
+                immediate_field("op2_shift_type"),
+                immediate_field("op2_imm_shift_amt"),
+                false,
+            ),
+        ))
+        .derived_value(dv(
+            "address",
+            transfer_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_pre_idx",
+                "is_up_offset",
+            ),
+        ))
+        .derived_value(dv(
+            "writeback_address",
+            transfer_writeback_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_up_offset",
+            ),
+        ))
+        .when(and([
+            data_tfr_valid_predicate(),
+            field_in("rm_addr", REG_NON_PC_PATTERNS),
+            extra_predicate,
+        ]))
+}
+
+fn data_tfr_immediate_offset_form(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> InstructionForm {
+    InstructionForm::new(name)
+        .fields(data_tfr_prefix(BIT_CLEAR, is_load_bits))
+        .fields([imm12()])
+        .derived_value(dv("offset", zero_extend(immediate_field("imm12"), 32)))
+        .derived_value(dv(
+            "address",
+            transfer_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_pre_idx",
+                "is_up_offset",
+            ),
+        ))
+        .derived_value(dv(
+            "writeback_address",
+            transfer_writeback_address(
+                read_register_field("rn_addr", 32),
+                derived("offset"),
+                "is_up_offset",
+            ),
+        ))
+        .when(and([data_tfr_valid_predicate(), extra_predicate]))
+}
+
+fn data_tfr_category(
+    name: &str,
+    is_load_bits: &'static str,
+    extra_predicate: Predicate,
+) -> Instruction {
+    let mode = if is_load_bits == BIT_SET {
+        TransferMode::Load
+    } else {
+        TransferMode::Store
+    };
+    with_effects(
+        Instruction::new(name, 32)
+            .form(data_tfr_register_offset_form(
+                "register_offset",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_normal_base_predicate()]),
+            ))
+            .form(data_tfr_register_offset_form(
+                "register_offset_pc_base",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_pc_base_predicate()]),
+            ))
+            .form(data_tfr_immediate_offset_form(
+                "immediate_offset",
+                is_load_bits,
+                and([extra_predicate.clone(), data_tfr_normal_base_predicate()]),
+            ))
+            .form(data_tfr_immediate_offset_form(
+                "immediate_offset_pc_base",
+                is_load_bits,
+                and([extra_predicate, data_tfr_pc_base_predicate()]),
+            )),
+        data_transfer_effects(mode),
+    )
+}
+
+pub fn load_ops() -> Instruction {
+    data_tfr_category(
+        "load_ops",
+        BIT_SET,
+        field_in("rd_addr", REG_NON_PC_PATTERNS),
+    )
+}
+
+pub fn store_ops() -> Instruction {
+    data_tfr_category("store_ops", BIT_CLEAR, Predicate::Always)
+}
+
+pub fn branch_ops_data_tfr() -> Instruction {
+    data_tfr_category(
+        "branch_ops_data_tfr",
+        BIT_SET,
+        field_eq("rd_addr", REG_PC_BITS),
+    )
+}
+
+fn block_tfr_form(is_load_block_bits: &'static str, extra_predicate: Predicate) -> InstructionForm {
+    InstructionForm::new("base")
+        .fields([
+            cond(),
+            c(ENC_BLOCK_TRANSFER_CLASS),
+            is_pre_idx_block(),
+            is_up_offset_block(),
+            c(BIT_CLEAR), // S bit: user-mode/PSR load form is not supported.
+            do_writeback_block(),
+            c(is_load_block_bits), // L bit: fixed by the block load/store/branch bucket.
+            rn_addr_read_write(),
+            block_reglist(),
+        ])
+        .derived_value(dv("transfer_count", block_transfer_count()))
+        .derived_value(dv("start_address", block_start_address()))
+        .derived_value(dv("writeback_address", block_writeback_address()))
+        .when(and([block_tfr_valid_predicate(), extra_predicate]))
+}
+
+fn block_tfr_category(
+    name: &str,
+    is_load_block_bits: &'static str,
+    extra_predicate: Predicate,
+) -> Instruction {
+    let mode = if is_load_block_bits == BIT_SET {
+        TransferMode::Load
+    } else {
+        TransferMode::Store
+    };
+    with_effects(
+        Instruction::new(name, 32).form(block_tfr_form(is_load_block_bits, extra_predicate)),
+        block_tfr_effects(mode),
+    )
+}
+
+pub fn block_load_ops() -> Instruction {
+    block_tfr_category("block_load_ops", BIT_SET, bit_eq(16, Bit::Low))
+}
+
+pub fn block_store_ops() -> Instruction {
+    block_tfr_category("block_store_ops", BIT_CLEAR, Predicate::Always)
+}
+
+pub fn branch_ops_block_tfr() -> Instruction {
+    block_tfr_category("branch_ops_block_tfr", BIT_SET, bit_eq(16, Bit::High))
 }
 
 pub fn b() -> Instruction {
@@ -1667,24 +2139,44 @@ pub fn b() -> Instruction {
             InstructionForm::new("base")
                 .fields([cond(), c(ENC_BRANCH_CLASS), do_link(), branch_offset()])
                 .derived_value(dv("target", branch_target()))
-                .derived_value(dv("link_value", sub(true_pc(), constant(4, 32)))),
+                .derived_value(dv("link_value", sub(true_pc(), constant(4, 32))))
+                .when(cond_valid_predicate()),
         ),
         branch_effects(),
     )
 }
 
+pub fn branch_ops_b() -> Instruction {
+    let mut instruction = b();
+    instruction.name = "branch_ops_b".to_string();
+    instruction
+}
+
 pub fn instructions() -> Vec<Instruction> {
     vec![
-        dproc(),
-        mul(),
-        mull(),
-        swp(),
-        bx(),
-        hwtfr_reg_offset(),
-        hwtfr_imm_offset(),
-        data_tfr(),
-        block_tfr(),
-        b(),
+        load_ops(),
+        hwtfr_load_ops(),
+        block_load_ops(),
+        store_ops(),
+        hwtfr_store_ops(),
+        block_store_ops(),
+        arithmetic_s0_reg_op2(),
+        arithmetic_s0_imm_op2(),
+        logical_s0_reg_op2(),
+        logical_s0_imm_op2(),
+        move_s0_reg_op2(),
+        move_s0_imm_op2(),
+        dproc_s1_reg_op2(),
+        dproc_s1_imm_op2(),
+        multiply_ops_mul(),
+        multiply_ops_mull(),
+        swap_ops(),
+        branch_ops_b(),
+        branch_ops_bx(),
+        branch_ops_dproc(),
+        branch_ops_data_tfr(),
+        branch_ops_hwtfr(),
+        branch_ops_block_tfr(),
     ]
 }
 
@@ -1837,7 +2329,8 @@ fn main() {
                 },
                 MergeMode::VariableBits => FieldUses::VariableBits {
                     name: name.clone(),
-                    pattern: value.clone(),
+                    pattern: Some(value.clone()),
+                    len: value.len(),
                 },
             };
             match field_values.entry(name.clone()).or_insert(default_val) {
@@ -1850,7 +2343,15 @@ fn main() {
                     let new_pattern = value.clone();
                     patterns.insert(new_pattern);
                 }
-                FieldUses::VariableBits { name: _, pattern } => {
+                FieldUses::VariableBits {
+                    name: _,
+                    pattern,
+                    len,
+                } => {
+                    assert_eq!(*len, value.len());
+                    let pattern = pattern
+                        .as_mut()
+                        .expect("observed VariableBits field should be populated");
                     // Any bits which are different between the existing pattern and the new pattern should become variable bits
                     let new_pattern = value.clone();
                     if pattern.len() != new_pattern.len() {
@@ -1897,10 +2398,10 @@ fn main() {
         println!("Instruction: {}", instr.name);
         for form in &instr.forms {
             // We only want to get the encodings for the form if this form actually is used in the program
-            if !decoded_program.iter().any(|decoded| {
-                decoded.name.as_ref().unwrap() == &instr.name
-                    && decoded.form.as_ref().unwrap().name.as_str() == &form.name
-            }) {
+            if !decoded_program
+                .iter()
+                .any(|decoded| decoded.name == instr.name && decoded.form.name == form.name)
+            {
                 continue;
             }
             let encodings = form.fields_to_encodings(&field_values);
@@ -1953,20 +2454,24 @@ fn main() {
                     println!("    Pattern: {}", pattern_str);
                 }
             }
-            FieldUses::VariableBits { name: _, pattern } => {
-                let pattern_str: String = pattern
-                    .bits
-                    .iter()
-                    .map(|b| match b {
-                        Bit::Low => '0',
-                        Bit::High => '1',
-                        Bit::Var => 'x',
-                        Bit::Test => {
-                            panic!("Test bits should not be present in final field patterns")
-                        }
-                    })
-                    .collect();
-                println!("    Pattern: {}", pattern_str);
+            FieldUses::VariableBits {
+                name: _, pattern, ..
+            } => {
+                if let Some(pattern) = pattern {
+                    let pattern_str: String = pattern
+                        .bits
+                        .iter()
+                        .map(|b| match b {
+                            Bit::Low => '0',
+                            Bit::High => '1',
+                            Bit::Var => 'x',
+                            Bit::Test => {
+                                panic!("Test bits should not be present in final field patterns")
+                            }
+                        })
+                        .collect();
+                    println!("    Pattern: {}", pattern_str);
+                }
             }
         }
     }
@@ -2002,12 +2507,9 @@ fn main() {
     .unwrap();
 
     println!(
-        "Kept {} combinational gates, commented out {} gates ({} globally static, {} observably static, {} arbitrary), added {} assigns, and wrote {}",
-        optimization.used_gates.len(),
+        "Kept {} combinational gates, commented out {} gates, added {} assigns, and wrote {}",
+        simulator.combinational_gate_count() - optimization.gates_to_comment.len(),
         commented_gate_count,
-        optimization.static_gates.len(),
-        optimization.observably_static_gates.len(),
-        optimization.arbitrary_gates.len(),
         optimization.assignments.len(),
         OPTIMIZED_NETLIST_PATH
     );
@@ -2030,8 +2532,6 @@ fn main() {
             validation.elapsed,
         );
     }
-    // println!("{:#?}", dproc());
-
     // // Program: add r0, r0, r1; mov r1, r0
     // let program = DecodedInstruction::decode_program_str(
     //     "11100000100000000000000000000001\n11100001101000000001000000000000",

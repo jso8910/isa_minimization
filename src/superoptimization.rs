@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use rand::{
@@ -20,13 +20,12 @@ use crate::{
     bit::{Bit, BitPattern},
     constants::{
         MCMC_TEMP, P_FIELD_CHANGE, P_INSERT_UNUSED, P_INSTR_CHANGE, P_SWAP_LINES,
-        SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_ILLEGAL_READ, WEIGHT_PROG_LEN,
-        WEIGHT_REVISIT_PENALTY,
+        SAME_COST_PENALTY, SUPEROPTIMIZATION_PROGRAM_LEN, WEIGHT_ILLEGAL_READ, WEIGHT_PROG_LEN,
     },
     instruction_semantics::{Effect, Expr, FieldName, OperandRef, RegisterRef},
     isa_specification::{
         ArchitecturalRegister, DecodedField, DecodedInstruction, FieldUses, ISA, InstructionField,
-        InstructionForm, MergeMode, StackDirection,
+        InstructionForm, MergeMode, StackDirection, instruction_valid_under_field_uses,
     },
     semantic_matching::{
         BddEquality, ConcreteProgram, MachineState, Z3EquivalenceManager, evaluate_expr,
@@ -45,7 +44,7 @@ pub struct SuperoptimizationCtx<'a> {
     gen_program_cost: f64,
     original_program_effects: Vec<Effect>,
     equality_manager: Z3EquivalenceManager<'a>,
-    protected_registers: Vec<ArchitecturalRegister>,
+    live_out_registers: Vec<ArchitecturalRegister>,
 
     instr_form_encoding_count: Vec<(usize, usize, u64)>,
 
@@ -53,9 +52,183 @@ pub struct SuperoptimizationCtx<'a> {
     /// Stored as a tuple with their total cost
     perfect_matches: Vec<(f64, Program)>,
 
-    seen_programs: HashMap<ProgramFinalWriteKey, f64>,
-
     rng: ThreadRng,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SuperoptimizationIterationTiming {
+    total_iteration: Duration,
+    randomized_counterexamples: Duration,
+    proposal_generation: Duration,
+    acceptance_total: Duration,
+    effect_collection: Duration,
+    performance_cost: Duration,
+    illegal_read_cost: Duration,
+    concrete_program_build: Duration,
+    counterexample_evaluation: Duration,
+    bdd_equivalence_check: Duration,
+    counterexample_output_generation: Duration,
+    counterexample_insertion: Duration,
+    match_recording: Duration,
+    accepted_state_update: Duration,
+    counterexamples_evaluated: u64,
+    counterexamples_added: u64,
+    bdd_checks: u64,
+    perfect_matches_added: u64,
+    empty_proposal_rejections: u64,
+    base_cost_rejections: u64,
+    counterexample_rejections: u64,
+    new_counterexample_rejections: u64,
+    same_cost_rejections: u64,
+}
+
+#[derive(Debug, Default)]
+struct SuperoptimizationTimingWindow {
+    iterations: u64,
+    totals: SuperoptimizationIterationTiming,
+}
+
+impl SuperoptimizationTimingWindow {
+    fn record(&mut self, timing: SuperoptimizationIterationTiming) {
+        self.iterations += 1;
+        self.totals += timing;
+    }
+
+    fn print_and_reset(&mut self, num_iters: u32) {
+        if self.iterations == 0 {
+            return;
+        }
+
+        let iterations = self.iterations as f64;
+        let counterexamples = self.totals.counterexamples_evaluated.max(1) as f64;
+        let bdd_checks = self.totals.bdd_checks.max(1) as f64;
+        println!(
+            "timing iter={num_iters} window={} avg_ms total={:.3} proposal={:.3} acceptance={:.3} effects={:.3} perf_cost={:.3} illegal_reads={:.3} concrete_build={:.3} counterexamples={:.3} bdd={:.3} cex_output={:.3} cex_insert={:.3} match_record={:.3} state_update={:.3} randomized_cex={:.3}",
+            self.iterations,
+            avg_ms(self.totals.total_iteration, iterations),
+            avg_ms(self.totals.proposal_generation, iterations),
+            avg_ms(self.totals.acceptance_total, iterations),
+            avg_ms(self.totals.effect_collection, iterations),
+            avg_ms(self.totals.performance_cost, iterations),
+            avg_ms(self.totals.illegal_read_cost, iterations),
+            avg_ms(self.totals.concrete_program_build, iterations),
+            avg_ms(self.totals.counterexample_evaluation, iterations),
+            avg_ms(self.totals.bdd_equivalence_check, iterations),
+            avg_ms(self.totals.counterexample_output_generation, iterations),
+            avg_ms(self.totals.counterexample_insertion, iterations),
+            avg_ms(self.totals.match_recording, iterations),
+            avg_ms(self.totals.accepted_state_update, iterations),
+            avg_ms(self.totals.randomized_counterexamples, iterations),
+        );
+        println!(
+            "timing counts iter={num_iters} cex_eval={} cex_eval_avg_ms={:.3} bdd_checks={} bdd_avg_ms={:.3} cex_added={} matches={} rejects empty={} base={} cex={} new_cex={} same_cost={}",
+            self.totals.counterexamples_evaluated,
+            avg_ms(self.totals.counterexample_evaluation, counterexamples),
+            self.totals.bdd_checks,
+            avg_ms(self.totals.bdd_equivalence_check, bdd_checks),
+            self.totals.counterexamples_added,
+            self.totals.perfect_matches_added,
+            self.totals.empty_proposal_rejections,
+            self.totals.base_cost_rejections,
+            self.totals.counterexample_rejections,
+            self.totals.new_counterexample_rejections,
+            self.totals.same_cost_rejections,
+        );
+        let mut phases = [
+            (
+                "proposal",
+                avg_ms(self.totals.proposal_generation, iterations),
+            ),
+            (
+                "acceptance",
+                avg_ms(self.totals.acceptance_total, iterations),
+            ),
+            ("effects", avg_ms(self.totals.effect_collection, iterations)),
+            (
+                "perf_cost",
+                avg_ms(self.totals.performance_cost, iterations),
+            ),
+            (
+                "illegal_reads",
+                avg_ms(self.totals.illegal_read_cost, iterations),
+            ),
+            (
+                "concrete_build",
+                avg_ms(self.totals.concrete_program_build, iterations),
+            ),
+            (
+                "counterexamples",
+                avg_ms(self.totals.counterexample_evaluation, iterations),
+            ),
+            ("bdd", avg_ms(self.totals.bdd_equivalence_check, iterations)),
+            (
+                "cex_output",
+                avg_ms(self.totals.counterexample_output_generation, iterations),
+            ),
+            (
+                "cex_insert",
+                avg_ms(self.totals.counterexample_insertion, iterations),
+            ),
+            (
+                "match_record",
+                avg_ms(self.totals.match_recording, iterations),
+            ),
+            (
+                "state_update",
+                avg_ms(self.totals.accepted_state_update, iterations),
+            ),
+            (
+                "randomized_cex",
+                avg_ms(self.totals.randomized_counterexamples, iterations),
+            ),
+        ];
+        phases.sort_by(|left, right| right.1.total_cmp(&left.1));
+        println!(
+            "timing top iter={num_iters} {}={:.3}ms {}={:.3}ms {}={:.3}ms {}={:.3}ms",
+            phases[0].0,
+            phases[0].1,
+            phases[1].0,
+            phases[1].1,
+            phases[2].0,
+            phases[2].1,
+            phases[3].0,
+            phases[3].1,
+        );
+
+        *self = Self::default();
+    }
+}
+
+impl std::ops::AddAssign for SuperoptimizationIterationTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.total_iteration += rhs.total_iteration;
+        self.randomized_counterexamples += rhs.randomized_counterexamples;
+        self.proposal_generation += rhs.proposal_generation;
+        self.acceptance_total += rhs.acceptance_total;
+        self.effect_collection += rhs.effect_collection;
+        self.performance_cost += rhs.performance_cost;
+        self.illegal_read_cost += rhs.illegal_read_cost;
+        self.concrete_program_build += rhs.concrete_program_build;
+        self.counterexample_evaluation += rhs.counterexample_evaluation;
+        self.bdd_equivalence_check += rhs.bdd_equivalence_check;
+        self.counterexample_output_generation += rhs.counterexample_output_generation;
+        self.counterexample_insertion += rhs.counterexample_insertion;
+        self.match_recording += rhs.match_recording;
+        self.accepted_state_update += rhs.accepted_state_update;
+        self.counterexamples_evaluated += rhs.counterexamples_evaluated;
+        self.counterexamples_added += rhs.counterexamples_added;
+        self.bdd_checks += rhs.bdd_checks;
+        self.perfect_matches_added += rhs.perfect_matches_added;
+        self.empty_proposal_rejections += rhs.empty_proposal_rejections;
+        self.base_cost_rejections += rhs.base_cost_rejections;
+        self.counterexample_rejections += rhs.counterexample_rejections;
+        self.new_counterexample_rejections += rhs.new_counterexample_rejections;
+        self.same_cost_rejections += rhs.same_cost_rejections;
+    }
+}
+
+fn avg_ms(duration: Duration, divisor: f64) -> f64 {
+    duration.as_secs_f64() * 1_000.0 / divisor
 }
 
 impl<'a> SuperoptimizationCtx<'a> {
@@ -63,7 +236,7 @@ impl<'a> SuperoptimizationCtx<'a> {
         original_instruction: DecodedInstruction,
         valid_field_uses: HashMap<FieldName, FieldUses>,
         isa: &'a ISA,
-        protected_registers: Vec<ArchitecturalRegister>,
+        live_out_registers: Vec<ArchitecturalRegister>,
     ) -> Self {
         let original_program =
             Program::from_instructions(vec![original_instruction], SUPEROPTIMIZATION_PROGRAM_LEN);
@@ -71,10 +244,12 @@ impl<'a> SuperoptimizationCtx<'a> {
         let gen_program = Program::from_instructions(vec![], SUPEROPTIMIZATION_PROGRAM_LEN);
         let original_program_effects = instruction_seq_to_effects(&original_program, isa);
         let original_concrete_program = ConcreteProgram::from_program(&original_program, isa);
-        let equality_manager = Z3EquivalenceManager::from_left_instruction(&original_program, isa);
+        let equality_manager = Z3EquivalenceManager::from_left_instruction_with_live_out_registers(
+            &original_program,
+            isa,
+            live_out_registers.clone(),
+        );
         let perfect_matches = vec![];
-
-        let seen_programs = HashMap::new();
 
         // Generate the legal count per instruction in the ISA
         let mut instr_form_encoding_count = Vec::new();
@@ -105,57 +280,17 @@ impl<'a> SuperoptimizationCtx<'a> {
             gen_program_cost: f64::INFINITY,
             original_program_effects,
             equality_manager,
-            protected_registers,
+            live_out_registers,
             instr_form_encoding_count,
             rng,
             perfect_matches,
-            seen_programs,
         }
-    }
-
-    /// Returns whether an instruction is valid under the new ISA (valid_field_uses)
-    fn instruction_valid(&self, instr: &DecodedInstruction) -> bool {
-        for field in instr.fields.iter() {
-            let Some(name) = &field.name else {
-                // constant field
-                continue;
-            };
-            let Some(valid_uses) = self.valid_field_uses.get(name) else {
-                // The entire instruction form is illegal because it uses a field which we don't use
-                return false;
-            };
-
-            match valid_uses {
-                FieldUses::Uses { patterns, .. } => {
-                    // At least one pattern must match
-                    let matches = if field.value.bits.iter().any(|bit| *bit == Bit::Var) {
-                        patterns
-                            .iter()
-                            .any(|pattern| field.value.matches_bits(&pattern.bits))
-                    } else {
-                        patterns
-                            .iter()
-                            .any(|pattern| pattern.matches_bits(&field.value.bits))
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-                FieldUses::VariableBits { pattern, .. } => {
-                    if !pattern.matches_bits(&field.value.bits) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
     }
 
     pub fn generate_candidates(&mut self, target_candidates: usize, max_iters: u32) {
-        self.seen_programs = HashMap::new();
-
         let mut num_iters = 0;
         let mut acceptance_count: f64 = 0.0;
+        let mut timing_window = SuperoptimizationTimingWindow::default();
         loop {
             if self.perfect_matches.len() >= target_candidates {
                 return;
@@ -165,10 +300,14 @@ impl<'a> SuperoptimizationCtx<'a> {
                 return;
             }
 
+            let iteration_start = Instant::now();
+            let mut timing = SuperoptimizationIterationTiming::default();
+
             // Once we add the first counterexample, we want to use that machinestate template to
             // add some more randomized test cases
             if self.counterexamples.len() == 1 {
-                for _ in 0..2 {
+                let randomized_counterexamples_start = Instant::now();
+                for _ in 0..100 {
                     let (mut instate, _) = self.counterexamples.first().unwrap().clone();
                     for (_ident, value) in instate.registers.iter_mut() {
                         let width = value.width;
@@ -181,24 +320,22 @@ impl<'a> SuperoptimizationCtx<'a> {
                     let desired_output = self.original_concrete_program.execute(&instate);
                     self.add_counterexample(instate, desired_output);
                 }
+                timing.randomized_counterexamples = randomized_counterexamples_start.elapsed();
             }
 
             let proposal_start = Instant::now();
             let proposal = self.generate_proposal();
-            let proposal_elapsed = proposal_start.elapsed();
+            timing.proposal_generation = proposal_start.elapsed();
             let acceptance_start = Instant::now();
-            let accepted = self.decide_proposal_acceptance(proposal);
+            let accepted = self.decide_proposal_acceptance_timed(proposal, &mut timing);
             if accepted {
                 acceptance_count += 1.0;
-
-                // Insert this program into seen programs
-                let key = self.gen_program.final_write_key(self.isa);
-                let num_visits = self.seen_programs.entry(key).or_insert(0.0);
-                *num_visits += 1.0;
             }
-            let acceptance_elapsed = acceptance_start.elapsed();
+            timing.acceptance_total = acceptance_start.elapsed();
+            timing.total_iteration = iteration_start.elapsed();
+            timing_window.record(timing);
             let proposal_acceptance_ratio =
-                proposal_elapsed.as_secs_f64() / acceptance_elapsed.as_secs_f64();
+                timing.proposal_generation.as_secs_f64() / timing.acceptance_total.as_secs_f64();
             num_iters += 1;
             if num_iters % 100 == 0 {
                 println!(
@@ -212,6 +349,7 @@ impl<'a> SuperoptimizationCtx<'a> {
                     proposal_acceptance_ratio,
                     acceptance_count / f64::try_from(num_iters).unwrap() // self.gen_program.iter_instructions().map(|i| &i.fields).collect::<Vec<_>>()
                 );
+                timing_window.print_and_reset(num_iters);
             }
             if num_iters % 5000 == 0 {
                 self.print_current_canonical_effects(num_iters);
@@ -233,7 +371,7 @@ impl<'a> SuperoptimizationCtx<'a> {
 
             let instruction_effects = instruction_effects(instruction, self.isa);
             for (effect_idx, effect) in instruction_effects.iter().cloned().enumerate() {
-                let effect = collapse_effect_for_debug(effect, instruction);
+                let effect = canonicalize_effect_for_instruction(effect, instruction);
                 if effect_guard_is_const_zero(&effect) {
                     continue;
                 }
@@ -245,7 +383,8 @@ impl<'a> SuperoptimizationCtx<'a> {
 
     /// Mutates the current program to return a new proposal
     /// Can do any of these with the following probabilities
-    ///     - P_FIELD_CHANGE - change a random field in a random non-UNUSED instruction
+    ///     - P_FIELD_CHANGE - change a random field in a random non-UNUSED instruction. For
+    ///     immediates, a bit-flip is used. For other fields, a fully random value is taken.
     ///     - P_INSTR_CHANGE - changes a random program slot to another randomly generated valid instruction
     ///     - P_INSERT_UNUSED - changes a random non-UNUSED instruction to ProgramInstr::UNUSED
     ///     - P_SWAP_LINES - switches two random non-UNUSED instructions
@@ -268,17 +407,14 @@ impl<'a> SuperoptimizationCtx<'a> {
                 let (idx, instruction) =
                     self.gen_program.clone_random_instruction(&mut self.rng)?;
 
-                let form = instruction
-                    .form
-                    .clone()
-                    .expect("DecodedInstruction form must be some");
+                let form = instruction.form.clone();
 
                 let field_idx = (0..instruction.fields.len())
                     .filter(|idx| instruction.fields[*idx].name.is_some())
                     .choose(&mut self.rng)?;
                 let new_instruction =
-                    self.change_selected_field(instruction, &form.fields[field_idx]);
-                if !form.when.check(&new_instruction) || !self.instruction_valid(&new_instruction) {
+                    self.change_selected_field(instruction, &form.fields[field_idx])?;
+                if !instruction_valid_under_field_uses(&new_instruction, &self.valid_field_uses) {
                     return None;
                 }
 
@@ -310,14 +446,25 @@ impl<'a> SuperoptimizationCtx<'a> {
         &mut self,
         mut instr: DecodedInstruction,
         field: &InstructionField,
-    ) -> DecodedInstruction {
+    ) -> Option<DecodedInstruction> {
         let (field_idx, pattern_idx) = {
-            let form = instr.form.as_ref().expect("Form should be defined!");
+            let form = &instr.form;
             Self::selected_field_index_and_pattern_idx(form, field)
                 .expect("Selected field must belong to the instruction form")
         };
 
-        let form = instr.form.as_ref().expect("Form should be defined!");
+        // We only want to do a bit-flip for immediates
+        if field.is_immediate {
+            let current_value = &instr.fields[field_idx].value;
+            let bit_idx = self.rng.random_range(0..current_value.len());
+            let mut new_value = current_value.clone();
+            new_value.bits[bit_idx] = !new_value.bits[bit_idx];
+            instr.bits[pattern_idx..pattern_idx + new_value.len()].copy_from_slice(&new_value.bits);
+            instr.fields[field_idx].value = new_value;
+            return Some(instr);
+        }
+
+        let form = &instr.form;
         let selected_field = &form.fields[field_idx];
 
         let new_field_val = Self::select_random_field_value_with_rng(
@@ -326,8 +473,7 @@ impl<'a> SuperoptimizationCtx<'a> {
             pattern_idx,
             &self.valid_field_uses,
             &mut self.rng,
-        )
-        .expect("Generating random field value failed!");
+        )?;
 
         // Replace the bits in instr.bits
         instr.bits[pattern_idx..pattern_idx + new_field_val.len()]
@@ -335,7 +481,7 @@ impl<'a> SuperoptimizationCtx<'a> {
 
         // Replace the value in instr.fields
         instr.fields[field_idx].value = new_field_val;
-        instr
+        Some(instr)
     }
 
     fn selected_field_index_and_pattern_idx(
@@ -430,8 +576,8 @@ impl<'a> SuperoptimizationCtx<'a> {
             }
 
             let instruction = DecodedInstruction {
-                name: Some(selected_instruction.name.clone()),
-                form: Some(selected_form.clone()),
+                name: selected_instruction.name.clone(),
+                form: selected_form.clone(),
                 bits,
                 fields,
             };
@@ -454,7 +600,7 @@ impl<'a> SuperoptimizationCtx<'a> {
                 let field_use = valid_field_uses.get(name)?;
                 match (field.merge_mode, field_use) {
                     (MergeMode::VariableBits, FieldUses::VariableBits { pattern, .. }) => {
-                        pattern.clone()
+                        pattern.clone()?
                     }
                     (MergeMode::Uses, FieldUses::Uses { patterns, .. }) => {
                         let selected = rng.random_range(0..patterns.len());
@@ -470,11 +616,19 @@ impl<'a> SuperoptimizationCtx<'a> {
             None => field.pattern.clone(),
         };
 
-        let mut value = form.constrain_variable_bits(
+        let constrained_values = form.constrain_variable_bits(
             &value,
             pattern_idx,
             field.name.as_deref().unwrap_or("__const__"),
-        )?;
+        );
+        if constrained_values.is_empty() {
+            return None;
+        }
+        let selected = rng.random_range(0..constrained_values.len());
+        let mut value = constrained_values
+            .into_iter()
+            .nth(selected)
+            .expect("selected constrained field value should exist");
 
         for bit in &mut value.bits {
             if *bit == Bit::Var {
@@ -490,21 +644,42 @@ impl<'a> SuperoptimizationCtx<'a> {
     /// If true is returned, gen_instruction_seq is set to the `proposal` and
     /// `gen_instruction_seq_cost` is set to `cost(proposal)`
     fn decide_proposal_acceptance(&mut self, proposal: Program) -> bool {
+        let mut timing = SuperoptimizationIterationTiming::default();
+        self.decide_proposal_acceptance_timed(proposal, &mut timing)
+    }
+
+    fn decide_proposal_acceptance_timed(
+        &mut self,
+        proposal: Program,
+        timing: &mut SuperoptimizationIterationTiming,
+    ) -> bool {
+        // Don't accept an empty proposal
+        if proposal.iter_instructions().count() == 0 {
+            timing.empty_proposal_rejections += 1;
+            return false;
+        }
+
+        let effects_start = Instant::now();
+        let proposal_effects: Vec<_> = proposal
+            .iter_instructions()
+            .map(|i| instruction_effects(i, self.isa))
+            .collect();
+        timing.effect_collection += effects_start.elapsed();
+
+        let performance_cost_start = Instant::now();
         let performance_cost: f64 = self
             .performance_cost(&proposal)
             .try_into()
             .expect("Could not convert u32 to f64");
-        let illegal_read_cost =
-            self.sequence_illegal_read_count(&proposal) as f64 * WEIGHT_ILLEGAL_READ;
+        timing.performance_cost += performance_cost_start.elapsed();
 
-        // Cost = w * ln(1 + num_visits)
-        let seen_sequence_cost = WEIGHT_REVISIT_PENALTY
-            * self
-                .seen_programs
-                .entry(proposal.final_write_key(self.isa))
-                .or_insert(0.0)
-                .ln_1p();
-        let proposal_base_cost = performance_cost + illegal_read_cost + seen_sequence_cost;
+        let illegal_read_cost_start = Instant::now();
+        let illegal_read_cost = self.sequence_illegal_read_count(&proposal, &proposal_effects)
+            as f64
+            * WEIGHT_ILLEGAL_READ;
+        timing.illegal_read_cost += illegal_read_cost_start.elapsed();
+
+        let proposal_base_cost = performance_cost + illegal_read_cost;
         // Preliminary cost -- not yet complete calculating
         let mut cost = proposal_base_cost;
 
@@ -520,15 +695,22 @@ impl<'a> SuperoptimizationCtx<'a> {
         let mut maximum_cost: f64 = self.gen_program_cost - random.ln() * MCMC_TEMP;
 
         if cost > maximum_cost {
+            timing.base_cost_rejections += 1;
             return false;
         }
 
+        let concrete_program_start = Instant::now();
         let proposal_concrete = ConcreteProgram::from_program(&proposal, self.isa);
+        timing.concrete_program_build += concrete_program_start.elapsed();
         for (counterexample, desired_output) in self.counterexamples.iter() {
+            let counterexample_start = Instant::now();
             cost += self.equality_cost(&proposal_concrete, counterexample, desired_output);
+            timing.counterexample_evaluation += counterexample_start.elapsed();
+            timing.counterexamples_evaluated += 1;
 
             // At this point, we can exit early
             if cost > maximum_cost {
+                timing.counterexample_rejections += 1;
                 return false;
             }
         }
@@ -536,43 +718,66 @@ impl<'a> SuperoptimizationCtx<'a> {
         // If equality_cost == 0 (ie passes all counterexamples), ask Z3 for an
         // authoritative counterexample or proof.
         if cost == proposal_base_cost {
-            println!("HERE");
+            let bdd_start = Instant::now();
             let result = self.compare_program(&proposal);
+            timing.bdd_equivalence_check += bdd_start.elapsed();
+            timing.bdd_checks += 1;
             if let BddEquality::Unequal(counterexample) = result {
+                let desired_output_start = Instant::now();
                 let desired_output = self.original_concrete_program.execute(&counterexample);
+                timing.counterexample_output_generation += desired_output_start.elapsed();
                 // Before we add the new counterexample, we want to maintain the random component of
                 // the maximum cost
                 // This can be done by subtracting self.gen_program_cost then adding it back once
                 // it's been modified
                 maximum_cost -= self.gen_program_cost;
+                let counterexample_insertion_start = Instant::now();
                 self.add_counterexample(counterexample.clone(), desired_output.clone());
+                timing.counterexample_insertion += counterexample_insertion_start.elapsed();
+                timing.counterexamples_added += 1;
                 maximum_cost += self.gen_program_cost;
 
                 // Add the cost of the new counterexample
+                let new_counterexample_start = Instant::now();
                 cost += self.equality_cost(&proposal_concrete, &counterexample, &desired_output);
+                timing.counterexample_evaluation += new_counterexample_start.elapsed();
+                timing.counterexamples_evaluated += 1;
 
                 // At this point, base cost and cost should not be equal
                 // because the equality cost of the new counterexample should be nonzero
                 assert_ne!(proposal_base_cost, cost);
                 if cost > maximum_cost {
+                    timing.new_counterexample_rejections += 1;
                     return false;
                 }
             } else {
+                let match_start = Instant::now();
                 self.add_match(proposal.clone(), cost);
+                timing.match_recording += match_start.elapsed();
+                timing.perfect_matches_added += 1;
             }
         }
 
+        // Apply "same cost" penalty
+        if self.gen_program_cost == cost {
+            cost += SAME_COST_PENALTY;
+            if cost > maximum_cost {
+                timing.same_cost_rejections += 1;
+                return false;
+            }
+        }
+
+        let state_update_start = Instant::now();
         self.gen_program_cost = cost;
         self.gen_program = proposal;
+        timing.accepted_state_update += state_update_start.elapsed();
         true
     }
 
     /// Evaluates performance cost of instruction sequence
     /// Currently, just the length of the sequence
-    fn performance_cost(&self, sequence: &Program) -> u32 {
-        u32::try_from(sequence.iter_enumerate_instructions().count())
-            .expect("Sequence doesn't fit into u32")
-            * WEIGHT_PROG_LEN
+    fn performance_cost(&self, sequence: &Program) -> f64 {
+        sequence.iter_enumerate_instructions().count() as f64 * WEIGHT_PROG_LEN
     }
 
     /// Calculates equality cost for a sequence against a single counterexample
@@ -593,7 +798,7 @@ impl<'a> SuperoptimizationCtx<'a> {
         let equality_cost: f64 = desired_output
             .compare(
                 &new_machinestate,
-                &self.protected_registers,
+                &self.live_out_registers,
                 &self.isa.sp,
                 sp_val,
             )
@@ -645,7 +850,7 @@ impl<'a> SuperoptimizationCtx<'a> {
 
         original_state.compare(
             &generated_state,
-            &self.protected_registers,
+            &self.live_out_registers,
             &self.isa.sp,
             sp_val,
         ) == 0
@@ -693,18 +898,26 @@ impl<'a> SuperoptimizationCtx<'a> {
         next_state
     }
 
-    fn sequence_meets_state_constraints(&self, sequence: &Program) -> bool {
-        let effects = instruction_seq_to_effects(sequence, self.isa);
+    fn sequence_meets_state_constraints(&self, sequence_effects: &[Effect]) -> bool {
         generated_effects_meet_state_constraints(
-            &effects,
+            sequence_effects,
             &self.original_program_effects,
-            &self.protected_registers,
+            &self.live_out_registers,
             self.isa,
         )
     }
 
-    fn sequence_illegal_read_count(&self, sequence: &Program) -> u32 {
-        generated_program_illegal_read_count(sequence, &self.original_program_effects, self.isa)
+    fn sequence_illegal_read_count(
+        &self,
+        sequence: &Program,
+        sequence_effects: &[&[Effect]],
+    ) -> u32 {
+        generated_program_illegal_read_count(
+            sequence,
+            sequence_effects,
+            &self.original_program_effects,
+            self.isa,
+        )
     }
 
     fn form_field_uses_are_compatible(&self, form: &InstructionForm) -> bool {
@@ -755,10 +968,7 @@ impl ProgramMutation {
 }
 
 fn instruction_effects<'a>(instruction: &DecodedInstruction, isa: &'a ISA) -> &'a [Effect] {
-    let instruction_name = instruction
-        .name
-        .as_ref()
-        .expect("Instruction should have a name");
+    let instruction_name = &instruction.name;
     &isa.instructions
         .iter()
         .find(|candidate| candidate.name == *instruction_name)
@@ -770,7 +980,7 @@ fn instruction_effects<'a>(instruction: &DecodedInstruction, isa: &'a ISA) -> &'
         .effects
 }
 
-fn collapse_effect_for_debug(effect: Effect, instruction: &DecodedInstruction) -> Effect {
+fn canonicalize_effect_for_instruction(effect: Effect, instruction: &DecodedInstruction) -> Effect {
     match effect {
         Effect::WriteRegister {
             guard,
@@ -876,7 +1086,7 @@ impl Program {
 
         for instruction in self.iter_instructions() {
             for effect in instruction_effects(instruction, isa).iter().cloned() {
-                let effect = collapse_effect_for_debug(effect, instruction);
+                let effect = canonicalize_effect_for_instruction(effect, instruction);
                 if effect_guard_is_const_zero(&effect) {
                     continue;
                 }
@@ -992,28 +1202,33 @@ fn expand_variable_bits(bits: &[Bit]) -> Vec<Vec<Bit>> {
 ///   accounting only when they appear inside memory address expressions, or inside an effect that
 ///   writes SP itself,
 /// - register write destinations must be constants/fixed registers,
-///     - these constant registers are not protected by some form of read dependency or convention,
+///     - these constant registers are not live-out by caller policy,
 /// - the stack pointer register may not be written,
 /// - memory writes must either target an original memory write destination exactly or an approved
 ///   SP-relative scratch byte,
 /// - every original write destination must have a corresponding generated write destination.
 pub fn generated_sequence_meets_state_constraints(
     generated: &Program,
-    original: &Program,
-    protected_registers: &[ArchitecturalRegister],
+    generated_instruction_effects: &[&[Effect]],
+    generated_effects: &[Effect],
+    original_effects: &[Effect],
+    live_out_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
-    let original_effects = instruction_seq_to_effects(original, isa);
-    let generated_effects = instruction_seq_to_effects(generated, isa);
-
-    if generated_program_illegal_read_count(generated, &original_effects, isa) != 0 {
+    if generated_program_illegal_read_count(
+        generated,
+        generated_instruction_effects,
+        original_effects,
+        isa,
+    ) != 0
+    {
         return false;
     }
 
     generated_effects_meet_state_constraints(
-        &generated_effects,
-        &original_effects,
-        protected_registers,
+        generated_effects,
+        original_effects,
+        live_out_registers,
         isa,
     )
 }
@@ -1025,7 +1240,7 @@ pub fn generated_sequence_meets_state_constraints(
 pub fn generated_effects_meet_state_constraints(
     generated_effects: &[Effect],
     original_effects: &[Effect],
-    protected_registers: &[ArchitecturalRegister],
+    live_out_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
     if !original_effects.iter().all(|original_effect| {
@@ -1037,12 +1252,13 @@ pub fn generated_effects_meet_state_constraints(
     }
 
     generated_effects.iter().all(|effect| {
-        effect_write_destination_is_legal(effect, original_effects, protected_registers, isa)
+        effect_write_destination_is_legal(effect, original_effects, live_out_registers, isa)
     })
 }
 
 fn generated_program_illegal_read_count(
     generated: &Program,
+    generated_instruction_effects: &[&[Effect]],
     original_effects: &[Effect],
     isa: &ISA,
 ) -> u32 {
@@ -1052,9 +1268,12 @@ fn generated_program_illegal_read_count(
     let mut written_memory = Vec::new();
     let mut illegal_reads = 0;
 
-    for instruction in generated.iter_instructions() {
-        for effect in instruction_effects(instruction, isa).iter().cloned() {
-            let effect = collapse_effect_for_debug(effect, instruction);
+    for (instruction, instruction_effects) in generated
+        .iter_instructions()
+        .zip(generated_instruction_effects.iter())
+    {
+        for effect in instruction_effects.iter().cloned() {
+            let effect = canonicalize_effect_for_instruction(effect, instruction);
             if effect_guard_is_const_zero(&effect) {
                 continue;
             }
@@ -1137,11 +1356,11 @@ fn effect_illegal_read_count(
 fn effect_write_destination_is_legal(
     effect: &Effect,
     original_effects: &[Effect],
-    protected_registers: &[ArchitecturalRegister],
+    live_out_registers: &[ArchitecturalRegister],
     isa: &ISA,
 ) -> bool {
-    let protected_register_identifiers: Vec<_> =
-        protected_registers.iter().map(|r| r.identifier).collect();
+    let live_out_register_identifiers: Vec<_> =
+        live_out_registers.iter().map(|r| r.identifier).collect();
     let original_memory_destinations: Vec<_> = original_effects
         .iter()
         .filter_map(|effect| match effect {
@@ -1161,7 +1380,7 @@ fn effect_write_destination_is_legal(
         Effect::WriteRegister { register, .. } => {
             register_destination(register).is_some_and(|destination| {
                 destination != isa.sp.register.identifier as u128
-                    && !protected_register_identifiers.contains(&(destination as u8))
+                    && !live_out_register_identifiers.contains(&(destination as u8))
             }) || original_register_identifiers.iter().any(|original_ident| {
                 register_destination(register).is_some_and(|r| Some(r) == *original_ident)
             })
@@ -1497,8 +1716,7 @@ mod tests {
             Register, add, constant, fixed_register, read_memory, read_register, sub,
         },
         isa_specification::{
-            Instruction, InstructionField, InstructionForm, StackPointer, field_eq, field_in, not,
-            or,
+            Instruction, InstructionField, InstructionForm, StackPointer, field_eq, field_in,
         },
         semantic_matching::BitWord,
     };
@@ -1554,7 +1772,7 @@ mod tests {
             DecodedInstruction::decode_program_str(bits, isa).expect("test instruction decodes");
         assert_eq!(decoded.len(), 1);
         let decoded = decoded.into_iter().next().unwrap();
-        assert_eq!(decoded.name.as_deref(), Some(expected_name));
+        assert_eq!(decoded.name, expected_name);
         decoded
     }
 
@@ -1578,6 +1796,38 @@ mod tests {
         instruction_seq_to_effects(program, isa)
     }
 
+    fn sequence_meets_constraints(
+        isa: &ISA,
+        generated: &Program,
+        original: &Program,
+        live_out_registers: &[ArchitecturalRegister],
+        _isa: &ISA,
+    ) -> bool {
+        let generated_instruction_effects = instruction_effect_slices(isa, generated);
+        let generated_effects = effects(isa, generated);
+        let original_effects = effects(isa, original);
+        generated_sequence_meets_state_constraints(
+            generated,
+            &generated_instruction_effects,
+            &generated_effects,
+            &original_effects,
+            live_out_registers,
+            isa,
+        )
+    }
+
+    fn instruction_effect_slices<'a>(isa: &'a ISA, program: &'a Program) -> Vec<&'a [Effect]> {
+        program
+            .iter_instructions()
+            .map(|instruction| instruction_effects(instruction, isa))
+            .collect()
+    }
+
+    fn illegal_read_count(ctx: &SuperoptimizationCtx<'_>, program: &Program) -> u32 {
+        let sequence_effects = instruction_effect_slices(ctx.isa, program);
+        ctx.sequence_illegal_read_count(program, &sequence_effects)
+    }
+
     fn desired_output(ctx: &SuperoptimizationCtx<'_>, state: &MachineState) -> MachineState {
         ctx.execute_test(&ctx.original_program_effects, state)
     }
@@ -1587,7 +1837,8 @@ mod tests {
             name.to_owned(),
             FieldUses::VariableBits {
                 name: name.to_owned(),
-                pattern: BitPattern::parse(pattern),
+                pattern: Some(BitPattern::parse(pattern)),
+                len: pattern.len(),
             },
         )
     }
@@ -1672,8 +1923,8 @@ mod tests {
             .field(InstructionField::variable("dup", 1))
             .field(InstructionField::variable("dup", 1).merge_mode_uses());
         let instr = DecodedInstruction {
-            name: Some("CANDIDATE".to_string()),
-            form: Some(form.clone()),
+            name: "CANDIDATE".to_string(),
+            form: form.clone(),
             bits: BitPattern::parse("00").bits,
             fields: vec![
                 DecodedField {
@@ -1695,11 +1946,94 @@ mod tests {
             ],
         };
 
-        let changed = ctx.change_selected_field(instr, &form.fields[1]);
+        let changed = ctx
+            .change_selected_field(instr, &form.fields[1])
+            .expect("field change should succeed");
 
         assert_eq!(changed.bits, BitPattern::parse("01").bits);
         assert_eq!(changed.fields[0].value, BitPattern::parse("0"));
         assert_eq!(changed.fields[1].value, BitPattern::parse("1"));
+    }
+
+    #[test]
+    fn change_selected_field_flips_one_immediate_bit_and_updates_instruction_bits() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "0000", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "0000", "ORIGINAL"),
+            HashMap::from([variable_bits_use("imm", "xxxx")]),
+            &isa,
+            vec![],
+        );
+        let form = InstructionForm::new("candidate")
+            .field(InstructionField::variable("imm", 4).immediate());
+        let original_value = BitPattern::parse("1010");
+        let instr = DecodedInstruction {
+            name: "CANDIDATE".to_string(),
+            form: form.clone(),
+            bits: original_value.bits.clone(),
+            fields: vec![DecodedField {
+                name: Some("imm".to_string()),
+                value: original_value.clone(),
+                merge_mode: MergeMode::VariableBits,
+                is_immediate: true,
+                is_register_read: false,
+                is_register_write: false,
+            }],
+        };
+
+        let changed = ctx
+            .change_selected_field(instr, &form.fields[0])
+            .expect("field change should succeed");
+
+        let changed_value = &changed.fields[0].value;
+        assert_eq!(
+            original_value
+                .bits
+                .iter()
+                .zip(&changed_value.bits)
+                .filter(|(left, right)| left != right)
+                .count(),
+            1
+        );
+        assert_eq!(changed.bits, changed_value.bits);
+    }
+
+    #[test]
+    fn change_selected_field_uses_random_allowed_value_for_non_immediates() {
+        let isa = test_isa(
+            StackDirection::Downwards,
+            vec![encoded_instruction("ORIGINAL", "0000", vec![])],
+        );
+        let mut ctx = SuperoptimizationCtx::new_from_single_instruction(
+            decode_one(&isa, "0000", "ORIGINAL"),
+            HashMap::from([variable_bits_use("field", "0101")]),
+            &isa,
+            vec![],
+        );
+        let form = InstructionForm::new("candidate").field(InstructionField::variable("field", 4));
+        let instr = DecodedInstruction {
+            name: "CANDIDATE".to_string(),
+            form: form.clone(),
+            bits: BitPattern::parse("1010").bits,
+            fields: vec![DecodedField {
+                name: Some("field".to_string()),
+                value: BitPattern::parse("1010"),
+                merge_mode: MergeMode::VariableBits,
+                is_immediate: false,
+                is_register_read: false,
+                is_register_write: false,
+            }],
+        };
+
+        let changed = ctx
+            .change_selected_field(instr, &form.fields[0])
+            .expect("field change should succeed");
+
+        assert_eq!(changed.bits, BitPattern::parse("0101").bits);
+        assert_eq!(changed.fields[0].value, BitPattern::parse("0101"));
     }
 
     #[test]
@@ -1851,9 +2185,9 @@ mod tests {
         assert_eq!(
             program
                 .iter_enumerate_instructions()
-                .map(|(_, instruction)| instruction.name.as_deref())
+                .map(|(_, instruction)| instruction.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![Some("FIRST"), Some("SECOND")]
+            vec!["FIRST", "SECOND"]
         );
     }
 
@@ -1974,16 +2308,16 @@ mod tests {
         assert_eq!(
             program
                 .iter_enumerate_instructions()
-                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .map(|(idx, instruction)| (idx, instruction.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(1, Some("SECOND")), (3, Some("THIRD"))]
+            vec![(1, "SECOND"), (3, "THIRD")]
         );
         assert_eq!(
             program
                 .iter_instructions()
-                .map(|instruction| instruction.name.as_deref())
+                .map(|instruction| instruction.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![Some("SECOND"), Some("THIRD")]
+            vec!["SECOND", "THIRD"]
         );
 
         program.swap_instructions(1, 3);
@@ -1991,9 +2325,9 @@ mod tests {
         assert_eq!(
             program
                 .iter_enumerate_instructions()
-                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .map(|(idx, instruction)| (idx, instruction.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(1, Some("THIRD")), (3, Some("SECOND"))]
+            vec![(1, "THIRD"), (3, "SECOND")]
         );
     }
 
@@ -2047,10 +2381,7 @@ mod tests {
                 .clone_random_instruction(&mut rng)
                 .expect("program should clone a selectable instruction");
             assert!([1, 4].contains(&idx));
-            assert!(matches!(
-                instruction.name.as_deref(),
-                Some("SECOND") | Some("THIRD")
-            ));
+            assert!(matches!(instruction.name.as_str(), "SECOND" | "THIRD"));
         }
 
         for _ in 0..64 {
@@ -2142,15 +2473,15 @@ mod tests {
             match idx {
                 0 => {
                     counts[0] += 1;
-                    assert_eq!(instruction.name.as_deref(), Some("FIRST"));
+                    assert_eq!(instruction.name, "FIRST");
                 }
                 2 => {
                     counts[1] += 1;
-                    assert_eq!(instruction.name.as_deref(), Some("THIRD"));
+                    assert_eq!(instruction.name, "THIRD");
                 }
                 5 => {
                     counts[2] += 1;
-                    assert_eq!(instruction.name.as_deref(), Some("SECOND"));
+                    assert_eq!(instruction.name, "SECOND");
                 }
                 idx => panic!("selected UNUSED or out-of-scope index {idx}"),
             }
@@ -2312,14 +2643,14 @@ mod tests {
     }
 
     #[test]
-    fn field_change_proposal_rejects_mutation_that_fails_not_field_in_predicate() {
+    fn field_change_proposal_rejects_mutation_outside_field_in_predicate() {
         let isa = test_isa(
             StackDirection::Downwards,
             vec![instruction_with_form(
                 "CANDIDATE",
                 InstructionForm::new("candidate")
                     .field(InstructionField::variable("mode", 2).merge_mode_uses())
-                    .when(not(field_in("mode", ["10"]))),
+                    .when(field_in("mode", ["0x", "x1"])),
                 vec![],
             )],
         );
@@ -2338,14 +2669,14 @@ mod tests {
     }
 
     #[test]
-    fn field_change_proposal_rejects_mutation_that_fails_or_predicate() {
+    fn field_change_proposal_rejects_mutation_that_fails_field_in_predicate() {
         let isa = test_isa(
             StackDirection::Downwards,
             vec![instruction_with_form(
                 "CANDIDATE",
                 InstructionForm::new("candidate")
                     .field(InstructionField::variable("mode", 2).merge_mode_uses())
-                    .when(or([field_eq("mode", "00"), field_eq("mode", "11")])),
+                    .when(field_in("mode", ["00", "11"])),
                 vec![],
             )],
         );
@@ -2424,9 +2755,9 @@ mod tests {
         assert_eq!(
             proposal
                 .iter_enumerate_instructions()
-                .map(|(idx, instruction)| (idx, instruction.name.as_deref()))
+                .map(|(idx, instruction)| (idx, instruction.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(0, Some("SECOND")), (1, Some("FIRST"))]
+            vec![(0, "SECOND"), (1, "FIRST")]
         );
         assert!(matches!(proposal.instructions[2], ProgramInstr::UNUSED));
         assert!(matches!(proposal.instructions[3], ProgramInstr::UNUSED));
@@ -2488,7 +2819,7 @@ mod tests {
             proposal
                 .iter_instructions()
                 .next()
-                .and_then(|instruction| instruction.name.as_deref()),
+                .map(|instruction| instruction.name.as_str()),
             Some("ORIGINAL")
         );
     }
@@ -2594,8 +2925,11 @@ mod tests {
                 &mut rng,
             );
 
-            assert_eq!(instruction.name.as_deref(), Some("CANDIDATE"));
-            assert!(ctx.instruction_valid(&instruction));
+            assert_eq!(instruction.name, "CANDIDATE");
+            assert!(instruction_valid_under_field_uses(
+                &instruction,
+                &ctx.valid_field_uses
+            ));
             counts[instruction.bits.iter().fold(0, |acc, bit| {
                 (acc << 1)
                     | match bit {
@@ -2644,7 +2978,7 @@ mod tests {
                 &mut rng,
             );
 
-            assert_eq!(instruction.name.as_deref(), Some("CONSTRAINED"));
+            assert_eq!(instruction.name, "CONSTRAINED");
             assert_eq!(instruction.bits, vec![Bit::High]);
         }
     }
@@ -2673,7 +3007,7 @@ mod tests {
 
         let instruction = ctx.select_random_instruction();
 
-        assert_eq!(instruction.name.as_deref(), Some("ONLY_CANDIDATE"));
+        assert_eq!(instruction.name, "ONLY_CANDIDATE");
         assert_eq!(instruction.bits, vec![Bit::High]);
     }
 
@@ -2722,7 +3056,7 @@ mod tests {
             original,
             HashMap::new(),
             &isa,
-            vec![],
+            vec![arch_register(1)],
         );
 
         ctx.add_match(program.clone(), 42.0);
@@ -2765,7 +3099,7 @@ mod tests {
             original.clone(),
             HashMap::new(),
             &isa,
-            vec![],
+            vec![arch_register(2)],
         );
 
         assert_eq!(
@@ -2824,7 +3158,7 @@ mod tests {
             original,
             HashMap::new(),
             &isa,
-            vec![],
+            vec![arch_register(1)],
         );
 
         assert!(ctx.counterexamples.is_empty());
@@ -2906,7 +3240,9 @@ mod tests {
             vec![],
         );
 
-        assert!(ctx.sequence_meets_state_constraints(&sequence(&isa, "01", "GENERATED")));
+        let generated = sequence(&isa, "01", "GENERATED");
+        let generated_effects = effects(&isa, &generated);
+        assert!(ctx.sequence_meets_state_constraints(&generated_effects));
     }
 
     #[test]
@@ -2934,7 +3270,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READS_EXTRA")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "READS_EXTRA")),
             1
         );
     }
@@ -2975,7 +3311,7 @@ mod tests {
             2,
         );
 
-        assert_eq!(ctx.sequence_illegal_read_count(&generated), 0);
+        assert_eq!(illegal_read_count(&ctx, &generated), 0);
     }
 
     #[test]
@@ -3003,7 +3339,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_SP_VALUE")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "READ_SP_VALUE")),
             1
         );
     }
@@ -3037,7 +3373,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "WRITE_STACK")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "WRITE_STACK")),
             0
         );
     }
@@ -3074,7 +3410,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_STACK")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "READ_STACK")),
             0
         );
     }
@@ -3108,7 +3444,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "READ_SP_VALUE")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "READ_SP_VALUE")),
             1
         );
     }
@@ -3141,7 +3477,7 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.sequence_illegal_read_count(&sequence(&isa, "01", "WRITE_SP")),
+            illegal_read_count(&ctx, &sequence(&isa, "01", "WRITE_SP")),
             0
         );
     }
@@ -3206,7 +3542,10 @@ mod tests {
         );
         let instr = decode_one(&isa, "101111010", "CANDIDATE");
 
-        assert!(ctx.instruction_valid(&instr));
+        assert!(instruction_valid_under_field_uses(
+            &instr,
+            &ctx.valid_field_uses
+        ));
     }
 
     #[test]
@@ -3231,7 +3570,10 @@ mod tests {
         );
         let instr = decode_one(&isa, "1", "CANDIDATE");
 
-        assert!(!ctx.instruction_valid(&instr));
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &ctx.valid_field_uses
+        ));
     }
 
     #[test]
@@ -3256,7 +3598,10 @@ mod tests {
         );
         let instr = decode_one(&isa, "10", "CANDIDATE");
 
-        assert!(!ctx.instruction_valid(&instr));
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &ctx.valid_field_uses
+        ));
     }
 
     #[test]
@@ -3280,7 +3625,10 @@ mod tests {
         );
         let instr = decode_one(&isa, "1101", "CANDIDATE");
 
-        assert!(!ctx.instruction_valid(&instr));
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &ctx.valid_field_uses
+        ));
     }
 
     #[test]
@@ -3309,7 +3657,10 @@ mod tests {
         );
         let instr = decode_one(&isa, "01000", "CANDIDATE");
 
-        assert!(!ctx.instruction_valid(&instr));
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &ctx.valid_field_uses
+        ));
     }
 
     #[test]
@@ -3377,7 +3728,7 @@ mod tests {
             decode_one(&isa, "0000", "ORIGINAL"),
             HashMap::new(),
             &isa,
-            vec![],
+            vec![arch_register(1)],
         );
         let state = MachineState {
             registers: HashMap::from([
@@ -3457,7 +3808,7 @@ mod tests {
             decode_one(&isa, "0000", "ORIGINAL"),
             HashMap::new(),
             &isa,
-            vec![],
+            vec![arch_register(1)],
         );
         let state = MachineState::default();
 
@@ -3469,8 +3820,9 @@ mod tests {
     }
 
     #[test]
-    fn passes_test_ignores_unprotected_scratch_register_but_rejects_protected_one() {
-        let protected_register = arch_register(2);
+    fn passes_test_ignores_scratch_register_but_rejects_live_out_one() {
+        let result_register = arch_register(1);
+        let scratch_register = arch_register(2);
         let isa = test_isa(
             StackDirection::Downwards,
             vec![
@@ -3489,30 +3841,31 @@ mod tests {
                 ),
             ],
         );
-        let unprotected_ctx = SuperoptimizationCtx::new_from_single_instruction(
+        let scratch_ctx = SuperoptimizationCtx::new_from_single_instruction(
             decode_one(&isa, "0000", "ORIGINAL"),
             HashMap::new(),
             &isa,
-            vec![],
+            vec![result_register],
         );
-        let protected_ctx = SuperoptimizationCtx::new_from_single_instruction(
+        let live_out_scratch_ctx = SuperoptimizationCtx::new_from_single_instruction(
             decode_one(&isa, "0000", "ORIGINAL"),
             HashMap::new(),
             &isa,
-            vec![protected_register],
+            vec![result_register, scratch_register],
         );
-        let state = MachineState::default();
+        let mut state = MachineState::default();
+        state.registers.insert(2, BitWord::new(99, 32));
         let generated = sequence(&isa, "0001", "GENERATED");
         let generated_effects = effects(&isa, &generated);
-        let unprotected_original_state = desired_output(&unprotected_ctx, &state);
-        let protected_original_state = desired_output(&protected_ctx, &state);
+        let scratch_original_state = desired_output(&scratch_ctx, &state);
+        let live_out_scratch_original_state = desired_output(&live_out_scratch_ctx, &state);
 
-        assert!(unprotected_ctx.passes_test(
+        assert!(scratch_ctx.passes_test(&generated_effects, &state, &scratch_original_state));
+        assert!(!live_out_scratch_ctx.passes_test(
             &generated_effects,
             &state,
-            &unprotected_original_state
+            &live_out_scratch_original_state
         ));
-        assert!(!protected_ctx.passes_test(&generated_effects, &state, &protected_original_state));
     }
 
     #[test]
@@ -3541,7 +3894,8 @@ mod tests {
             ],
         );
 
-        assert!(generated_sequence_meets_state_constraints(
+        assert!(sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "GENERATED"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
@@ -3589,19 +3943,22 @@ mod tests {
             ],
         );
 
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "ONLY_REGISTER"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000010", "ONLY_MEMORY"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000011", "ONLY_STACK_SCRATCH"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
@@ -3628,13 +3985,15 @@ mod tests {
             ],
         );
 
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "NONCONST_REG_DEST"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000010", "SP_WRITE"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
@@ -3683,25 +4042,29 @@ mod tests {
             ],
         );
 
-        assert!(generated_sequence_meets_state_constraints(
+        assert!(sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "STACK_DOWN"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000010", "STACK_UP"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000011", "STACK_TOO_FAR"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000100", "ARBITRARY_MEMORY"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
@@ -3736,13 +4099,15 @@ mod tests {
             ],
         );
 
-        assert!(generated_sequence_meets_state_constraints(
+        assert!(sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "STACK_UP"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000010", "STACK_DOWN"),
             &sequence(&isa, "00000000", "ORIGINAL"),
             &[],
@@ -3751,42 +4116,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_generated_writes_to_protected_registers() {
-        let protected_register = arch_register(1);
+    fn rejects_generated_writes_to_live_out_registers() {
+        let live_out_register = arch_register(1);
         let isa = test_isa(
             StackDirection::Downwards,
             vec![
                 encoded_instruction("ORIGINAL", "00000000", vec![]),
                 encoded_instruction(
-                    "WRITE_UNPROTECTED_R0",
+                    "WRITE_SCRATCH_R0",
                     "00000001",
                     vec![Effect::write_register(fixed_reg(0), constant(0x12, 32))],
                 ),
                 encoded_instruction(
-                    "WRITE_PROTECTED_R1",
+                    "WRITE_LIVE_OUT_R1",
                     "00000010",
                     vec![Effect::write_register(fixed_reg(1), constant(0x34, 32))],
                 ),
             ],
         );
 
-        assert!(generated_sequence_meets_state_constraints(
-            &sequence(&isa, "00000001", "WRITE_UNPROTECTED_R0"),
+        assert!(sequence_meets_constraints(
+            &isa,
+            &sequence(&isa, "00000001", "WRITE_SCRATCH_R0"),
             &sequence(&isa, "00000000", "ORIGINAL"),
-            &[protected_register],
+            &[live_out_register],
             &isa
         ));
-        assert!(!generated_sequence_meets_state_constraints(
-            &sequence(&isa, "00000010", "WRITE_PROTECTED_R1"),
+        assert!(!sequence_meets_constraints(
+            &isa,
+            &sequence(&isa, "00000010", "WRITE_LIVE_OUT_R1"),
             &sequence(&isa, "00000000", "ORIGINAL"),
-            &[protected_register],
+            &[live_out_register],
             &isa
         ));
     }
 
     #[test]
-    fn allows_original_destination_even_when_register_is_protected() {
-        let protected_register = arch_register(1);
+    fn allows_original_destination_even_when_register_is_live_out() {
+        let live_out_register = arch_register(1);
         let isa = test_isa(
             StackDirection::Downwards,
             vec![
@@ -3803,17 +4170,18 @@ mod tests {
             ],
         );
 
-        assert!(generated_sequence_meets_state_constraints(
+        assert!(sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "GENERATED"),
             &sequence(&isa, "00000000", "ORIGINAL"),
-            &[protected_register],
+            &[live_out_register],
             &isa
         ));
     }
 
     #[test]
-    fn protected_registers_do_not_make_arbitrary_memory_writes_valid() {
-        let protected_register = arch_register(1);
+    fn live_out_registers_do_not_make_arbitrary_memory_writes_valid() {
+        let live_out_register = arch_register(1);
         let isa = test_isa(
             StackDirection::Downwards,
             vec![
@@ -3826,10 +4194,11 @@ mod tests {
             ],
         );
 
-        assert!(!generated_sequence_meets_state_constraints(
+        assert!(!sequence_meets_constraints(
+            &isa,
             &sequence(&isa, "00000001", "ARBITRARY_MEMORY"),
             &sequence(&isa, "00000000", "ORIGINAL"),
-            &[protected_register],
+            &[live_out_register],
             &isa
         ));
     }

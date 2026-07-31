@@ -130,8 +130,8 @@ impl Instruction {
             }
 
             let mut decoded_fields = DecodedInstruction {
-                name: Some(self.name.clone()),
-                form: Some(form.clone()),
+                name: self.name.clone(),
+                form: form.clone(),
                 bits: bits.to_vec(),
                 fields: Vec::new(),
             };
@@ -176,8 +176,8 @@ impl Instruction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedInstruction {
-    pub name: Option<String>,
-    pub form: Option<InstructionForm>,
+    pub name: String,
+    pub form: InstructionForm,
     pub bits: Vec<Bit>,
     pub fields: Vec<DecodedField>,
 }
@@ -190,6 +190,52 @@ pub struct DecodedField {
     pub is_immediate: bool,
     pub is_register_read: bool,
     pub is_register_write: bool,
+}
+
+/// Returns whether a decoded instruction is valid under the supplied field-use constraints.
+pub fn instruction_valid_under_field_uses(
+    instr: &DecodedInstruction,
+    valid_field_uses: &HashMap<FieldName, FieldUses>,
+) -> bool {
+    if !instr.form.when.check(instr) {
+        return false;
+    }
+
+    for field in &instr.fields {
+        let Some(name) = &field.name else {
+            continue;
+        };
+        let Some(valid_uses) = valid_field_uses.get(name) else {
+            return false;
+        };
+
+        match valid_uses {
+            FieldUses::Uses { patterns, .. } => {
+                let matches = if field.value.bits.iter().any(|bit| *bit == Bit::Var) {
+                    patterns
+                        .iter()
+                        .any(|pattern| field.value.matches_bits(&pattern.bits))
+                } else {
+                    patterns
+                        .iter()
+                        .any(|pattern| pattern.matches_bits(&field.value.bits))
+                };
+                if !matches {
+                    return false;
+                }
+            }
+            FieldUses::VariableBits { pattern, .. } => {
+                let Some(pattern) = pattern else {
+                    return false;
+                };
+                if !pattern.matches_bits(&field.value.bits) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 impl DecodedInstruction {
@@ -251,9 +297,8 @@ pub struct InstructionForm {
     pub fields: Vec<InstructionField>,
 
     /// Condition (on the instruction) for when the field is applicable (eg requiring a certain bit to be set to 1)
-    /// For these predicates, it is recommended to only use And, FieldEq, and BitEq
-    /// If you use Not, Or, or FieldIn, fields_to_encodings may generate some encodings which don't fully satisfy the predicate
-    /// (ie generating an instruction which may actually belong to another form) because of the current implementation
+    /// For these predicates, use conjunctions of positive constraints. `fields_to_encodings`
+    /// supports `And`, `FieldEq`, `FieldIn`, and `BitEq`.
     pub when: Predicate,
 
     /// Derived values for this instruction form for semantics (eg defining a certain "operand2 = Rm << Rs")
@@ -302,21 +347,6 @@ impl InstructionForm {
         field_values: &HashMap<String, FieldUses>,
     ) -> Vec<BitPattern> {
         let mut encodings = Vec::new();
-
-        // let mut num_permutations = 1;
-        // for field in self.fields.iter() {
-        //     let Some(name) = &field.name else { continue };
-        //     let Some(field_use) = field_values.get(name) else {
-        //         continue;
-        //     };
-        //     print!("{name}\t");
-        //     println!("{:?}", field_use);
-        //     if let FieldUses::Uses { patterns, .. } = field_use {
-        //         num_permutations *= patterns.len();
-        //     }
-        // }
-        // println!("{num_permutations}");
-
         // We approach this problem by walking through each field in in the instruction form
         // If a field is MergeMode::VariableBits, we don't need to expand anything
         // If it is MergeMode::Uses, and there are n uses, we need to generate n new instructions
@@ -325,12 +355,14 @@ impl InstructionForm {
         fn helper(
             form: &InstructionForm,
             field_values: &HashMap<String, FieldUses>,
-            current_encoding: BitPattern,
+            current_encoding: &mut Vec<Bit>,
             encodings: &mut Vec<BitPattern>,
             field_index: usize,
         ) {
             if field_index == form.fields.len() {
-                encodings.push(current_encoding);
+                encodings.push(BitPattern {
+                    bits: current_encoding.clone(),
+                });
                 return;
             }
             let field = &form.fields[field_index];
@@ -343,7 +375,8 @@ impl InstructionForm {
                     // If there is no name, this is a constant field, so we can just use the pattern directly
                     Some(&FieldUses::VariableBits {
                         name: "__const__".to_string(),
-                        pattern: field.pattern.clone(),
+                        pattern: Some(field.pattern.clone()),
+                        len: field.pattern.len(),
                     })
                 }
             }) else {
@@ -352,29 +385,44 @@ impl InstructionForm {
                 return;
             };
             match (field.merge_mode, field_use) {
-                (MergeMode::VariableBits, FieldUses::VariableBits { name: _, pattern }) => {
+                (
+                    MergeMode::VariableBits,
+                    FieldUses::VariableBits {
+                        name: _,
+                        pattern,
+                        len,
+                    },
+                ) => {
+                    assert_eq!(
+                        *len,
+                        field.pattern.len(),
+                        "FieldUses::VariableBits length must match instruction field width"
+                    );
+                    let Some(pattern) = pattern else {
+                        return;
+                    };
                     // If the field or a bit in the field necessarily must have a certain value for a predicate in the form
                     // and it is currently unknown, we must fix that bit to the required value, since otherwise we would generate an encoding that doesn't satisfy the form's predicate
-                    if let Some(constrained_pattern) = form.constrain_variable_bits(
+                    let pattern_idx = current_encoding.len();
+                    let constrained_patterns = form.constrain_variable_bits(
                         pattern,
-                        current_encoding.bits.len(),
+                        pattern_idx,
                         field
                             .name
                             .as_ref()
                             .unwrap_or(&"__const__".to_string())
                             .as_str(),
-                    ) {
-                        // Just append the pattern to the current encoding and move on
-                        let new_encoding = BitPattern {
-                            bits: [
-                                current_encoding.bits.clone(),
-                                constrained_pattern.bits.clone(),
-                            ]
-                            .concat(),
-                        };
-                        helper(form, field_values, new_encoding, encodings, field_index + 1);
-                    } else {
-                        // If the field cannot satisfy the predicate, we should abandon this specific encoding, since it is not valid
+                    );
+                    for constrained_pattern in constrained_patterns {
+                        current_encoding.extend(constrained_pattern.bits);
+                        helper(
+                            form,
+                            field_values,
+                            current_encoding,
+                            encodings,
+                            field_index + 1,
+                        );
+                        current_encoding.truncate(pattern_idx);
                     }
                 }
                 (
@@ -390,43 +438,29 @@ impl InstructionForm {
                         field.pattern.len(),
                         "FieldUses::Uses length must match instruction field width"
                     );
-                    let merged_patterns;
-                    let patterns = if field.is_register_read && !field.is_register_write {
-                        merged_patterns = FieldUses::Uses {
-                            name: field.name.clone().unwrap_or_default(),
-                            patterns: patterns.clone(),
-                            len: *len,
-                        }
-                        .merge();
-                        match &merged_patterns {
-                            FieldUses::Uses { patterns, .. } => patterns,
-                            FieldUses::VariableBits { .. } => unreachable!(),
-                        }
-                    } else {
-                        patterns
-                    };
 
                     // For each pattern, append it to the current encoding and recurse
                     for pattern in patterns {
-                        if let Some(constrained_pattern) = form.constrain_variable_bits(
+                        let pattern_idx = current_encoding.len();
+                        let constrained_patterns = form.constrain_variable_bits(
                             pattern,
-                            current_encoding.bits.len(),
+                            pattern_idx,
                             field
                                 .name
                                 .as_ref()
                                 .unwrap_or(&"__const__".to_string())
                                 .as_str(),
-                        ) {
-                            let new_encoding = BitPattern {
-                                bits: [
-                                    current_encoding.bits.clone(),
-                                    constrained_pattern.bits.clone(),
-                                ]
-                                .concat(),
-                            };
-                            helper(form, field_values, new_encoding, encodings, field_index + 1);
-                        } else {
-                            // If the field cannot satisfy the predicate, we should abandon this specific encoding, since it is not valid
+                        );
+                        for constrained_pattern in constrained_patterns {
+                            current_encoding.extend(constrained_pattern.bits);
+                            helper(
+                                form,
+                                field_values,
+                                current_encoding,
+                                encodings,
+                                field_index + 1,
+                            );
+                            current_encoding.truncate(pattern_idx);
                         }
                     }
                 }
@@ -434,27 +468,16 @@ impl InstructionForm {
             }
         }
 
-        helper(
-            self,
-            field_values,
-            BitPattern { bits: Vec::new() },
-            &mut encodings,
-            0,
-        );
+        helper(self, field_values, &mut Vec::new(), &mut encodings, 0);
 
         // Remove any direct duplicates (created by constrain_variable_bits)
-        encodings.sort_by(|a, b| {
-            let a_key: Vec<String> = a.bits.iter().map(|bit| format!("{:?}", bit)).collect();
-            let b_key: Vec<String> = b.bits.iter().map(|bit| format!("{:?}", bit)).collect();
-            a_key.cmp(&b_key)
-        });
-        encodings.dedup();
+        let mut seen = HashSet::new();
+        encodings.retain(|encoding| seen.insert(encoding.clone()));
         encodings
     }
 
-    /// Elaborates variable bits in a BitPattern to satisfy the predicate of InstructionForm::when
-    /// This does not fully satisfy predicates, so after selecting specific bits, you should make
-    /// sure to call the actual predicate.
+    /// Elaborates variable bits in a BitPattern to satisfy the predicate of InstructionForm::when.
+    /// `FieldIn` can split one broad pattern into multiple constrained patterns.
     /// Arguments:
     /// * `pattern` - the BitPattern to elaborate.
     /// * `pattern_idx` - the starting index of the pattern in the overall instruction encoding (used for checking BitEq predicates)
@@ -464,92 +487,134 @@ impl InstructionForm {
         pattern: &BitPattern,
         pattern_idx: usize,
         field_name: &str,
-    ) -> Option<BitPattern> {
-        let mut pattern = pattern.clone();
+    ) -> Vec<BitPattern> {
+        let pattern = pattern.clone();
+
+        fn constrain_pattern(pattern: &BitPattern, value: &BitPattern) -> Option<BitPattern> {
+            if pattern.bits.len() != value.bits.len() {
+                return None;
+            }
+
+            let mut constrained = pattern.clone();
+            for (pattern_bit, value_bit) in constrained.bits.iter_mut().zip(&value.bits) {
+                match (*pattern_bit, *value_bit) {
+                    (_, Bit::Var) => {}
+                    (Bit::Var, bit) => *pattern_bit = bit,
+                    (lhs, rhs) if lhs == rhs => {}
+                    _ => return None,
+                }
+            }
+
+            Some(constrained)
+        }
+
+        fn merge_patterns(patterns: Vec<BitPattern>) -> Vec<BitPattern> {
+            let Some(len) = patterns.first().map(BitPattern::len) else {
+                return Vec::new();
+            };
+            let patterns = patterns.into_iter().collect::<HashSet<_>>();
+            let merged = FieldUses::Uses {
+                name: "__predicate__".to_string(),
+                patterns,
+                len,
+            }
+            .merge();
+
+            let FieldUses::Uses { patterns, .. } = merged else {
+                unreachable!("FieldUses::Uses::merge must return FieldUses::Uses");
+            };
+            patterns.into_iter().collect()
+        }
 
         fn apply_constraints(
             form: &InstructionForm,
             predicate: &Predicate,
-            pattern: &mut BitPattern,
+            patterns: Vec<BitPattern>,
             pattern_idx: usize,
             field_name: &str,
-        ) -> bool {
+        ) -> Vec<BitPattern> {
             match predicate {
-                Predicate::Always | Predicate::Never => {}
-                Predicate::Not(_) => {
-                    // For simplicity, we won't handle Not predicates, since they can be complex to handle (eg Not(And(...)) or Not(Or(...)))
-                    // Instead, we will just ignore them, which means we won't be able to constrain bits based on Not predicates. This is a limitation of the current implementation.
-                }
-                Predicate::Or(_) => {
-                    // For simplicity, we won't handle Or predicates, since they can also be complex to handle (eg Or(And(...), And(...)))
-                    // Instead, we will just ignore them, which means we won't be able to constrain bits based on Or predicates. This is a limitation of the current implementation.
-                }
+                Predicate::Always => patterns,
+                Predicate::Never => Vec::new(),
                 Predicate::And(predicates) => {
+                    let mut constrained = patterns;
                     for p in predicates {
-                        if !apply_constraints(form, p, pattern, pattern_idx, field_name) {
-                            return false;
+                        constrained =
+                            apply_constraints(form, p, constrained, pattern_idx, field_name);
+                        if constrained.is_empty() {
+                            break;
                         }
                     }
+                    constrained
                 }
                 Predicate::FieldEq {
                     field_name: pred_field_name,
                     value,
                 } => {
                     if pred_field_name == field_name {
-                        for (i, bit) in value.bits.iter().enumerate() {
-                            if i < pattern.bits.len()
-                                && *bit != Bit::Var
-                                && pattern.bits[i] == Bit::Var
-                            {
-                                pattern.bits[i] = *bit;
-                            } else if i >= pattern.bits.len()
-                                || (*bit != Bit::Var && pattern.bits[i] != *bit)
-                            {
-                                // This means the constraints are unsatisfiable, since the field must be equal to value, but pattern cannot be made equal to value
-                                return false;
-                            }
-                        }
+                        patterns
+                            .iter()
+                            .filter_map(|pattern| constrain_pattern(pattern, value))
+                            .collect()
+                    } else {
+                        patterns
                     }
                 }
                 Predicate::BitEq { index, value } => {
-                    if *index < pattern.bits.len() + pattern_idx
-                        && pattern_idx <= *index
-                        && *value != Bit::Var
-                        && pattern.bits[*index - pattern_idx] == Bit::Var
-                    {
-                        pattern.bits[*index - pattern_idx] = *value;
+                    let pattern_len = patterns.first().map_or(0, BitPattern::len);
+                    if *index < pattern_idx || *index >= pattern_idx + pattern_len {
+                        return patterns;
                     }
-
-                    // If the predicate applies to this pattern, and the value is not variable, and the pattern bit does not match the value, then this means the constraints are unsatisfiable, since the bit must be equal to value, but pattern cannot be made equal to value
-                    if (*index < pattern.bits.len() + pattern_idx && pattern_idx <= *index)
-                        && (*value != Bit::Var
-                            && pattern.bits.get(*index - pattern_idx) != Some(value))
-                    {
-                        // This means the constraints are unsatisfiable
-                        // This does not return false if index is out of bounds, since that just means this predicate is not actually constraining any bits in this pattern
-                        return false;
+                    let local_index = *index - pattern_idx;
+                    patterns
+                        .into_iter()
+                        .filter_map(|mut pattern| {
+                            let bit = pattern.bits.get_mut(local_index)?;
+                            match (*bit, *value) {
+                                (Bit::Var, value) => {
+                                    *bit = value;
+                                    Some(pattern)
+                                }
+                                (lhs, rhs) if lhs == rhs => Some(pattern),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                }
+                Predicate::FieldIn {
+                    field_name: pred_field_name,
+                    values,
+                } => {
+                    if pred_field_name == field_name {
+                        merge_patterns(
+                            patterns
+                                .iter()
+                                .flat_map(|pattern| {
+                                    values
+                                        .iter()
+                                        .filter_map(|value| constrain_pattern(pattern, value))
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        patterns
                     }
                 }
-                Predicate::FieldIn { .. } => {
-                    // For simplicity, we don't handle FieldIn
-                    // These can be tricky
-                }
-            };
-            true
+            }
         }
 
-        if !apply_constraints(self, &self.when, &mut pattern, pattern_idx, field_name) {
-            None
-        } else {
-            Some(pattern)
-        }
+        apply_constraints(self, &self.when, vec![pattern], pattern_idx, field_name)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldUses {
     /// The used values of the field is represented by a single bit pattern (eg 01 and 11 can be represented by x1)
-    VariableBits { name: String, pattern: BitPattern },
+    VariableBits {
+        name: String,
+        pattern: Option<BitPattern>,
+        len: usize,
+    },
 
     /// The used values of the field is represented by a set of distinct bit patterns (eg 00, 01, and 11 can be represented by {00, 01, 11}, but not by a single pattern)
     Uses {
@@ -563,9 +628,10 @@ impl FieldUses {
     /// Uses Quine-McCluskey style merging to attempt to merge the patterns in this FieldUses, returning a new FieldUses with the merged patterns. Only applicable for FieldUses::Uses.
     pub fn merge(&self) -> Self {
         match self {
-            FieldUses::VariableBits { name, pattern } => FieldUses::VariableBits {
+            FieldUses::VariableBits { name, pattern, len } => FieldUses::VariableBits {
                 name: name.clone(),
                 pattern: pattern.clone(),
+                len: *len,
             },
             FieldUses::Uses {
                 name,
@@ -577,6 +643,19 @@ impl FieldUses {
                     patterns.iter().all(|pattern| pattern.len() == *len),
                     "All FieldUses::Uses patterns must match len"
                 );
+                fn remove_subsumed(patterns: HashSet<BitPattern>) -> HashSet<BitPattern> {
+                    patterns
+                        .iter()
+                        .filter(|pattern| {
+                            !patterns
+                                .iter()
+                                .any(|other| *other != **pattern && other.covers(pattern))
+                        })
+                        .cloned()
+                        .collect()
+                }
+
+                patterns = remove_subsumed(patterns);
                 loop {
                     let mut used = HashSet::new();
                     let mut new_strings = HashSet::new();
@@ -597,11 +676,13 @@ impl FieldUses {
                         }
                     }
 
-                    let next_strings: HashSet<BitPattern> = patterns
-                        .difference(&used)
-                        .cloned()
-                        .chain(new_strings.into_iter())
-                        .collect();
+                    let next_strings = remove_subsumed(
+                        patterns
+                            .difference(&used)
+                            .cloned()
+                            .chain(new_strings.into_iter())
+                            .collect(),
+                    );
 
                     if next_strings == patterns {
                         break;
@@ -722,9 +803,7 @@ pub enum Predicate {
     Always,
     Never,
 
-    Not(Box<Predicate>),
     And(Vec<Predicate>),
-    Or(Vec<Predicate>),
 
     BitEq {
         index: usize,
@@ -747,14 +826,13 @@ impl Predicate {
         match self {
             Predicate::Always => true,
             Predicate::Never => false,
-            Predicate::Not(inner) => !inner.check(inst),
             Predicate::And(inner) => inner.iter().all(|i| i.check(inst)),
-            Predicate::Or(inner) => inner.iter().any(|i| i.check(inst)),
             Predicate::BitEq { index, value } => inst.bits[*index] == *value,
             Predicate::FieldEq { field_name, value } => inst.field_value(field_name) == Some(value),
-            Predicate::FieldIn { field_name, values } => values
-                .iter()
-                .any(|v| inst.field_value(field_name) == Some(v)),
+            Predicate::FieldIn { field_name, values } => values.iter().any(|v| {
+                inst.field_value(field_name)
+                    .is_some_and(|field| v.matches_bits(&field.bits))
+            }),
         }
     }
 }
@@ -778,24 +856,19 @@ pub fn field_eq(name: impl Into<String>, value: &str) -> Predicate {
 
 pub fn field_in(
     name: impl Into<String>,
-    values: impl IntoIterator<Item = &'static str>,
+    values: impl IntoIterator<Item = impl Into<String>>,
 ) -> Predicate {
     Predicate::FieldIn {
         field_name: name.into(),
-        values: values.into_iter().map(BitPattern::parse).collect(),
+        values: values
+            .into_iter()
+            .map(|value| BitPattern::parse(&value.into()))
+            .collect(),
     }
-}
-
-pub fn not(predicate: Predicate) -> Predicate {
-    Predicate::Not(Box::new(predicate))
 }
 
 pub fn and(predicates: impl IntoIterator<Item = Predicate>) -> Predicate {
     Predicate::And(predicates.into_iter().collect())
-}
-
-pub fn or(predicates: impl IntoIterator<Item = Predicate>) -> Predicate {
-    Predicate::Or(predicates.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -849,15 +922,11 @@ mod tests {
         let decoded = DecodedInstruction::decode_program(&path, &isa).unwrap();
 
         assert_eq!(decoded.len(), 2);
-        assert!(
-            decoded
-                .iter()
-                .all(|instr| instr.name.as_deref() == Some("NOP"))
-        );
+        assert!(decoded.iter().all(|instr| instr.name == "NOP"));
     }
 
     #[test]
-    fn field_and_predicate_builders_cover_variable_bits_and_or() {
+    fn field_and_predicate_builders_cover_variable_bits_and_field_in() {
         let field = InstructionField::variable("mode", 2)
             .merge_mode_uses()
             .merge_mode_variable_bits();
@@ -866,7 +935,7 @@ mod tests {
         let instruction = Instruction::new("TEST", 2).form(
             InstructionForm::new("form")
                 .field(field)
-                .when(or(vec![field_eq("mode", "01"), field_eq("mode", "10")])),
+                .when(field_in("mode", ["01", "10"])),
         );
 
         assert!(
@@ -884,6 +953,160 @@ mod tests {
                 .find_match(&BitPattern::parse("11").bits)
                 .is_none()
         );
+    }
+
+    fn decoded_with_form(form: InstructionForm, fields: Vec<DecodedField>) -> DecodedInstruction {
+        DecodedInstruction {
+            name: "TEST".to_string(),
+            form,
+            bits: BitPattern::parse("101011").bits,
+            fields,
+        }
+    }
+
+    fn decoded_field(name: Option<&str>, value: &str, merge_mode: MergeMode) -> DecodedField {
+        DecodedField {
+            name: name.map(str::to_string),
+            value: BitPattern::parse(value),
+            merge_mode,
+            is_immediate: false,
+            is_register_read: false,
+            is_register_write: false,
+        }
+    }
+
+    fn uses(name: &str, patterns: &[&str]) -> (FieldName, FieldUses) {
+        let len = patterns.first().expect("uses requires patterns").len();
+        (
+            name.to_string(),
+            FieldUses::Uses {
+                name: name.to_string(),
+                patterns: patterns
+                    .iter()
+                    .map(|pattern| BitPattern::parse(pattern))
+                    .collect(),
+                len,
+            },
+        )
+    }
+
+    fn variable_bits(name: &str, pattern: &str) -> (FieldName, FieldUses) {
+        (
+            name.to_string(),
+            FieldUses::VariableBits {
+                name: name.to_string(),
+                pattern: Some(BitPattern::parse(pattern)),
+                len: pattern.len(),
+            },
+        )
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_accepts_matching_named_fields() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![
+                decoded_field(None, "101", MergeMode::VariableBits),
+                decoded_field(Some("opcode"), "10", MergeMode::Uses),
+                decoded_field(Some("imm"), "0110", MergeMode::VariableBits),
+            ],
+        );
+        let valid_field_uses =
+            HashMap::from([uses("opcode", &["00", "10"]), variable_bits("imm", "0xx0")]);
+
+        assert!(instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_rejects_empty_variable_bits_use() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![decoded_field(Some("imm"), "01", MergeMode::VariableBits)],
+        );
+        let valid_field_uses = HashMap::from([(
+            "imm".to_string(),
+            FieldUses::VariableBits {
+                name: "imm".to_string(),
+                pattern: None,
+                len: 2,
+            },
+        )]);
+
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_accepts_variable_decoded_uses_field() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![decoded_field(Some("opcode"), "1x", MergeMode::Uses)],
+        );
+        let valid_field_uses = HashMap::from([uses("opcode", &["10"])]);
+
+        assert!(instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_rejects_missing_field_use() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![decoded_field(Some("opcode"), "10", MergeMode::Uses)],
+        );
+
+        assert!(!instruction_valid_under_field_uses(&instr, &HashMap::new()));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_rejects_nonmatching_uses_pattern() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![decoded_field(Some("opcode"), "10", MergeMode::Uses)],
+        );
+        let valid_field_uses = HashMap::from([uses("opcode", &["00", "01"])]);
+
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_rejects_nonmatching_variable_bits_pattern() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form"),
+            vec![decoded_field(Some("imm"), "0110", MergeMode::VariableBits)],
+        );
+        let valid_field_uses = HashMap::from([variable_bits("imm", "1xx0")]);
+
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
+    }
+
+    #[test]
+    fn instruction_valid_under_field_uses_rejects_failed_form_predicate() {
+        let instr = decoded_with_form(
+            InstructionForm::new("form")
+                .field(InstructionField::variable("mode", 2))
+                .when(field_eq("mode", "11")),
+            vec![decoded_field(Some("mode"), "10", MergeMode::VariableBits)],
+        );
+        let valid_field_uses = HashMap::from([variable_bits("mode", "xx")]);
+
+        assert!(!instruction_valid_under_field_uses(
+            &instr,
+            &valid_field_uses
+        ));
     }
 
     mod inst_recognition {
@@ -1022,7 +1245,7 @@ mod tests {
 
             assert_eq!(
                 form.constrain_variable_bits(&BitPattern::parse("xxx"), 0, "field1"),
-                Some(BitPattern::parse("110"))
+                vec![BitPattern::parse("110")]
             );
         }
 
@@ -1034,7 +1257,34 @@ mod tests {
 
             assert_eq!(
                 form.constrain_variable_bits(&BitPattern::parse("1x"), 0, "field1"),
-                None
+                Vec::<BitPattern>::new()
+            );
+        }
+
+        #[test]
+        fn constrain_variable_bits_expands_field_in_predicates() {
+            let form = InstructionForm::new("form1")
+                .field(InstructionField::variable("field1", 2))
+                .when(field_in("field1", ["0x", "x1"]));
+            let expected = HashSet::from([BitPattern::parse("0x"), BitPattern::parse("x1")]);
+
+            assert_eq!(
+                form.constrain_variable_bits(&BitPattern::parse("xx"), 0, "field1")
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+        }
+
+        #[test]
+        fn constrain_variable_bits_merges_field_in_results() {
+            let form = InstructionForm::new("form1")
+                .field(InstructionField::variable("field1", 2))
+                .when(field_in("field1", ["00", "10"]));
+
+            assert_eq!(
+                form.constrain_variable_bits(&BitPattern::parse("xx"), 0, "field1"),
+                vec![BitPattern::parse("x0")]
             );
         }
 
@@ -1046,12 +1296,31 @@ mod tests {
                 "field1".to_string(),
                 FieldUses::VariableBits {
                     name: "field1".to_string(),
-                    pattern: BitPattern::parse("x1"),
+                    pattern: Some(BitPattern::parse("x1")),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
             assert_eq!(encodings.len(), 1);
             assert_eq!(encodings[0], BitPattern::parse("x1"));
+        }
+
+        #[test]
+        fn test_variable_bits_none_generates_no_encodings() {
+            let form = InstructionForm::new("form1").field(InstructionField::variable("field1", 2));
+            let mut field_values = HashMap::new();
+            field_values.insert(
+                "field1".to_string(),
+                FieldUses::VariableBits {
+                    name: "field1".to_string(),
+                    pattern: None,
+                    len: 2,
+                },
+            );
+
+            let encodings = form.fields_to_encodings(&field_values);
+
+            assert!(encodings.is_empty());
         }
 
         #[test]
@@ -1082,6 +1351,26 @@ mod tests {
         }
 
         #[test]
+        fn fields_to_encodings_splits_wildcard_uses_with_field_in_predicate() {
+            let form = InstructionForm::new("form1")
+                .field(InstructionField::variable("field1", 2).merge_mode_uses())
+                .when(field_in("field1", ["00", "10"]));
+            let mut field_values = HashMap::new();
+            field_values.insert(
+                "field1".to_string(),
+                FieldUses::Uses {
+                    name: "field1".to_string(),
+                    patterns: HashSet::from([BitPattern::parse("xx")]),
+                    len: 2,
+                },
+            );
+
+            let encodings = form.fields_to_encodings(&field_values);
+
+            assert_eq!(encodings, vec![BitPattern::parse("x0")]);
+        }
+
+        #[test]
         fn test_mixed() {
             let form = InstructionForm::new("form1")
                 .field(InstructionField::variable("field1", 2).merge_mode_uses())
@@ -1102,7 +1391,8 @@ mod tests {
                 "field2".to_string(),
                 FieldUses::VariableBits {
                     name: "field2".to_string(),
-                    pattern: BitPattern::parse("x"),
+                    pattern: Some(BitPattern::parse("x")),
+                    len: 1,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1133,7 +1423,8 @@ mod tests {
                 "field2".to_string(),
                 FieldUses::VariableBits {
                     name: "field2".to_string(),
-                    pattern: BitPattern::parse("xx"),
+                    pattern: Some(BitPattern::parse("xx")),
+                    len: 2,
                 },
             );
             field_values.insert(
@@ -1190,7 +1481,8 @@ mod tests {
                 "field2".to_string(),
                 FieldUses::VariableBits {
                     name: "field2".to_string(),
-                    pattern: BitPattern::parse("xx"),
+                    pattern: Some(BitPattern::parse("xx")),
+                    len: 2,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1277,7 +1569,8 @@ mod tests {
                 "field3".to_string(),
                 FieldUses::VariableBits {
                     name: "field3".to_string(),
-                    pattern: BitPattern::parse("x"),
+                    pattern: Some(BitPattern::parse("x")),
+                    len: 1,
                 },
             );
             let encodings = form.fields_to_encodings(&field_values);
@@ -1406,6 +1699,70 @@ mod tests {
             assert_eq!(len, 3);
             assert_eq!(patterns.len(), 1);
             assert!(patterns.contains(&BitPattern::parse("xxx")));
+        }
+
+        #[test]
+        fn test_merge_removes_subsumed_pattern() {
+            let field_uses = FieldUses::Uses {
+                name: "field1".to_string(),
+                patterns: [BitPattern::parse("0x"), BitPattern::parse("00")]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                len: 2,
+            };
+
+            assert_eq!(
+                field_uses.merge(),
+                FieldUses::Uses {
+                    name: "field1".to_string(),
+                    patterns: [BitPattern::parse("0x")].iter().cloned().collect(),
+                    len: 2,
+                }
+            );
+        }
+
+        #[test]
+        fn test_merge_removes_subsumed_pattern_after_merge_round() {
+            let field_uses = FieldUses::Uses {
+                name: "field1".to_string(),
+                patterns: [
+                    BitPattern::parse("00"),
+                    BitPattern::parse("01"),
+                    BitPattern::parse("0x"),
+                ]
+                .iter()
+                .cloned()
+                .collect(),
+                len: 2,
+            };
+
+            assert_eq!(
+                field_uses.merge(),
+                FieldUses::Uses {
+                    name: "field1".to_string(),
+                    patterns: [BitPattern::parse("0x")].iter().cloned().collect(),
+                    len: 2,
+                }
+            );
+        }
+
+        #[test]
+        fn test_merge_preserves_empty_variable_bits() {
+            let field_uses = FieldUses::VariableBits {
+                name: "field1".to_string(),
+                pattern: None,
+                len: 3,
+            };
+
+            assert_eq!(
+                field_uses.merge(),
+                FieldUses::VariableBits {
+                    name: "field1".to_string(),
+                    pattern: None,
+                    len: 3,
+                }
+            );
         }
     }
 }

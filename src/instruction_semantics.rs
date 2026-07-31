@@ -1690,11 +1690,7 @@ impl Expr {
     /// preserved; this method does not perform algebraic canonicalization or
     /// prior-state substitution.
     pub fn collapse(self, instruction: &DecodedInstruction) -> Self {
-        let derived_values = &instruction
-            .form
-            .as_ref()
-            .expect("DecodedInstruction.form must not be None")
-            .derived_values;
+        let derived_values = &instruction.form.derived_values;
 
         match self {
             constant @ Expr::Const { .. } => constant,
@@ -2407,8 +2403,8 @@ mod tests {
     /// Builds a decoded instruction with no fields or derived values.
     fn empty_instruction() -> DecodedInstruction {
         DecodedInstruction {
-            name: Some("test".to_owned()),
-            form: Some(InstructionForm::new("test")),
+            name: "test".to_owned(),
+            form: InstructionForm::new("test"),
             bits: Vec::new(),
             fields: Vec::new(),
         }

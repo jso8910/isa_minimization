@@ -321,21 +321,45 @@ pub struct Z3EquivalenceManager<'a> {
     left: Program,
     right: Program,
     isa: &'a ISA,
+    live_out_registers: Vec<ArchitecturalRegister>,
     timeout: Option<Duration>,
 }
 
 impl<'a> Z3EquivalenceManager<'a> {
     pub fn from_instructions(left: &Program, right: &Program, isa: &'a ISA) -> Self {
+        Self::from_instructions_with_live_out_registers(
+            left,
+            right,
+            isa,
+            Self::left_register_destinations(left, isa),
+        )
+    }
+
+    pub fn from_instructions_with_live_out_registers(
+        left: &Program,
+        right: &Program,
+        isa: &'a ISA,
+        live_out_registers: Vec<ArchitecturalRegister>,
+    ) -> Self {
         Self {
             left: left.clone(),
             right: right.clone(),
             isa,
+            live_out_registers,
             timeout: Some(Duration::from_millis(5_000)),
         }
     }
 
     pub fn from_left_instruction(left: &Program, isa: &'a ISA) -> Self {
         Self::from_instructions(left, left, isa)
+    }
+
+    pub fn from_left_instruction_with_live_out_registers(
+        left: &Program,
+        isa: &'a ISA,
+        live_out_registers: Vec<ArchitecturalRegister>,
+    ) -> Self {
+        Self::from_instructions_with_live_out_registers(left, left, isa, live_out_registers)
     }
 
     pub fn replace_right_instruction(&mut self, new_right: &Program) {
@@ -355,8 +379,12 @@ impl<'a> Z3EquivalenceManager<'a> {
 
         with_z3_config(&cfg, || {
             let initial = Z3State::new();
-            let (left_final, observations) = initial.execute_program(&self.left, self.isa, true);
-            let (right_final, _) = initial.execute_program(&self.right, self.isa, false);
+            let (left_final, mut observations) =
+                self.execute_program_observing(&initial, &self.left, Z3ObservationSide::Left);
+            let (right_final, right_observations) =
+                self.execute_program_observing(&initial, &self.right, Z3ObservationSide::Right);
+            observations.extend(right_observations);
+            observations.extend(self.live_out_register_observations());
             let solver = Solver::new();
 
             let differences =
@@ -404,6 +432,93 @@ impl<'a> Z3EquivalenceManager<'a> {
                 }
             })
             .collect()
+    }
+
+    fn execute_program_observing(
+        &self,
+        initial: &Z3State,
+        program: &Program,
+        side: Z3ObservationSide,
+    ) -> (Z3State, Vec<Z3Observation>) {
+        let mut state = initial.clone();
+        let mut observations = Vec::new();
+
+        for instruction in program.iter_instructions() {
+            let before = state.clone();
+            let mut after = state.clone();
+
+            for effect in instruction_effects(instruction, self.isa).iter().cloned() {
+                let effect = collapse_effect(effect, instruction);
+                if self.effect_destination_is_observable(&effect, side) {
+                    observations.push(Z3State::observe_effect_destination(&effect, &before));
+                }
+                after.apply_collapsed_effect(&effect, &before);
+            }
+
+            state = after;
+        }
+
+        (state, observations)
+    }
+
+    fn effect_destination_is_observable(&self, effect: &Effect, side: Z3ObservationSide) -> bool {
+        match effect {
+            Effect::WriteRegister { .. } => false,
+            Effect::WriteMemory { address, .. } => {
+                side == Z3ObservationSide::Left
+                    || !is_allowed_stack_scratch_address(address, self.isa)
+            }
+        }
+    }
+
+    fn live_out_register_observations(&self) -> Vec<Z3Observation> {
+        self.live_out_registers
+            .iter()
+            .map(|register| Z3Observation::Register {
+                selector: bv_const(
+                    register.identifier as u128,
+                    register.identifier_width.into(),
+                ),
+                width: register.width.into(),
+            })
+            .collect()
+    }
+
+    fn left_register_destinations(left: &Program, isa: &ISA) -> Vec<ArchitecturalRegister> {
+        let mut live_out_registers = Vec::new();
+        let mut seen = HashSet::new();
+        for instruction in left.iter_instructions() {
+            for effect in instruction_effects(instruction, isa).iter().cloned() {
+                let Effect::WriteRegister {
+                    register, value, ..
+                } = collapse_effect(effect, instruction)
+                else {
+                    continue;
+                };
+                let Some(identifier) = register_destination(&register) else {
+                    continue;
+                };
+                if !seen.insert(identifier) {
+                    continue;
+                }
+                live_out_registers.push(ArchitecturalRegister {
+                    identifier: identifier
+                        .try_into()
+                        .expect("architectural register identifiers should fit in u8"),
+                    identifier_width: register
+                        .expr_width()
+                        .expect("register selector should have width")
+                        .try_into()
+                        .expect("register identifier width should fit in u8"),
+                    width: value
+                        .expr_width()
+                        .expect("register write value should have width")
+                        .try_into()
+                        .expect("register value width should fit in u8"),
+                });
+            }
+        }
+        live_out_registers
     }
 
     fn model_to_machine_state(&self, model: &Z3Model, initial: &Z3State) -> MachineState {
@@ -626,39 +741,18 @@ enum Z3Observation {
     Memory { address: BV, width: u16 },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Z3ObservationSide {
+    Left,
+    Right,
+}
+
 impl Z3State {
     fn new() -> Self {
         Self {
             registers: HashMap::new(),
             memory: HashMap::new(),
         }
-    }
-
-    fn execute_program(
-        &self,
-        program: &Program,
-        isa: &ISA,
-        collect_observations: bool,
-    ) -> (Self, Vec<Z3Observation>) {
-        let mut state = self.clone();
-        let mut observations = Vec::new();
-
-        for instruction in program.iter_instructions() {
-            let before = state.clone();
-            let mut after = state.clone();
-
-            for effect in instruction_effects(instruction, isa).iter().cloned() {
-                let effect = collapse_effect(effect, instruction);
-                if collect_observations {
-                    observations.push(Self::observe_effect_destination(&effect, &before));
-                }
-                after.apply_collapsed_effect(&effect, &before);
-            }
-
-            state = after;
-        }
-
-        (state, observations)
     }
 
     fn observe_effect_destination(effect: &Effect, before: &Self) -> Z3Observation {
@@ -1132,7 +1226,7 @@ impl MachineState {
     /// the cost reg(self, other) = w_m + 2 * (width(R0) + w_{extra write}).
     ///
     /// In the calculation of the cost, not all registers and memory locations are included in the cost
-    ///     - Registers: all registers in self.registers, as well as those in protected_registers.
+    ///     - Registers: only registers in live_out_registers.
     ///       Other registers are scratch, and have arbitrary values
     ///     - Memory: all memory locations other than those within the stack indicated by the
     ///       StackPointer, as well as those in self.memory.
@@ -1141,12 +1235,12 @@ impl MachineState {
     pub fn compare(
         &self,
         other: &MachineState,
-        protected_registers: &[ArchitecturalRegister],
+        live_out_registers: &[ArchitecturalRegister],
         sp: &StackPointer,
         sp_val: u128,
     ) -> u32 {
         self.compute_memory_cost(other, sp, sp_val)
-            + self.compute_register_cost(other, protected_registers)
+            + self.compute_register_cost(other, live_out_registers)
     }
 
     fn compute_memory_cost(&self, other: &MachineState, sp: &StackPointer, sp_val: u128) -> u32 {
@@ -1194,18 +1288,12 @@ impl MachineState {
     fn compute_register_cost(
         &self,
         other: &MachineState,
-        protected_registers: &[ArchitecturalRegister],
+        live_out_registers: &[ArchitecturalRegister],
     ) -> u32 {
         let mut cost = 0;
-        let involved_registers: HashSet<u128> = self
-            .registers
-            .keys()
-            .copied()
-            .chain(
-                protected_registers
-                    .iter()
-                    .map(|register| register.identifier as u128),
-            )
+        let involved_registers: HashSet<u128> = live_out_registers
+            .iter()
+            .map(|register| register.identifier as u128)
             .collect();
 
         for (reg, val) in self
@@ -1313,6 +1401,101 @@ fn memory_location_is_stack_scratch(
             address >= stack_start && last_address <= stack_end
         }
     }
+}
+
+fn is_allowed_stack_scratch_address(address: &Expr, isa: &ISA) -> bool {
+    let Some((direction, offset)) = stack_pointer_relative_offset(address, isa.sp.register) else {
+        return false;
+    };
+
+    let stack_size = isa.sp.stack_size as u128;
+    if offset == 0 || offset > stack_size {
+        return false;
+    }
+
+    direction == isa.sp.direction
+}
+
+fn stack_pointer_relative_offset(
+    address: &Expr,
+    sp: ArchitecturalRegister,
+) -> Option<(StackDirection, u128)> {
+    if is_stack_pointer_value(address, sp) {
+        return Some((StackDirection::Upwards, 0));
+    }
+
+    match address {
+        Expr::Add(lhs, rhs) => sp_relative_add_offset(lhs, rhs, sp),
+        Expr::Sub(lhs, rhs) if is_stack_pointer_value(lhs, sp) => {
+            constant_value(rhs).map(|(value, _)| (StackDirection::Downwards, value))
+        }
+        _ => None,
+    }
+}
+
+fn sp_relative_add_offset(
+    lhs: &Expr,
+    rhs: &Expr,
+    sp: ArchitecturalRegister,
+) -> Option<(StackDirection, u128)> {
+    if is_stack_pointer_value(lhs, sp) {
+        constant_value(rhs).and_then(twos_complement_offset)
+    } else if is_stack_pointer_value(rhs, sp) {
+        constant_value(lhs).and_then(twos_complement_offset)
+    } else {
+        None
+    }
+}
+
+fn twos_complement_offset((value, width): (u128, u16)) -> Option<(StackDirection, u128)> {
+    let mask = checked_bit_mask(width)?;
+    let value = value & mask;
+    if value == 0 {
+        return Some((StackDirection::Upwards, 0));
+    }
+
+    let sign_bit = 1u128.checked_shl((width - 1) as u32)?;
+    if value & sign_bit == 0 {
+        Some((StackDirection::Upwards, value))
+    } else {
+        Some((StackDirection::Downwards, ((!value).wrapping_add(1)) & mask))
+    }
+}
+
+fn is_stack_pointer_value(expr: &Expr, sp: ArchitecturalRegister) -> bool {
+    match expr {
+        Expr::ReadRegister { register, .. } => register_destination(register)
+            .is_some_and(|destination| destination == sp.identifier as u128),
+        _ => false,
+    }
+}
+
+fn register_destination(register: &Expr) -> Option<u128> {
+    match register {
+        Expr::Const { value, .. } => Some(*value),
+        Expr::Operand(OperandRef::RegisterField(RegisterRef::Fixed { register, .. })) => {
+            Some(register.0 as u128)
+        }
+        _ => None,
+    }
+}
+
+fn constant_value(expr: &Expr) -> Option<(u128, u16)> {
+    match expr {
+        Expr::Const { value, width } => Some((*value, *width)),
+        _ => None,
+    }
+}
+
+fn checked_bit_mask(width: u16) -> Option<u128> {
+    if width == 0 || width > 128 {
+        return None;
+    }
+    Some(if width == 128 {
+        !0
+    } else {
+        (1u128 << width) - 1
+    })
 }
 
 fn bit_mask(width: u16) -> u128 {
@@ -3251,10 +3434,7 @@ fn collapse_effect_for_concrete_execution(
 }
 
 fn instruction_effects<'a>(instruction: &DecodedInstruction, isa: &'a ISA) -> &'a [Effect] {
-    let instruction_name = instruction
-        .name
-        .as_ref()
-        .expect("Instruction should have a name");
+    let instruction_name = &instruction.name;
     &isa.instructions
         .iter()
         .find(|candidate| candidate.name == *instruction_name)
@@ -3722,8 +3902,8 @@ mod tests {
 
     fn decoded(name: &str) -> DecodedInstruction {
         DecodedInstruction {
-            name: Some(name.to_owned()),
-            form: Some(InstructionForm::new(format!("{name}_form"))),
+            name: name.to_owned(),
+            form: InstructionForm::new(format!("{name}_form")),
             bits: Vec::new(),
             fields: Vec::new(),
         }
@@ -4048,18 +4228,19 @@ mod tests {
     fn machine_state_register_cost_counts_hamming_distance_for_same_register() {
         let left = machine_state(&[(0, BitWord::new(0b1010_1010, 8))], &[]);
         let right = machine_state(&[(0, BitWord::new(0b1111_0000, 8))], &[]);
+        let live_out = [test_arch_register(0, 8, 8)];
 
-        assert_eq!(left.compute_register_cost(&right, &[]), 4);
+        assert_eq!(left.compute_register_cost(&right, &live_out), 4);
     }
 
     #[test]
     fn machine_state_register_cost_rewards_matching_value_in_different_register_with_penalties() {
         let left = machine_state(&[(0, BitWord::new(0xab, 8))], &[]);
         let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
-        let protected = [test_arch_register(1, 8, 8)];
+        let live_out = [test_arch_register(0, 8, 8), test_arch_register(1, 8, 8)];
 
         assert_eq!(
-            left.compute_register_cost(&right, &protected),
+            left.compute_register_cost(&right, &live_out),
             WEIGHT_REGISTER_MISMATCH + (2 * (8 + WEIGHT_EXTRA_WRITE))
         );
     }
@@ -4068,20 +4249,20 @@ mod tests {
     fn machine_state_register_cost_counts_missing_write_as_all_bits_plus_penalty() {
         let left = machine_state(&[(0, BitWord::new(0xab, 8))], &[]);
         let right = MachineState::default();
-        let protected = [test_arch_register(0, 8, 8)];
+        let live_out = [test_arch_register(0, 8, 8)];
 
         assert_eq!(
-            left.compute_register_cost(&right, &[]),
+            left.compute_register_cost(&right, &live_out),
             8 + WEIGHT_EXTRA_WRITE
         );
         assert_eq!(
-            right.compute_register_cost(&left, &protected),
+            right.compute_register_cost(&left, &live_out),
             8 + WEIGHT_EXTRA_WRITE
         );
     }
 
     #[test]
-    fn machine_state_register_cost_ignores_unprotected_other_scratch_registers() {
+    fn machine_state_register_cost_ignores_non_live_out_other_scratch_registers() {
         let left = MachineState::default();
         let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
 
@@ -4089,15 +4270,44 @@ mod tests {
     }
 
     #[test]
-    fn machine_state_register_cost_includes_protected_other_registers() {
+    fn machine_state_register_cost_ignores_non_live_out_self_registers() {
+        let left = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
+        let right = MachineState::default();
+
+        assert_eq!(left.compute_register_cost(&right, &[]), 0);
+    }
+
+    #[test]
+    fn machine_state_register_cost_includes_live_out_other_registers() {
         let left = MachineState::default();
         let right = machine_state(&[(1, BitWord::new(0xab, 8))], &[]);
-        let protected = [test_arch_register(1, 8, 8)];
+        let live_out = [test_arch_register(1, 8, 8)];
 
         assert_eq!(
-            left.compute_register_cost(&right, &protected),
+            left.compute_register_cost(&right, &live_out),
             8 + WEIGHT_EXTRA_WRITE
         );
+    }
+
+    #[test]
+    fn machine_state_register_cost_only_counts_live_out_registers_present_in_both_states() {
+        let left = machine_state(
+            &[
+                (0, BitWord::new(0b1010_1010, 8)),
+                (1, BitWord::new(0b1100_1100, 8)),
+            ],
+            &[],
+        );
+        let right = machine_state(
+            &[
+                (0, BitWord::new(0b0101_0101, 8)),
+                (1, BitWord::new(0b1111_0000, 8)),
+            ],
+            &[],
+        );
+        let live_out = [test_arch_register(1, 8, 8)];
+
+        assert_eq!(left.compute_register_cost(&right, &live_out), 4);
     }
 
     #[test]
@@ -4135,10 +4345,7 @@ mod tests {
                             other_has_memory,
                         );
 
-                        let expected_register_cost = match (self_has_register, other_has_register) {
-                            (false, false) | (false, true) | (true, true) => 0,
-                            (true, false) => 8 + WEIGHT_EXTRA_WRITE,
-                        };
+                        let expected_register_cost = 0;
                         let expected_memory_cost = match (self_has_memory, other_has_memory) {
                             (false, false) | (true, true) => 0,
                             (true, false) | (false, true) => 8 + WEIGHT_EXTRA_WRITE,
@@ -4178,7 +4385,7 @@ mod tests {
         assert_eq!(
             left.compare(
                 &right,
-                &[],
+                &[test_arch_register(0, 8, 4)],
                 &compare_test_sp(StackDirection::Downwards),
                 compare_test_sp_val()
             ),
@@ -4968,6 +5175,115 @@ mod tests {
             execute_program_concrete(&unequal_right, &isa, &counterexample).registers[&0].value,
             2
         );
+    }
+
+    #[test]
+    fn z3_equivalence_manager_observes_only_live_out_registers() {
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction(
+                    "WRITE_R1_ONE",
+                    vec![Effect::write_register(reg(1), constant(1, 8))],
+                ),
+                isa_instruction(
+                    "WRITE_R1_TWO",
+                    vec![Effect::write_register(reg(1), constant(2, 8))],
+                ),
+            ],
+        );
+        let left = decoded_sequence(&["WRITE_R1_ONE"]);
+        let right = decoded_sequence(&["WRITE_R1_TWO"]);
+
+        let mut scratch_manager = Z3EquivalenceManager::from_instructions_with_live_out_registers(
+            &left,
+            &right,
+            &isa,
+            vec![],
+        );
+        assert_eq!(scratch_manager.compare_instructions(), BddEquality::Equal);
+
+        let mut live_out_manager = Z3EquivalenceManager::from_instructions_with_live_out_registers(
+            &left,
+            &right,
+            &isa,
+            vec![test_arch_register(1, 8, 8)],
+        );
+        assert!(matches!(
+            live_out_manager.compare_instructions(),
+            BddEquality::Unequal(_)
+        ));
+    }
+
+    #[test]
+    fn z3_equivalence_manager_uses_stack_scratch_memory_policy() {
+        let sp = Expr::ReadRegister {
+            register: Box::new(fixed_register(Register(254), 8)),
+            width: 32,
+        };
+        let stack_scratch_address = sub(sp, constant(4, 32));
+        let arbitrary_address = read_reg(0);
+        let isa = equivalence_test_isa(
+            8,
+            vec![
+                isa_instruction("NOP", vec![]),
+                isa_instruction(
+                    "STACK_SCRATCH",
+                    vec![Effect::write_memory(
+                        stack_scratch_address.clone(),
+                        constant(0xaa, 8),
+                        8,
+                    )],
+                ),
+                isa_instruction(
+                    "ARBITRARY_MEMORY",
+                    vec![Effect::write_memory(
+                        arbitrary_address,
+                        constant(0xaa, 8),
+                        8,
+                    )],
+                ),
+            ],
+        );
+        let empty = decoded_sequence(&["NOP"]);
+        let stack_scratch = decoded_sequence(&["STACK_SCRATCH"]);
+        let arbitrary_memory = decoded_sequence(&["ARBITRARY_MEMORY"]);
+
+        let mut right_scratch_manager =
+            Z3EquivalenceManager::from_instructions_with_live_out_registers(
+                &empty,
+                &stack_scratch,
+                &isa,
+                vec![],
+            );
+        assert_eq!(
+            right_scratch_manager.compare_instructions(),
+            BddEquality::Equal
+        );
+
+        let mut right_arbitrary_manager =
+            Z3EquivalenceManager::from_instructions_with_live_out_registers(
+                &empty,
+                &arbitrary_memory,
+                &isa,
+                vec![],
+            );
+        assert!(matches!(
+            right_arbitrary_manager.compare_instructions(),
+            BddEquality::Unequal(_)
+        ));
+
+        let mut left_scratch_manager =
+            Z3EquivalenceManager::from_instructions_with_live_out_registers(
+                &stack_scratch,
+                &empty,
+                &isa,
+                vec![],
+            );
+        assert!(matches!(
+            left_scratch_manager.compare_instructions(),
+            BddEquality::Unequal(_)
+        ));
     }
 
     #[test]

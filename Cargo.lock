@@ -587,6 +587,7 @@ dependencies = [
  "pest_derive",
  "petgraph",
  "rand 0.10.2",
+ "rayon",
  "regex",
  "rhai",
  "thiserror",

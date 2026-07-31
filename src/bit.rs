@@ -196,6 +196,18 @@ impl BitPattern {
         diff_count == 1
     }
 
+    /// Returns whether this pattern covers every concrete value covered by `other`.
+    pub fn covers(&self, other: &BitPattern) -> bool {
+        if self.bits.len() != other.bits.len() {
+            return false;
+        }
+
+        self.bits
+            .iter()
+            .zip(&other.bits)
+            .all(|(x, y)| *x == Bit::Var || x == y)
+    }
+
     pub fn merge_with(&self, other: &BitPattern) -> Self {
         assert!(
             self.can_merge_with(other),
@@ -282,10 +294,7 @@ impl BitPattern {
 
     /// Returns whether `self` covers `other`
     fn cube_covers(&self, other: &BitPattern) -> bool {
-        self.bits
-            .iter()
-            .zip(&other.bits)
-            .all(|(x, y)| *x == Bit::Var || x == y)
+        self.covers(other)
     }
 }
 
@@ -427,6 +436,25 @@ impl LookupTable {
 
         // Find the correct index in the LUT
         let index = self.get_index(operands);
+
+        self.truth_table[index]
+    }
+
+    pub fn evaluate_iter(&self, operands: impl IntoIterator<Item = Bit>) -> Bit {
+        let mut count = 0;
+        let mut index = 0;
+        for (i, val) in operands.into_iter().enumerate() {
+            let enc = match val {
+                Bit::Low => 0,
+                Bit::High => 1,
+                Bit::Var => 2,
+                Bit::Test => 3,
+            };
+            index |= enc << (2 * i);
+            count += 1;
+        }
+
+        assert_eq!(count, self.input_count, "Invalid number of operands");
 
         self.truth_table[index]
     }

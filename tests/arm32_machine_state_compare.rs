@@ -55,7 +55,8 @@ fn field_uses_from(program: &[DecodedInstruction]) -> HashMap<FieldName, FieldUs
                 },
                 MergeMode::VariableBits => FieldUses::VariableBits {
                     name: name.clone(),
-                    pattern: value.clone(),
+                    pattern: Some(value.clone()),
+                    len: value.len(),
                 },
             };
 
@@ -63,7 +64,11 @@ fn field_uses_from(program: &[DecodedInstruction]) -> HashMap<FieldName, FieldUs
                 FieldUses::Uses { patterns, .. } => {
                     patterns.insert(value.clone());
                 }
-                FieldUses::VariableBits { pattern, .. } => {
+                FieldUses::VariableBits { pattern, len, .. } => {
+                    assert_eq!(*len, value.len());
+                    let pattern = pattern
+                        .as_mut()
+                        .expect("observed VariableBits field should be populated");
                     assert_eq!(pattern.len(), value.len());
                     for (pattern_bit, value_bit) in pattern.bits.iter_mut().zip(&value.bits) {
                         if pattern_bit != value_bit {
@@ -76,6 +81,9 @@ fn field_uses_from(program: &[DecodedInstruction]) -> HashMap<FieldName, FieldUs
     }
 
     field_values
+        .into_iter()
+        .map(|(name, field_uses)| (name, field_uses.merge()))
+        .collect()
 }
 
 fn decode_one(bits: &str, isa: &ISA) -> DecodedInstruction {
@@ -122,7 +130,7 @@ fn program_from(instructions: Vec<DecodedInstruction>) -> Program {
 fn ctx_for_execute<'a>(
     isa: &'a ISA,
     original: Vec<DecodedInstruction>,
-    protected_registers: Vec<isa_minimization::isa_specification::ArchitecturalRegister>,
+    live_out_registers: Vec<isa_minimization::isa_specification::ArchitecturalRegister>,
 ) -> SuperoptimizationCtx<'a> {
     let valid_field_uses = field_uses_from(&original);
     SuperoptimizationCtx::new_from_single_instruction(
@@ -132,7 +140,7 @@ fn ctx_for_execute<'a>(
             .clone(),
         valid_field_uses,
         isa,
-        protected_registers,
+        live_out_registers,
     )
 }
 
@@ -157,10 +165,10 @@ fn execute_both(
     isa: &ISA,
     left: Vec<DecodedInstruction>,
     right: Vec<DecodedInstruction>,
-    protected_registers: Vec<isa_minimization::isa_specification::ArchitecturalRegister>,
+    live_out_registers: Vec<isa_minimization::isa_specification::ArchitecturalRegister>,
 ) -> (MachineState, MachineState, MachineState) {
     let counterexample = unequal_counterexample(isa, &left, &right);
-    let ctx = ctx_for_execute(isa, left.clone(), protected_registers);
+    let ctx = ctx_for_execute(isa, left.clone(), live_out_registers);
     let left = program_from(left);
     let right = program_from(right);
     let left_effects = instruction_seq_to_effects(&left, isa);
@@ -225,7 +233,7 @@ fn shared_memory_cost(left_state: &MachineState, right_state: &MachineState, add
 }
 
 #[test]
-fn bdd_counterexample_execute_test_and_compare_cover_scratch_and_protected_registers() {
+fn bdd_counterexample_execute_test_and_compare_cover_scratch_and_live_out_registers() {
     let isa = arm32_isa();
     let left = decoded_sequence(&isa, &[mov_imm(1, 1)]);
     let right = decoded_sequence(&isa, &[mov_imm(1, 2), mov_imm(8, 5)]);
@@ -244,13 +252,11 @@ fn bdd_counterexample_execute_test_and_compare_cover_scratch_and_protected_regis
     assert_eq!(register_value(&right_state, 1), BitWord::new(2, 32));
     assert_eq!(register_value(&right_state, 8), BitWord::new(5, 32));
 
-    let scratch_cost = left_state.compare(&right_state, &[], &isa.sp, 0);
-    let protected_cost = left_state.compare(&right_state, &[arm32::gpr(8)], &isa.sp, 0);
+    let scratch_cost = left_state.compare(&right_state, &[arm32::gpr(1)], &isa.sp, 0);
+    let live_out_cost =
+        left_state.compare(&right_state, &[arm32::gpr(1), arm32::gpr(8)], &isa.sp, 0);
     assert!(scratch_cost > 0);
-    assert_eq!(
-        protected_cost - scratch_cost,
-        32 + isa_minimization::constants::WEIGHT_EXTRA_WRITE
-    );
+    assert!(live_out_cost > scratch_cost);
 }
 
 #[test]
