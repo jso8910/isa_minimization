@@ -17,8 +17,8 @@ use isa_minimization::instruction_semantics::{
     sub_overflow, unsigned_less_than, xor_expr, zero_extend,
 };
 use isa_minimization::isa_specification::{
-    ArchitecturalRegister, DecodedField, DecodedInstruction, DerivedValue, FieldUses, ISA,
-    Instruction, InstructionField, InstructionForm, MergeMode, Predicate, StackDirection,
+    ArchitecturalRegister, BranchOffset, DecodedField, DecodedInstruction, DerivedValue, FieldUses,
+    ISA, Instruction, InstructionField, InstructionForm, MergeMode, Predicate, StackDirection,
     StackPointer, and, bit_eq, c, field_eq, field_in,
 };
 use isa_minimization::semantic_matching::instruction_seq_to_effects;
@@ -975,12 +975,13 @@ fn block_tfr_effects(mode: TransferMode) -> Vec<Effect> {
 }
 
 fn branch_target() -> Expr {
-    add(
-        true_pc(),
-        sign_extend(
-            concat([immediate_field("branch_offset"), constant(0, 2)]),
-            32,
-        ),
+    add(true_pc(), branch_pc_relative_offset())
+}
+
+fn branch_pc_relative_offset() -> Expr {
+    sign_extend(
+        concat([immediate_field("branch_offset"), constant(0, 2)]),
+        32,
     )
 }
 
@@ -1630,7 +1631,8 @@ pub fn dproc_s1_imm_op2() -> Instruction {
 }
 
 pub fn branch_ops_dproc() -> Instruction {
-    let mut instruction = Instruction::new("branch_ops_dproc", 32);
+    let mut instruction =
+        Instruction::new("branch_ops_dproc", 32).branch_instruction(BranchOffset::Register);
     for set_flags_bits in [BIT_CLEAR, BIT_SET] {
         for (mnemonic, opcode_bits) in DPROC_RESULT_OPCODES {
             let form_prefix = if set_flags_bits == BIT_SET {
@@ -1764,12 +1766,14 @@ pub fn swap_ops() -> Instruction {
 
 pub fn bx() -> Instruction {
     with_effects(
-        Instruction::new("bx", 32).form(
-            InstructionForm::new("base")
-                .fields([cond(), c(ENC_BX_FIXED), rn_addr()])
-                .derived_value(dv("target", read_register_field("rn_addr", 32)))
-                .when(cond_valid_predicate()),
-        ),
+        Instruction::new("bx", 32)
+            .branch_instruction(BranchOffset::Register)
+            .form(
+                InstructionForm::new("base")
+                    .fields([cond(), c(ENC_BX_FIXED), rn_addr()])
+                    .derived_value(dv("target", read_register_field("rn_addr", 32)))
+                    .when(cond_valid_predicate()),
+            ),
         bx_effects(),
     )
 }
@@ -1953,6 +1957,7 @@ pub fn branch_ops_hwtfr() -> Instruction {
             ),
         ]),
     )
+    .branch_instruction(BranchOffset::Register)
 }
 
 fn data_tfr_register_offset_form(
@@ -2084,6 +2089,7 @@ pub fn branch_ops_data_tfr() -> Instruction {
         BIT_SET,
         field_eq("rd_addr", REG_PC_BITS),
     )
+    .branch_instruction(BranchOffset::Register)
 }
 
 fn block_tfr_form(is_load_block_bits: &'static str, extra_predicate: Predicate) -> InstructionForm {
@@ -2131,17 +2137,20 @@ pub fn block_store_ops() -> Instruction {
 
 pub fn branch_ops_block_tfr() -> Instruction {
     block_tfr_category("branch_ops_block_tfr", BIT_SET, bit_eq(16, Bit::High))
+        .branch_instruction(BranchOffset::Register)
 }
 
 pub fn b() -> Instruction {
     with_effects(
-        Instruction::new("b", 32).form(
-            InstructionForm::new("base")
-                .fields([cond(), c(ENC_BRANCH_CLASS), do_link(), branch_offset()])
-                .derived_value(dv("target", branch_target()))
-                .derived_value(dv("link_value", sub(true_pc(), constant(4, 32))))
-                .when(cond_valid_predicate()),
-        ),
+        Instruction::new("b", 32)
+            .branch_instruction(BranchOffset::PCRelative(branch_pc_relative_offset()))
+            .form(
+                InstructionForm::new("base")
+                    .fields([cond(), c(ENC_BRANCH_CLASS), do_link(), branch_offset()])
+                    .derived_value(dv("target", branch_target()))
+                    .derived_value(dv("link_value", sub(true_pc(), constant(4, 32))))
+                    .when(cond_valid_predicate()),
+            ),
         branch_effects(),
     )
 }
@@ -2150,6 +2159,10 @@ pub fn branch_ops_b() -> Instruction {
     let mut instruction = b();
     instruction.name = "branch_ops_b".to_string();
     instruction
+}
+
+pub fn pc_to_instruction_index(pc_value: u128, _program: Vec<DecodedInstruction>) -> u32 {
+    ((pc_value - 8) / 4) as u32
 }
 
 pub fn instructions() -> Vec<Instruction> {
@@ -2298,6 +2311,7 @@ fn main() {
             direction: StackDirection::Downwards,
         },
         pc: gpr(15),
+        pc_to_instruction_index,
     };
 
     let decoded_program: Vec<DecodedInstruction> =

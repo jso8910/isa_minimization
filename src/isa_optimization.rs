@@ -1566,6 +1566,7 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: register,
+            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
         }
     }
 

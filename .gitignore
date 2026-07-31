@@ -4,3 +4,4 @@
 .z3-trace
 /greenthumb/arm/restriction-superopt/output/
 /greenthumb/arm/restriction-superopt/generated/*/out/
+/tmp

@@ -17,6 +17,7 @@ fn arm32_isa() -> ISA {
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
+        pc_to_instruction_index: arm32::pc_to_instruction_index,
     }
 }
 

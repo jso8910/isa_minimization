@@ -7,7 +7,7 @@ use crate::instruction_semantics::{Effect, Expr, FieldName, ValueName};
 
 use super::bit::{Bit, BitPattern};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ISA {
     pub registers: Vec<ArchitecturalRegister>,
     pub instructions: Vec<Instruction>,
@@ -17,6 +17,14 @@ pub struct ISA {
     /// does not literally use a GPR as the PC, it should be
     /// defined as an ArchitecturalRegister)
     pub pc: ArchitecturalRegister,
+    /// A function which converts a PC value into an index within a program, given the PC value
+    /// (u128) and the program (Vec<DecodedInstruction>). For ARM32, this is as simple as taking the
+    /// PC value, subtracting 8 (to account for prefetch), and dividing by 4
+    pub pc_to_instruction_index: fn(u128, Vec<DecodedInstruction>) -> u32,
+}
+
+pub fn linear_pc_to_instruction_index(pc_value: u128, _program: Vec<DecodedInstruction>) -> u32 {
+    pc_value as u32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +82,17 @@ pub struct ArchitecturalRegister {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchOffset {
+    /// Adds the value in the Expr to the current PC (the add(pc, ...) need not be included, it is implied)
+    /// It is assumed that the PC should be the same width as the Expr. As such, if there is a
+    /// negative offset, Expr merely needs to be correctly sign extended.
+    PCRelative(Expr),
+    /// Indicates a register branch. It is assumed that all registers are live-out if there is a
+    /// register branch
+    Register,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
     pub name: String,
     pub width: usize,
@@ -84,6 +103,12 @@ pub struct Instruction {
     /// Each instruction has a set of effects which occur. An instruction should never
     /// have two effects which could possibly write to the same location.
     pub effects: Vec<Effect>,
+
+    /// Branch instruction. Some if this instruction modifies the PC
+    /// Note that this means branch instructions and any PC-modifying instructions necessarily must
+    /// be fully separate from other instructions.
+    /// This is used for basic block analysis.
+    pub branch_instruction: Option<BranchOffset>,
 }
 
 impl Instruction {
@@ -93,7 +118,13 @@ impl Instruction {
             width,
             forms: Vec::new(),
             effects: Vec::new(),
+            branch_instruction: None,
         }
+    }
+
+    pub fn branch_instruction(mut self, branch_instruction: BranchOffset) -> Self {
+        self.branch_instruction = Some(branch_instruction);
+        self
     }
 
     pub fn form(mut self, form: InstructionForm) -> Self {
@@ -909,6 +940,7 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: reg,
+            pc_to_instruction_index: linear_pc_to_instruction_index,
         }
     }
 

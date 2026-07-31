@@ -3964,6 +3964,7 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: test_arch_register(253, 8, 32),
+            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
         }
     }
 

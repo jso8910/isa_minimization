@@ -1744,6 +1744,7 @@ mod tests {
                 direction,
             },
             pc: arch_register(PC_ID),
+            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
         }
     }
 

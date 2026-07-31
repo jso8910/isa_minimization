@@ -8,8 +8,8 @@ use isa_minimization::{
     bit::{Bit, BitPattern},
     instruction_semantics::FieldName,
     isa_specification::{
-        ArchitecturalRegister, DecodedField, DecodedInstruction, FieldUses, ISA, MergeMode,
-        StackDirection, StackPointer, instruction_valid_under_field_uses,
+        ArchitecturalRegister, BranchOffset, DecodedField, DecodedInstruction, FieldUses, ISA,
+        MergeMode, StackDirection, StackPointer, instruction_valid_under_field_uses,
     },
     superoptimization::SuperoptimizationCtx,
 };
@@ -58,6 +58,7 @@ fn arm32_isa_with_instructions(
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
+        pc_to_instruction_index: arm32::pc_to_instruction_index,
     }
 }
 
@@ -517,6 +518,43 @@ fn arm32_pc_writing_forms_decode_as_branch_ops_when_valid() {
         &isa,
         "branch_ops_block_tfr",
     );
+}
+
+#[test]
+fn arm32_branch_ops_carry_branch_metadata() {
+    let isa = arm32_isa();
+
+    let metadata = isa
+        .instructions
+        .iter()
+        .map(|instruction| (instruction.name.as_str(), &instruction.branch_instruction))
+        .collect::<HashMap<_, _>>();
+
+    assert!(matches!(
+        metadata["branch_ops_b"],
+        Some(BranchOffset::PCRelative(_))
+    ));
+    for name in [
+        "branch_ops_bx",
+        "branch_ops_dproc",
+        "branch_ops_data_tfr",
+        "branch_ops_hwtfr",
+        "branch_ops_block_tfr",
+    ] {
+        assert_eq!(metadata[name], &Some(BranchOffset::Register), "{name}");
+    }
+    assert_eq!(metadata["load_ops"], &None);
+    assert_eq!(metadata["store_ops"], &None);
+}
+
+#[test]
+fn arm32_pc_values_map_to_prefetched_instruction_indexes() {
+    let isa = arm32_isa();
+    let program = Vec::new();
+
+    assert_eq!((isa.pc_to_instruction_index)(8, program.clone()), 0);
+    assert_eq!((isa.pc_to_instruction_index)(12, program.clone()), 1);
+    assert_eq!((isa.pc_to_instruction_index)(24, program), 4);
 }
 
 #[test]
