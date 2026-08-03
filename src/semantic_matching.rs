@@ -1498,7 +1498,7 @@ fn checked_bit_mask(width: u16) -> Option<u128> {
     })
 }
 
-fn bit_mask(width: u16) -> u128 {
+pub fn bit_mask(width: u16) -> u128 {
     assert!(
         width > 0 && width <= 128,
         "Bit-vector width must be in 1..=128"
@@ -3906,6 +3906,7 @@ mod tests {
             form: InstructionForm::new(format!("{name}_form")),
             bits: Vec::new(),
             fields: Vec::new(),
+            branch_instruction: None,
         }
     }
 
@@ -3965,6 +3966,7 @@ mod tests {
             },
             pc: test_arch_register(253, 8, 32),
             pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
+            instruction_index_to_pc: crate::isa_specification::linear_instruction_index_to_pc,
         }
     }
 

@@ -888,7 +888,7 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
     fn mutate_active_forms(
         &mut self,
         instruction_name: &str,
-        mut active_forms: HashSet<String>,
+        _active_forms: HashSet<String>,
     ) -> HashSet<String> {
         // Either add or remove an active form, proportional to the total number of forms
         let instruction = self
@@ -1567,6 +1567,7 @@ mod tests {
             },
             pc: register,
             pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
+            instruction_index_to_pc: crate::isa_specification::linear_instruction_index_to_pc,
         }
     }
 
@@ -3239,7 +3240,8 @@ mod tests {
     }
 
     #[test]
-    fn mutate_active_forms_adds_a_valid_form_when_none_are_active() {
+    fn mutate_active_forms_resamples_valid_subset_when_none_are_active() {
+        let valid_forms = HashSet::from(["base".to_string(), "inactive".to_string()]);
         let mut manager = manager_with(
             isa_with_instructions(vec![two_form_instruction()]),
             StdRng::seed_from_u64(0x7500),
@@ -3249,15 +3251,16 @@ mod tests {
 
         let mutated = manager.mutate_active_forms("INST", HashSet::new());
 
-        assert_eq!(mutated.len(), 1);
         assert!(
-            mutated.contains("base") || mutated.contains("inactive"),
-            "mutated form set should contain a real instruction form"
+            mutated.iter().all(|form| valid_forms.contains(form)),
+            "mutate_active_forms returned an unknown form: {mutated:?}"
         );
+        assert!(mutated.len() <= valid_forms.len());
     }
 
     #[test]
-    fn mutate_active_forms_removes_a_form_when_all_forms_are_active() {
+    fn mutate_active_forms_resamples_valid_subset_when_all_forms_are_active() {
+        let valid_forms = HashSet::from(["base".to_string(), "inactive".to_string()]);
         let mut manager = manager_with(
             isa_with_instructions(vec![two_form_instruction()]),
             StdRng::seed_from_u64(0x7501),
@@ -3268,8 +3271,11 @@ mod tests {
 
         let mutated = manager.mutate_active_forms("INST", active_forms);
 
-        assert_eq!(mutated.len(), 1);
-        assert!(mutated.contains("base") || mutated.contains("inactive"));
+        assert!(
+            mutated.iter().all(|form| valid_forms.contains(form)),
+            "mutate_active_forms returned an unknown form: {mutated:?}"
+        );
+        assert!(mutated.len() <= valid_forms.len());
     }
 
     #[test]
@@ -3294,11 +3300,13 @@ mod tests {
     }
 
     #[test]
-    fn mutate_active_forms_samples_add_and_remove_for_partially_active_forms() {
-        let mut saw_add = false;
-        let mut saw_remove = false;
+    fn mutate_active_forms_samples_empty_partial_and_full_subsets() {
+        let valid_forms = HashSet::from(["base".to_string(), "inactive".to_string()]);
+        let mut saw_empty = false;
+        let mut saw_partial = false;
+        let mut saw_full = false;
 
-        for seed in 0..256 {
+        for seed in 0..512 {
             let mut manager = manager_with(
                 isa_with_instructions(vec![two_form_instruction()]),
                 StdRng::seed_from_u64(seed),
@@ -3307,19 +3315,25 @@ mod tests {
             );
             let mutated = manager.mutate_active_forms("INST", HashSet::from(["base".to_string()]));
 
+            assert!(
+                mutated.iter().all(|form| valid_forms.contains(form)),
+                "mutate_active_forms returned an unknown form: {mutated:?}"
+            );
             match mutated.len() {
-                0 => saw_remove = true,
-                2 => saw_add = true,
-                len => panic!("expected add or remove from one active form, got len {len}"),
+                0 => saw_empty = true,
+                1 => saw_partial = true,
+                2 => saw_full = true,
+                len => panic!("expected at most two active forms, got len {len}"),
             }
 
-            if saw_add && saw_remove {
+            if saw_empty && saw_partial && saw_full {
                 break;
             }
         }
 
-        assert!(saw_add, "expected some seed to add an active form");
-        assert!(saw_remove, "expected some seed to remove an active form");
+        assert!(saw_empty, "expected some seed to sample no active forms");
+        assert!(saw_partial, "expected some seed to sample one active form");
+        assert!(saw_full, "expected some seed to sample all active forms");
     }
 
     #[test]
@@ -3359,7 +3373,8 @@ mod tests {
     }
 
     #[test]
-    fn mutate_can_change_field_uses_and_active_forms_in_one_call() {
+    fn mutate_can_change_field_uses_and_resample_active_forms_in_one_call() {
+        let valid_forms = HashSet::from(["base".to_string(), "inactive".to_string()]);
         let mut manager = manager_with(
             isa_with_instructions(vec![two_form_instruction()]),
             StdRng::seed_from_u64(0x7601),
@@ -3376,8 +3391,15 @@ mod tests {
         let mutated = manager.mutate(original.clone());
 
         assert_ne!(mutated.valid_field_uses, original.valid_field_uses);
-        assert_ne!(mutated.active_forms, original.active_forms);
-        assert!(mutated.active_forms.contains_key("INST"));
+        let mutated_forms = mutated
+            .active_forms
+            .get("INST")
+            .expect("mutated candidate should preserve the instruction active_forms key");
+        assert!(
+            mutated_forms.iter().all(|form| valid_forms.contains(form)),
+            "mutate active forms returned an unknown form: {mutated_forms:?}"
+        );
+        assert!(mutated_forms.len() <= valid_forms.len());
     }
 
     #[test]

@@ -8,3 +8,7 @@ marked with `InstructionField::register_read()`,
 `InstructionField::register_write()`, or
 `InstructionField::register_read_write()` are not selectable genes. Examples
 include ARM register operand selectors such as `Rn`, `Rm`, `Rd`, and `Rs`.
+
+## Greenthumb
+
+ISA notes: superoptimization must reject instructions which modify the PC.

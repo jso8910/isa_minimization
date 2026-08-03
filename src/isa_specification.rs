@@ -19,12 +19,24 @@ pub struct ISA {
     pub pc: ArchitecturalRegister,
     /// A function which converts a PC value into an index within a program, given the PC value
     /// (u128) and the program (Vec<DecodedInstruction>). For ARM32, this is as simple as taking the
-    /// PC value, subtracting 8 (to account for prefetch), and dividing by 4
-    pub pc_to_instruction_index: fn(u128, Vec<DecodedInstruction>) -> u32,
+    /// PC value and dividing by 4.
+    pub pc_to_instruction_index: fn(u128, &Vec<DecodedInstruction>) -> u32,
+    /// A function which converts an index within a program into its corresponding PC value. This
+    /// function should return the value that would be architecturally (ie the value used in
+    /// calculations when doing branch operations with offsets) visible inside the PC. For example,
+    /// in ARM32, the value is index * 4 + 8
+    pub instruction_index_to_pc: fn(u32, &Vec<DecodedInstruction>) -> u128,
 }
 
-pub fn linear_pc_to_instruction_index(pc_value: u128, _program: Vec<DecodedInstruction>) -> u32 {
+pub fn linear_pc_to_instruction_index(pc_value: u128, _program: &Vec<DecodedInstruction>) -> u32 {
     pc_value as u32
+}
+
+pub fn linear_instruction_index_to_pc(
+    instruction_index: u32,
+    _program: &Vec<DecodedInstruction>,
+) -> u128 {
+    instruction_index as u128
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,21 +86,31 @@ pub enum StackDirection {
 /// As such, you likely shouldn't mess with identifier width and sparsely
 /// defining register identifiers unless you're using fixed register identifiers.
 /// Register identifiers should never be sparse at an accessible level from the ISA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArchitecturalRegister {
     pub identifier: u8,
     pub identifier_width: u8,
     pub width: u8,
 }
 
+/// Enum which describes the two supported methods of PC modifications. If your program uses any
+/// other methods, the superoptimization of the program won't work very well, as live-out registers
+/// won't be properly identified.
+/// Importantly, in the genetic algorithm, the instructions which support these must be unrestricted
+/// - ie able to take any values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchOffset {
     /// Adds the value in the Expr to the current PC (the add(pc, ...) need not be included, it is implied)
     /// It is assumed that the PC should be the same width as the Expr. As such, if there is a
     /// negative offset, Expr merely needs to be correctly sign extended.
+    /// The Expr must evaluate to a Const when collapsed with a decoded instruction
     PCRelative(Expr),
     /// Indicates a register branch. It is assumed that all registers are live-out if there is a
-    /// register branch
+    /// register branch. It is also assumed that a Register branch is to a location which is either
+    /// itself immediately after a branch instruction and thus already inferred to be the start of a
+    /// basic block (eg bx lr always branches to the instruction right after a `bl` instruction), or is
+    /// branched to by some other piece of code. If this isn't the case, basic block analysis will not
+    /// work properly, and there may be bugs in the final program.
     Register,
 }
 
@@ -165,6 +187,7 @@ impl Instruction {
                 form: form.clone(),
                 bits: bits.to_vec(),
                 fields: Vec::new(),
+                branch_instruction: self.branch_instruction.clone(),
             };
             let mut matches = true;
 
@@ -211,6 +234,7 @@ pub struct DecodedInstruction {
     pub form: InstructionForm,
     pub bits: Vec<Bit>,
     pub fields: Vec<DecodedField>,
+    pub branch_instruction: Option<BranchOffset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -941,6 +965,7 @@ mod tests {
             },
             pc: reg,
             pc_to_instruction_index: linear_pc_to_instruction_index,
+            instruction_index_to_pc: linear_instruction_index_to_pc,
         }
     }
 
@@ -993,6 +1018,7 @@ mod tests {
             form,
             bits: BitPattern::parse("101011").bits,
             fields,
+            branch_instruction: None,
         }
     }
 

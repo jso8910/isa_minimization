@@ -2161,8 +2161,15 @@ pub fn branch_ops_b() -> Instruction {
     instruction
 }
 
-pub fn pc_to_instruction_index(pc_value: u128, _program: Vec<DecodedInstruction>) -> u32 {
-    ((pc_value - 8) / 4) as u32
+/// Subtracting 8 is NOT needed because this function is used to
+/// find the instruction which would execute next if the PC was set to a certain value. So if PC
+/// was, for example, set to 0, the instruction index would also be 0
+pub fn pc_to_instruction_index(pc_value: u128, _program: &Vec<DecodedInstruction>) -> u32 {
+    (pc_value / 4) as u32
+}
+
+pub fn instruction_index_to_pc(instruction_index: u32, _program: &Vec<DecodedInstruction>) -> u128 {
+    instruction_index as u128 * 4 + 8
 }
 
 pub fn instructions() -> Vec<Instruction> {
@@ -2312,6 +2319,7 @@ fn main() {
         },
         pc: gpr(15),
         pc_to_instruction_index,
+        instruction_index_to_pc,
     };
 
     let decoded_program: Vec<DecodedInstruction> =

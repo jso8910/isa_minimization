@@ -59,6 +59,7 @@ fn arm32_isa_with_instructions(
         },
         pc: arm32::gpr(15),
         pc_to_instruction_index: arm32::pc_to_instruction_index,
+        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 
@@ -428,7 +429,7 @@ fn arm32_categorized_dproc_decodes_to_expected_buckets() {
             "1110", "00", "1", "0100", "0", "0000", "0001", "0000", "00000001",
         ]),
         &isa,
-        "arithmetic_s0",
+        "arithmetic_s0_imm_op2",
     );
     // AND r1, r0, #1
     assert_decodes_as(
@@ -436,7 +437,7 @@ fn arm32_categorized_dproc_decodes_to_expected_buckets() {
             "1110", "00", "1", "0000", "0", "0000", "0001", "0000", "00000001",
         ]),
         &isa,
-        "logical_s0",
+        "logical_s0_imm_op2",
     );
     // MOV r1, #1
     assert_decodes_as(
@@ -444,7 +445,7 @@ fn arm32_categorized_dproc_decodes_to_expected_buckets() {
             "1110", "00", "1", "1101", "0", "0000", "0001", "0000", "00000001",
         ]),
         &isa,
-        "move_s0",
+        "move_s0_imm_op2",
     );
     // ADDS r1, r0, #1
     assert_decodes_as(
@@ -452,7 +453,7 @@ fn arm32_categorized_dproc_decodes_to_expected_buckets() {
             "1110", "00", "1", "0100", "1", "0000", "0001", "0000", "00000001",
         ]),
         &isa,
-        "dproc_s1",
+        "dproc_s1_imm_op2",
     );
     // CMP r0, #1
     assert_decodes_as(
@@ -460,7 +461,7 @@ fn arm32_categorized_dproc_decodes_to_expected_buckets() {
             "1110", "00", "1", "1010", "1", "0000", "0000", "0000", "00000001",
         ]),
         &isa,
-        "dproc_s1",
+        "dproc_s1_imm_op2",
     );
 }
 
@@ -545,16 +546,32 @@ fn arm32_branch_ops_carry_branch_metadata() {
     }
     assert_eq!(metadata["load_ops"], &None);
     assert_eq!(metadata["store_ops"], &None);
+
+    let decoded_b = decode_one(
+        &bits(&["1110", "101", "0", "000000000000000000000000"]),
+        &isa,
+    );
+    assert!(matches!(
+        decoded_b.branch_instruction,
+        Some(BranchOffset::PCRelative(_))
+    ));
+
+    let decoded_bx = decode_one(&bits(&["1110", "000100101111111111110001", "0000"]), &isa);
+    assert_eq!(decoded_bx.branch_instruction, Some(BranchOffset::Register));
 }
 
 #[test]
-fn arm32_pc_values_map_to_prefetched_instruction_indexes() {
+fn arm32_pc_values_map_to_instruction_addresses_and_prefetched_reads() {
     let isa = arm32_isa();
     let program = Vec::new();
 
-    assert_eq!((isa.pc_to_instruction_index)(8, program.clone()), 0);
-    assert_eq!((isa.pc_to_instruction_index)(12, program.clone()), 1);
-    assert_eq!((isa.pc_to_instruction_index)(24, program), 4);
+    assert_eq!((isa.pc_to_instruction_index)(0, &program), 0);
+    assert_eq!((isa.pc_to_instruction_index)(4, &program), 1);
+    assert_eq!((isa.pc_to_instruction_index)(16, &program), 4);
+
+    assert_eq!((isa.instruction_index_to_pc)(0, &program), 8);
+    assert_eq!((isa.instruction_index_to_pc)(1, &program), 12);
+    assert_eq!((isa.instruction_index_to_pc)(4, &program), 24);
 }
 
 #[test]

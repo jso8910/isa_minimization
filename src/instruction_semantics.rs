@@ -2407,6 +2407,7 @@ mod tests {
             form: InstructionForm::new("test"),
             bits: Vec::new(),
             fields: Vec::new(),
+            branch_instruction: None,
         }
     }
 
