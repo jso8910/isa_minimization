@@ -3,6 +3,7 @@ mod arm32;
 
 use std::{
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -24,6 +25,8 @@ struct Case {
     size: u32,
     timeout: u32,
     hard: bool,
+    require_discovered: bool,
+    mode: &'static str,
     stack_scratch: Option<StackScratch>,
 }
 
@@ -61,6 +64,11 @@ fn generate_cases(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         fs::write(case_dir.join("input.s"), ensure_newline(case.input))?;
         fs::write(case_dir.join("input.s.info"), ensure_newline(case.live_out))?;
+        match fs::remove_file(case_dir.join("inputs")) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(Box::new(err)),
+        }
 
         let restrictions = base_restrictions
             .clone()
@@ -108,12 +116,14 @@ fn expected_metadata(case: &Case) -> String {
     };
 
     format!(
-        "((name \"{}\")\n (hard {})\n (timeout {})\n (size {})\n (workers 4)\n {}\n (expected-shape \"{}\")\n (forbidden-opcodes {}))\n",
+        "((name \"{}\")\n (hard {})\n (timeout {})\n (size {})\n (workers 4)\n {}\n (require-discovered {})\n (mode \"{}\")\n (expected-shape \"{}\")\n (forbidden-opcodes {}))\n",
         case.name,
         racket_bool(case.hard),
         case.timeout,
         case.size,
         stack_scratch,
+        racket_bool(case.require_discovered),
+        escape(case.mode),
         escape(case.expected_shape),
         racket_string_list(&case.forbidden_opcodes),
     )
@@ -157,6 +167,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -175,6 +187,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -187,6 +201,8 @@ fn cases() -> Vec<Case> {
             size: 1,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -199,6 +215,8 @@ fn cases() -> Vec<Case> {
             size: 1,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -211,6 +229,8 @@ fn cases() -> Vec<Case> {
             size: 1,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -223,6 +243,8 @@ fn cases() -> Vec<Case> {
             size: 1,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -235,6 +257,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -247,6 +271,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -259,6 +285,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -271,6 +299,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -283,6 +313,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -295,6 +327,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -307,6 +341,8 @@ fn cases() -> Vec<Case> {
             size: 1,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -319,6 +355,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -331,6 +369,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -343,6 +383,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -355,6 +397,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 60,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -373,6 +417,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -385,6 +431,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -397,6 +445,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -409,6 +459,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -421,6 +473,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -433,6 +487,8 @@ fn cases() -> Vec<Case> {
             size: 8,
             timeout: 300,
             hard: true,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -445,6 +501,8 @@ fn cases() -> Vec<Case> {
             size: 8,
             timeout: 300,
             hard: true,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -457,6 +515,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 120,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -469,6 +529,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 120,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -481,6 +543,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 180,
             hard: true,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -493,6 +557,8 @@ fn cases() -> Vec<Case> {
             size: 2,
             timeout: 180,
             hard: true,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: None,
         },
         Case {
@@ -505,6 +571,8 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 90,
             hard: false,
+            require_discovered: false,
+            mode: "syn",
             stack_scratch: Some(StackScratch {
                 register: 12,
                 size: 32,
@@ -521,6 +589,40 @@ fn cases() -> Vec<Case> {
             size: 3,
             timeout: 180,
             hard: true,
+            require_discovered: false,
+            mode: "syn",
+            stack_scratch: None,
+        },
+        Case {
+            name: "31_pc_read_middle_of_independent_sequence",
+            input: "add r1, r1, r0
+eor r4, r4, r5
+add r2, r2, r15
+add r3, r3, r0
+eor r6, r6, r7",
+            live_out: "2",
+            denies: vec![],
+            forbidden_opcodes: vec![],
+            expected_shape: "two-instruction replacement must preserve the original index-2 PC read, e.g. by compensating if the PC read moves",
+            size: 2,
+            timeout: 180,
+            hard: false,
+            require_discovered: false,
+            mode: "syn",
+            stack_scratch: None,
+        },
+        Case {
+            name: "32_pop_pc_without_pop",
+            input: "pop {r0, r1, r2, pc}",
+            live_out: "0,1,2",
+            denies: vec![block_load_transfer()],
+            forbidden_opcodes: vec!["pop", "ldm"],
+            expected_shape: "ldr r0, [sp], #4; ldr r1, [sp], #4; ldr r2, [sp], #4",
+            size: 4,
+            timeout: 180,
+            hard: true,
+            require_discovered: true,
+            mode: "syn",
             stack_scratch: None,
         },
     ]
@@ -576,6 +678,10 @@ fn swap() -> &'static str {
 
 fn block_transfer() -> &'static str {
     "xxxx100xxxxxxxxxxxxxxxxxxxxxxxxx"
+}
+
+fn block_load_transfer() -> &'static str {
+    "xxxx100xxxx1xxxxxxxxxxxxxxxxxxxx"
 }
 
 fn bit(value: bool) -> char {

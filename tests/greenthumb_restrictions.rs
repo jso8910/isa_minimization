@@ -104,8 +104,10 @@ fn generated_restriction_superopt_fixtures_are_well_formed() {
         assert!(expected.contains("(workers 4)"));
     }
 
-    assert_eq!(cases.len(), 30);
+    assert_eq!(cases.len(), 32);
     assert!(cases.contains("23_word_load_from_bytes"));
     assert!(cases.contains("24_word_store_from_bytes"));
     assert!(cases.contains("29_stack_scratch_store"));
+    assert!(cases.contains("31_pc_read_middle_of_independent_sequence"));
+    assert!(cases.contains("32_pop_pc_without_pop"));
 }

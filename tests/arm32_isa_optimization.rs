@@ -26,7 +26,7 @@ fn arm32_isa() -> ISA {
 #[ignore = "runs the genetic ISA optimizer and prints progress"]
 fn arm32_optimize_arraysum_smoke() {
     let isa = arm32_isa();
-    let program = DecodedInstruction::decode_program("examples/matmul.bin", &isa)
+    let program = DecodedInstruction::decode_program("examples/matdet_stdlib.bin", &isa)
         .expect("arraysum ARM binary should decode");
     let mandatory_forms = HashMap::from([
         ("load_ops".to_string(), HashSet::new()),

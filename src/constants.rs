@@ -1,6 +1,6 @@
-// Weights for genetic algorithm hardware optimizatoin
-pub const WEIGHT_UNMODIFIED_PROGRAM: f64 = 0.4;
-pub const WEIGHT_CORE_SIZE: f64 = 6.0;
+// Weights for genetic algorithm hardware optimization
+pub const WEIGHT_UNMODIFIED_PROGRAM: f64 = 0.5;
+pub const WEIGHT_CORE_SIZE: f64 = 4.0;
 pub const MUTATE_FIELD_RATE: f64 = 0.01;
 pub const MUTATE_FORM_RATE: f64 = 0.001;
 pub const P_MUT_CONST_TO_VAR: f64 = 0.5;

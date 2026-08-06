@@ -363,3 +363,15 @@ fn concrete_semantic_samples_match_between_rust_and_greenthumb() {
         }
     }
 }
+
+#[test]
+fn greenthumb_distinguishes_reordered_pc_reads() {
+    let original = run_green_thumb(&["run-sample", "pc_read_after_independent_add"]);
+    let reordered = run_green_thumb(&["run-sample", "pc_read_before_independent_add"]);
+
+    assert_ne!(
+        parse_observations(&original),
+        parse_observations(&reordered),
+        "reordering an independent instruction across a PC read should change the PC value observed by ARM"
+    );
+}

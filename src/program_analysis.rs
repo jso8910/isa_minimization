@@ -17,21 +17,24 @@ pub struct ProgramAnalysis<'a> {
 pub struct BasicBlock {
     /// The instruction index where this BasicBlock starts in the original program.
     pub start_instruction_idx: usize,
-    /// HashSet of all registers which are read before being overwritten (ie their pre-block
-    /// contents are used by this basic block in some calculation)
+    /// HashSet of all registers which can be read before being overwritten in this program (ie its
+    /// contents are still live)
     pub live_in_regs: HashSet<ArchitecturalRegister>,
+    /// HashSet of all registers which are read by this basic block. Used as the
+    /// live-in input to the Greenthumb superoptimizer (since, although more registers are live-in,
+    /// they aren't useful for that block)
+    pub read_regs: HashSet<ArchitecturalRegister>,
     /// HashSet of all registers which have their contents changed during the course of this basic block
     pub consumed_registers: HashSet<ArchitecturalRegister>,
     /// HashSet of all live-out registers (ie registers which may or may not be read after the
-    /// basic block completes). Calculated assuming any branch could be taken. If live_out_regs is
-    /// None, that means it hasn't yet been calculated
-    pub live_out_regs: Option<HashSet<ArchitecturalRegister>>,
-    /// A list of pointers to all other basic blocks which this basic block can lead to (excluding itself).
+    /// basic block completes). Calculated assuming any branch could be taken.
+    pub live_out_regs: HashSet<ArchitecturalRegister>,
+    /// A list of pointers to all other basic blocks which this basic block can lead to.
     /// Pointers are defined by BasicBlock indices which index ProgramAnalysis::program.
     pub next_blocks: Vec<usize>,
     /// The instructions in the basic block. This should include the branch statement which ends the
     /// basic block (if applicable).
-    instructions: Vec<DecodedInstruction>,
+    pub instructions: Vec<DecodedInstruction>,
 }
 
 // is there any way to do all this without using the semantics? i would really rather that not be
@@ -113,10 +116,6 @@ impl<'a> ProgramAnalysis<'a> {
                 }
             }
         }
-        // let mut current_basic_block_instructions = vec![];
-        // let mut current_live_in_registers = HashSet::new();
-        // let mut current_consumed_registers = HashSet::new();
-        // let mut next_blocks = HashSet::new();
 
         let mut basic_blocks = vec![];
 
@@ -126,8 +125,7 @@ impl<'a> ProgramAnalysis<'a> {
 
         for (start_idx, end_idx) in basic_block_starts.windows(2).map(|w| (w[0], w[1])) {
             let mut instructions = vec![];
-            // We want the program counter to always be live-in
-            let mut live_in_registers = HashSet::from([isa.pc]);
+            let mut live_in_registers = HashSet::new();
             let mut consumed_registers = HashSet::new();
 
             // We know that the next instruction (at end_idx) is one potential next block if this
@@ -137,7 +135,7 @@ impl<'a> ProgramAnalysis<'a> {
             } else {
                 vec![end_idx]
             };
-            let mut live_out_regs = None;
+            let mut live_out_regs = HashSet::new();
 
             for (idx, instruction) in program[start_idx..end_idx].iter().enumerate() {
                 // We want to normalize the index to the start of the program
@@ -168,17 +166,13 @@ impl<'a> ProgramAnalysis<'a> {
                                 .try_into()
                                 .expect("Could not convert u32 to usize");
 
-                            // We don't want to include loops in the potential next blocks for
-                            // live-out analysis.
-                            if new_program_idx != start_idx {
-                                next_blocks.push(new_program_idx);
-                            }
+                            next_blocks.push(new_program_idx);
                         }
                         BranchOffset::Register => {
                             // Assume statically that all registers are live-out when a branch is to
                             // an unknown location. This will help to make sure calling conventions
                             // are respected, as well as preventing these branches from causing issues.
-                            live_out_regs = Some(isa.registers.iter().cloned().collect());
+                            live_out_regs = isa.registers.iter().cloned().collect();
                         }
                     }
                 }
@@ -199,7 +193,8 @@ impl<'a> ProgramAnalysis<'a> {
 
             basic_blocks.push(BasicBlock {
                 start_instruction_idx: start_idx,
-                live_in_regs: live_in_registers,
+                live_in_regs: live_in_registers.clone(),
+                read_regs: live_in_registers,
                 consumed_registers,
                 live_out_regs,
                 // This is currently incorrect and invalid. The loop afterwards to convert from the
@@ -236,6 +231,41 @@ impl<'a> ProgramAnalysis<'a> {
             isa,
         }
     }
+
+    /// Completes the computing of live-out and live-in registers
+    pub fn compute_liveliness(&mut self) {
+        // Liveliness analysis is simple. If a register is live-out at a basic block node, and is
+        // not overwritten, it is also live-in at that node. If a register is live-in at a successor
+        // node, it is live-out at the node.
+        // TODO: confirm this is all correct
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for idx in 0..self.program.len() {
+                let prev_live_in_len = self.program[idx].live_in_regs.len();
+                let prev_live_out_len = self.program[idx].live_out_regs.len();
+
+                let mut new_live_out = HashSet::new();
+                for succ in self.program[idx].next_blocks.iter() {
+                    new_live_out.extend(self.program[*succ].live_in_regs.clone());
+                }
+
+                // Now we do a mutable borrow to commit the changes
+                let block: &mut BasicBlock = &mut self.program[idx];
+                block
+                    .live_in_regs
+                    .extend(block.live_out_regs.difference(&block.consumed_registers));
+                block.live_out_regs.extend(new_live_out);
+
+                if (prev_live_in_len != block.live_in_regs.len())
+                    || (prev_live_out_len != block.live_out_regs.len())
+                {
+                    changed = true;
+                }
+            }
+        }
+    }
 }
 
 /// Registers which are read by an instruction. Assumed to happen *before* writes.
@@ -248,6 +278,9 @@ fn instruction_register_reads(effects: &[Effect]) -> HashSet<ArchitecturalRegist
                 register,
                 value,
             } => {
+                if guard_is_const_false(guard) {
+                    continue;
+                }
                 collect_expr_register_reads(guard, &mut reads);
                 collect_expr_register_reads(register, &mut reads);
                 collect_expr_register_reads(value, &mut reads);
@@ -258,6 +291,9 @@ fn instruction_register_reads(effects: &[Effect]) -> HashSet<ArchitecturalRegist
                 value,
                 ..
             } => {
+                if guard_is_const_false(guard) {
+                    continue;
+                }
                 collect_expr_register_reads(guard, &mut reads);
                 collect_expr_register_reads(address, &mut reads);
                 collect_expr_register_reads(value, &mut reads);
@@ -267,22 +303,39 @@ fn instruction_register_reads(effects: &[Effect]) -> HashSet<ArchitecturalRegist
     reads
 }
 
-/// Registers which are written by an instruction.
+/// Registers which are written by an instruction. Only returned if the guard evaluates to 1
+/// (always) for the purpose of being more conservative with live-out registers.
 fn instruction_register_writes(effects: &[Effect]) -> HashSet<ArchitecturalRegister> {
     effects
         .iter()
         .filter_map(|effect| match effect {
             Effect::WriteRegister {
-                register, value, ..
-            } => register_expr_to_architectural_register(
+                guard,
+                register,
+                value,
+            } if guard_is_const_true(guard) => register_expr_to_architectural_register(
                 register,
                 value
                     .expr_width()
                     .expect("Register write value should have an established width"),
             ),
-            Effect::WriteMemory { .. } => None,
+            Effect::WriteRegister { .. } | Effect::WriteMemory { .. } => None,
         })
         .collect()
+}
+
+fn guard_is_const_false(guard: &Expr) -> bool {
+    matches!(
+        guard,
+        Expr::Const { value, width } if (value & bit_mask(*width)) == 0
+    )
+}
+
+fn guard_is_const_true(guard: &Expr) -> bool {
+    matches!(
+        guard,
+        Expr::Const { value, width } if *width == 1 && (value & bit_mask(*width)) == 1
+    )
 }
 
 fn collect_expr_register_reads(expr: &Expr, reads: &mut HashSet<ArchitecturalRegister>) {
@@ -324,7 +377,9 @@ fn register_expr_to_architectural_register(
 mod tests {
     use super::*;
     use crate::{
-        instruction_semantics::constant,
+        instruction_semantics::{
+            Register, bool_const, constant, fixed_register, read_fixed_register,
+        },
         isa_specification::{
             Instruction, InstructionField, InstructionForm, StackDirection, StackPointer,
             linear_instruction_index_to_pc, linear_pc_to_instruction_index,
@@ -341,20 +396,52 @@ mod tests {
 
     fn test_isa() -> ISA {
         ISA {
-            registers: vec![test_register(0), test_register(1)],
+            registers: vec![
+                test_register(0),
+                test_register(1),
+                test_register(2),
+                test_register(3),
+            ],
             instructions: vec![
-                Instruction::new("nop", 2)
-                    .form(InstructionForm::new("base").fields([InstructionField::constant("00")])),
-                Instruction::new("branch_plus_two", 2)
+                Instruction::new("nop", 3)
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("000")])),
+                Instruction::new("r0_from_r1", 3)
+                    .effect(Effect::write_register(
+                        fixed_register(Register(0), 4),
+                        read_fixed_register(Register(1), 4, 32),
+                    ))
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("001")])),
+                Instruction::new("r1_from_r0", 3)
+                    .effect(Effect::write_register(
+                        fixed_register(Register(1), 4),
+                        read_fixed_register(Register(0), 4, 32),
+                    ))
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("010")])),
+                Instruction::new("r2_from_r1", 3)
+                    .effect(Effect::write_register(
+                        fixed_register(Register(2), 4),
+                        read_fixed_register(Register(1), 4, 32),
+                    ))
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("011")])),
+                Instruction::new("branch_plus_two", 3)
                     .branch_instruction(BranchOffset::PCRelative(constant(2, 8)))
-                    .form(InstructionForm::new("base").fields([InstructionField::constant("10")])),
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("100")])),
+                Instruction::new("branch_minus_one", 3)
+                    .branch_instruction(BranchOffset::PCRelative(constant(0xff, 8)))
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("101")])),
+                Instruction::new("r0_from_const", 3)
+                    .effect(Effect::write_register(
+                        fixed_register(Register(0), 4),
+                        constant(0, 32),
+                    ))
+                    .form(InstructionForm::new("base").fields([InstructionField::constant("110")])),
             ],
             sp: StackPointer {
                 register: test_register(0),
                 stack_size: 32,
                 direction: StackDirection::Downwards,
             },
-            pc: test_register(1),
+            pc: test_register(3),
             pc_to_instruction_index: linear_pc_to_instruction_index,
             instruction_index_to_pc: linear_instruction_index_to_pc,
         }
@@ -381,10 +468,63 @@ mod tests {
             .collect()
     }
 
+    fn register_set(registers: &[u8]) -> HashSet<ArchitecturalRegister> {
+        registers
+            .iter()
+            .map(|register| test_register(*register))
+            .collect()
+    }
+
+    fn block_live_ins(analysis: &ProgramAnalysis<'_>) -> Vec<HashSet<ArchitecturalRegister>> {
+        analysis
+            .program
+            .iter()
+            .map(|block| block.live_in_regs.clone())
+            .collect()
+    }
+
+    fn block_live_outs(analysis: &ProgramAnalysis<'_>) -> Vec<HashSet<ArchitecturalRegister>> {
+        analysis
+            .program
+            .iter()
+            .map(|block| block.live_out_regs.clone())
+            .collect()
+    }
+
+    #[test]
+    fn instruction_register_reads_ignores_false_guarded_effects() {
+        let effects = vec![Effect::write_register_if(
+            bool_const(false),
+            fixed_register(Register(0), 4),
+            read_fixed_register(Register(1), 4, 32),
+        )];
+
+        assert_eq!(instruction_register_reads(&effects), HashSet::new());
+    }
+
+    #[test]
+    fn instruction_register_writes_only_counts_unconditional_register_writes() {
+        let effects = vec![
+            Effect::write_register_if(
+                bool_const(false),
+                fixed_register(Register(0), 4),
+                constant(0, 32),
+            ),
+            Effect::write_register_if(
+                read_fixed_register(Register(1), 4, 1),
+                fixed_register(Register(2), 4),
+                constant(0, 32),
+            ),
+            Effect::write_register(fixed_register(Register(3), 4), constant(0, 32)),
+        ];
+
+        assert_eq!(instruction_register_writes(&effects), register_set(&[3]));
+    }
+
     #[test]
     fn from_program_splits_fallthrough_and_pc_relative_branch_target_blocks() {
         let isa = test_isa();
-        let program = decode_program(&["00", "10", "00", "00"], &isa);
+        let program = decode_program(&["000", "100", "000", "000"], &isa);
 
         let analysis = ProgramAnalysis::from_program(program, &isa);
 
@@ -398,7 +538,7 @@ mod tests {
     #[test]
     fn from_program_uses_absolute_instruction_index_for_later_branch_targets() {
         let isa = test_isa();
-        let program = decode_program(&["10", "00", "00", "10", "00", "00"], &isa);
+        let program = decode_program(&["100", "000", "000", "100", "000", "000"], &isa);
 
         let analysis = ProgramAnalysis::from_program(program, &isa);
 
@@ -406,6 +546,65 @@ mod tests {
         assert_eq!(
             block_successors(&analysis),
             vec![vec![1, 2], vec![2], vec![3, 4], vec![4], vec![]]
+        );
+    }
+
+    #[test]
+    fn compute_liveliness_tracks_straight_line_register_uses() {
+        let isa = test_isa();
+        let program = decode_program(&["001", "011"], &isa);
+
+        let mut analysis = ProgramAnalysis::from_program(program, &isa);
+        analysis.compute_liveliness();
+
+        assert_eq!(block_starts(&analysis), vec![0]);
+        assert_eq!(block_live_ins(&analysis), vec![register_set(&[1])]);
+        assert_eq!(block_live_outs(&analysis), vec![HashSet::new()]);
+    }
+
+    #[test]
+    fn compute_liveliness_propagates_live_ins_across_branch_successors() {
+        let isa = test_isa();
+        let program = decode_program(&["001", "100", "010", "011"], &isa);
+
+        let mut analysis = ProgramAnalysis::from_program(program, &isa);
+        analysis.compute_liveliness();
+
+        assert_eq!(block_starts(&analysis), vec![0, 2, 3]);
+        assert_eq!(
+            block_successors(&analysis),
+            vec![vec![1, 2], vec![2], vec![]]
+        );
+        assert_eq!(
+            block_live_ins(&analysis),
+            vec![register_set(&[1]), register_set(&[0]), register_set(&[1])]
+        );
+        assert_eq!(
+            block_live_outs(&analysis),
+            vec![register_set(&[0, 1]), register_set(&[1]), HashSet::new()]
+        );
+    }
+
+    #[test]
+    fn compute_liveliness_reaches_fixed_point_for_loop_successors() {
+        let isa = test_isa();
+        let program = decode_program(&["110", "010", "101", "011"], &isa);
+
+        let mut analysis = ProgramAnalysis::from_program(program, &isa);
+        analysis.compute_liveliness();
+
+        assert_eq!(block_starts(&analysis), vec![0, 1, 3]);
+        assert_eq!(
+            block_successors(&analysis),
+            vec![vec![1], vec![2, 1], vec![]]
+        );
+        assert_eq!(
+            block_live_ins(&analysis),
+            vec![HashSet::new(), register_set(&[0]), register_set(&[1])]
+        );
+        assert_eq!(
+            block_live_outs(&analysis),
+            vec![register_set(&[0]), register_set(&[0, 1]), HashSet::new()]
         );
     }
 }

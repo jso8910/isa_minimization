@@ -144,20 +144,20 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
                 if !(instruction_form_in_candidate
                     && instruction_valid_under_field_uses(instruction, &candidate.valid_field_uses))
                 {
-                    println!(
-                        "{} {:?} {}",
-                        instruction.name,
-                        instruction.form.name,
-                        instruction
-                            .bits
-                            .iter()
-                            .map(|b| match b {
-                                Bit::High => "1",
-                                Bit::Low => "0",
-                                _ => panic!(),
-                            })
-                            .collect::<String>()
-                    )
+                    // println!(
+                    //     "{} {:?} {}",
+                    //     instruction.name,
+                    //     instruction.form.name,
+                    //     instruction
+                    //         .bits
+                    //         .iter()
+                    //         .map(|b| match b {
+                    //             Bit::High => "1",
+                    //             Bit::Low => "0",
+                    //             _ => panic!(),
+                    //         })
+                    //         .collect::<String>()
+                    // )
                 }
             }
         }
