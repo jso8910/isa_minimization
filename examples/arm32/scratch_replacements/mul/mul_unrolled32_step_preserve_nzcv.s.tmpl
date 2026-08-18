@@ -1,0 +1,18 @@
+@ scratch-template: v1
+@ family: mul
+@ op: mul
+@ algorithm: unrolled32-step
+@ flags: preserve_nzcv
+@ kind: fragment
+@ temps: t0,t1,t2
+@ inputs: %t0,%t1,%rd
+@ outputs: %t0,%t1,%t2,%rd
+@ repeats: once per multiplier bit, least significant bit first
+@ notes: t0 is shifted multiplicand, t1 is shifted multiplier.
+
+and %t2, %t1, #1
+rsb %t2, %t2, #0
+and %t2, %t0, %t2
+add %rd, %rd, %t2
+mov %t1, %t1, lsr #1
+mov %t0, %t0, lsl #1

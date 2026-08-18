@@ -1,0 +1,14 @@
+@ scratch-template: v1
+@ family: flags
+@ op: mul32
+@ algorithm: tst-result
+@ flags: set_nz_preserve_cv
+@ kind: fragment
+@ temps:
+@ inputs: %rd
+@ outputs: nz
+@ requires: unshifted-register tst
+@ predication: use only after predicated body has executed
+@ notes: Under the repo ARM semantics, TST with an unshifted register preserves C and V.
+
+tst %rd, %rd

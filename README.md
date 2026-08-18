@@ -32,7 +32,13 @@ sudo pacman -S arm-none-eabi-newlib arm-none-eabi-gcc
 ```
 
 To compile a progam, `main.c` to a destination binary `main.o`. You will also want to link your
-startup files and include a linker script for your actual hardware, as well as an actual standard library.
+startup files and include a linker script for your actual hardware, as well as an actual standard
+library.
+
+Programs should not include any meta-programming which reads instructions. That is, you shouldn't
+ever do anything where you look at a memory address and change the execution of the program
+depending on what instrution is at that memory address — the exact locations of certain instructions
+and the exact instructions in a program will not be maintained by the superoptimization process.
 
 ```
 
@@ -54,6 +60,11 @@ clang -target arm-none-eabi \
   -mcpu=arm7tdmi \
   -mfloat-abi=soft \
   -marm \
+  -fno-jump-tables \
+  -fno-exceptions \
+  -fno-unwind-tables \
+  -fno-asynchronous-unwind-tables \
+  -fno-pic \
   --sysroot=/usr/arm-none-eabi \
   -save-temps=obj \
   -O3 \

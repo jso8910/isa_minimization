@@ -1,0 +1,18 @@
+@ scratch-template: v1
+@ family: mul
+@ op: mul
+@ algorithm: unrolled32
+@ flags: preserve_nzcv
+@ kind: whole
+@ temps: t0,t1,t2
+@ inputs: %rm,%rs
+@ outputs: %rd
+@ placeholders: %mul_unrolled32_steps
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ repeats: substitute mul_unrolled32_step_preserve_nzcv.s.tmpl 32 times
+@ notes: Copies operands before writing rd, so rd may alias rs.
+
+mov %t0, %rm
+mov %t1, %rs
+mov %rd, #0
+%mul_unrolled32_steps

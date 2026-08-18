@@ -1,0 +1,42 @@
+@ scratch-template: v1
+@ family: mull
+@ op: umull
+@ algorithm: four-16x16-muls-boolean-carry
+@ flags: preserve_nzcv
+@ kind: whole
+@ temps: t0,t1,t2,t3,t4,t5,t6,t7,t8,t9
+@ inputs: %rm,%rs
+@ outputs: %rdlo,%rdhi
+@ placeholders: %mul
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: %mul is a complete non-S low multiply mnemonic and must preserve NZCV.
+
+mov %t0, %rm, lsl #16
+mov %t0, %t0, lsr #16
+mov %t1, %rm, lsr #16
+mov %t2, %rs, lsl #16
+mov %t2, %t2, lsr #16
+mov %t3, %rs, lsr #16
+%mul %t4, %t0, %t2
+%mul %t5, %t0, %t3
+%mul %t6, %t1, %t2
+%mul %t7, %t1, %t3
+add %t8, %t5, %t6
+and %t9, %t5, %t6
+orr %t5, %t5, %t6
+mvn %t6, %t8
+and %t5, %t5, %t6
+orr %t9, %t9, %t5
+mov %t9, %t9, lsr #15
+mov %t5, %t8, lsl #16
+add %rdlo, %t4, %t5
+and %t6, %t4, %t5
+orr %t5, %t4, %t5
+mvn %t4, %rdlo
+and %t5, %t5, %t4
+orr %t6, %t6, %t5
+mov %t6, %t6, lsr #31
+mov %rdhi, %t8, lsr #16
+add %rdhi, %t7, %rdhi
+add %rdhi, %rdhi, %t9
+add %rdhi, %rdhi, %t6

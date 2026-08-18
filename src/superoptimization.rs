@@ -581,6 +581,9 @@ impl<'a> SuperoptimizationCtx<'a> {
                 bits,
                 fields,
                 branch_instruction: selected_instruction.branch_instruction.clone(),
+                mem_addr: 0,
+                static_instruction: false,
+                assembly_line: 0,
             };
 
             if selected_form.when.check(&instruction) {
@@ -1745,8 +1748,6 @@ mod tests {
                 direction,
             },
             pc: arch_register(PC_ID),
-            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
-            instruction_index_to_pc: crate::isa_specification::linear_instruction_index_to_pc,
         }
     }
 
@@ -1948,6 +1949,9 @@ mod tests {
                 },
             ],
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         };
 
         let changed = ctx
@@ -1987,6 +1991,9 @@ mod tests {
                 is_register_write: false,
             }],
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         };
 
         let changed = ctx
@@ -2032,6 +2039,9 @@ mod tests {
                 is_register_write: false,
             }],
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         };
 
         let changed = ctx

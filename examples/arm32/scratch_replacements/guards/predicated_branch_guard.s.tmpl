@@ -1,0 +1,15 @@
+@ scratch-template: v1
+@ family: guards
+@ op: predicate
+@ algorithm: inverse-cond-branch
+@ flags: preserve_nzcv
+@ kind: wrapper
+@ temps:
+@ inputs: %body
+@ outputs:
+@ placeholders: %skip_if_not_cond,%Ldone,%body
+@ notes: %skip_if_not_cond expands to a complete inverse-condition branch mnemonic.
+
+%skip_if_not_cond %Ldone
+%body
+%Ldone:

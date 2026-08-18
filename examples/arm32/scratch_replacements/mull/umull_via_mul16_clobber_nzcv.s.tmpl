@@ -1,0 +1,31 @@
+@ scratch-template: v1
+@ family: mull
+@ op: umull
+@ algorithm: four-16x16-muls
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps: t0,t1,t2,t3,t4,t5,t6,t7,t8
+@ inputs: %rm,%rs
+@ outputs: %rdlo,%rdhi
+@ placeholders: %mul
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: %mul is a complete non-S low multiply mnemonic and may be scratched recursively.
+
+mov %t0, %rm, lsl #16
+mov %t0, %t0, lsr #16
+mov %t1, %rm, lsr #16
+mov %t2, %rs, lsl #16
+mov %t2, %t2, lsr #16
+mov %t3, %rs, lsr #16
+%mul %t4, %t0, %t2
+%mul %t5, %t0, %t3
+%mul %t6, %t1, %t2
+%mul %t7, %t1, %t3
+adds %t8, %t5, %t6
+mov %t6, #0
+adc %t6, %t6, #0
+mov %t6, %t6, lsl #16
+mov %rdlo, %t8, lsl #16
+adds %rdlo, %t4, %rdlo
+adc %rdhi, %t7, %t8, lsr #16
+add %rdhi, %rdhi, %t6

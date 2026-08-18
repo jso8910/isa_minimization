@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-#[path = "../examples/arm32.rs"]
+#[path = "../examples/arm32/isa.rs"]
 mod arm32;
 
 use std::collections::HashMap;
@@ -30,8 +30,6 @@ fn arm32_isa_with_stack_direction(direction: StackDirection) -> ISA {
             direction,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 

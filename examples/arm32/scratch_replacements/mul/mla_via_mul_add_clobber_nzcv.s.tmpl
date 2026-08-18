@@ -1,0 +1,15 @@
+@ scratch-template: v1
+@ family: mul
+@ op: mla
+@ algorithm: mul-plus-adds
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps: t0
+@ inputs: %rm,%rs,%rn
+@ outputs: %rd
+@ placeholders: %mul
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: %mul is a complete non-S multiply mnemonic; it may itself be scratched recursively.
+
+%mul %t0, %rm, %rs
+adds %rd, %t0, %rn

@@ -1,13 +1,13 @@
 // Weights for genetic algorithm hardware optimization
 pub const WEIGHT_UNMODIFIED_PROGRAM: f64 = 0.5;
-pub const WEIGHT_CORE_SIZE: f64 = 4.0;
-pub const MUTATE_FIELD_RATE: f64 = 0.01;
-pub const MUTATE_FORM_RATE: f64 = 0.001;
+pub const WEIGHT_CORE_SIZE: f64 = 6.0;
+pub const MUTATE_FIELD_RATE: f64 = 0.03;
+pub const MUTATE_FORM_RATE: f64 = 0.01;
 pub const P_MUT_CONST_TO_VAR: f64 = 0.5;
 pub const P_MUT_VAR_TO_NONE: f64 = 0.05;
 // probability of crossover for each individual gene (each value of valid_field_uses is considered
 // to be one gene, or the valid forms of an instruction is considered to be a gene)
-pub const P_CROSSOVER_GENE: f64 = 0.5;
+pub const P_CROSSOVER_GENE: f64 = 0.4;
 
 // BDD constants
 // TODO multiple threads perchance? command line option
@@ -68,3 +68,10 @@ pub const P_SWAP_LINES: f64 = 0.15;
 
 // Superoptimization maximum program length
 pub const SUPEROPTIMIZATION_PROGRAM_LEN: usize = 12;
+
+// GreenThumb program rewrite defaults
+pub const GREENTHUMB_CORES: u32 = THREAD_COUNT;
+pub const GREENTHUMB_TIMEOUT_SECONDS: u32 = 60;
+pub const GREENTHUMB_CANDIDATE_SIZE: usize = SUPEROPTIMIZATION_PROGRAM_LEN;
+pub const GREENTHUMB_SEARCH_MODE_FLAG: &str = "--stoch";
+pub const GREENTHUMB_REWRITE_MODE_FLAG: &str = "--synthesize";

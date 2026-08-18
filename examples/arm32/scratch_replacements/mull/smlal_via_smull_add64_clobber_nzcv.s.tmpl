@@ -1,0 +1,19 @@
+@ scratch-template: v1
+@ family: mull
+@ op: smlal
+@ algorithm: smull-plus-add64
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps: t0,t1
+@ inputs: %rm,%rs,%rdlo,%rdhi
+@ outputs: %rdlo,%rdhi
+@ placeholders: %smull
+@ requires: smull or smull scratch replacement
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: Saves the 64-bit accumulator before SMULL overwrites rdhi:rdlo.
+
+mov %t0, %rdlo
+mov %t1, %rdhi
+%smull %rdlo, %rdhi, %rm, %rs
+adds %rdlo, %rdlo, %t0
+adc %rdhi, %rdhi, %t1

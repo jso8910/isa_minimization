@@ -1,0 +1,22 @@
+@ scratch-template: v1
+@ family: flags
+@ op: mull64
+@ algorithm: packed-nz-tst
+@ flags: set_nz_preserve_cv
+@ kind: fragment
+@ temps: t0,t1
+@ inputs: %rdlo,%rdhi
+@ outputs: nz
+@ requires: unshifted-register tst
+@ predication: use only after predicated body has executed
+@ notes: Builds a word whose bit31 is rdhi bit31 and whose zero-ness matches rdhi:rdlo.
+
+mov %t0, %rdhi, lsl #1
+mov %t0, %t0, lsr #1
+orr %t0, %t0, %rdlo, lsr #1
+and %t1, %rdlo, #1
+orr %t0, %t0, %t1
+mov %t1, %rdhi, lsr #31
+mov %t1, %t1, lsl #31
+orr %t0, %t0, %t1
+tst %t0, %t0

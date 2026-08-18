@@ -1,0 +1,14 @@
+@ scratch-template: v1
+@ family: mull
+@ op: add64
+@ algorithm: adds-adc
+@ flags: clobber_nzcv
+@ kind: fragment
+@ temps:
+@ inputs: %lo_src,%hi_src,%lo_dst,%hi_dst
+@ outputs: %lo_dst,%hi_dst,nzcv
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: Adds hi_src:lo_src into hi_dst:lo_dst.
+
+adds %lo_dst, %lo_dst, %lo_src
+adc %hi_dst, %hi_dst, %hi_src

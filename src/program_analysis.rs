@@ -72,27 +72,28 @@ impl<'a> ProgramAnalysis<'a> {
         // I don't know whether this is a universally valid assumption in normal compiler-generated
         // assembly, but it is necessary.
         for (idx, instruction) in program.iter().enumerate() {
+            if instruction.static_instruction {
+                basic_block_boundaries.insert(idx);
+                basic_block_boundaries.insert(idx + 1);
+            }
+
             let Some(branch_type) = &instruction.branch_instruction else {
                 continue;
             };
-            let current_pc: u128 = (isa.instruction_index_to_pc)(
-                idx.try_into()
-                    .expect("Could not convert usize index of program to u32"),
-                &program,
-            );
             match branch_type {
                 BranchOffset::PCRelative(offset_val) => {
                     let collapsed_offset = offset_val.clone().collapse(&instruction);
 
-                    // Offset is a signed value. We will assume the current_pc is also the same
-                    // width as the offset.
+                    // Offset is a signed value. We will assume the current mem_addr is also the
+                    // same width as the offset.
                     let Expr::Const { value, width } = collapsed_offset else {
                         panic!("PCRelative offset must evaluate to a Const!")
                     };
 
-                    let new_pc = ((current_pc & bit_mask(width)) + (value & bit_mask(width)))
+                    let target_mem_addr = ((instruction.mem_addr as u128 & bit_mask(width))
+                        + (value & bit_mask(width)))
                         & bit_mask(width);
-                    let new_program_idx = (isa.pc_to_instruction_index)(new_pc, &program);
+                    let new_program_idx = instruction_index_by_mem_addr(&program, target_mem_addr);
 
                     // The next index will be the start of a basic block unless this branch is
                     // already at the end of the program.
@@ -101,11 +102,7 @@ impl<'a> ProgramAnalysis<'a> {
                     }
 
                     // The branch target is also the start of a basic block
-                    basic_block_boundaries.insert(
-                        new_program_idx
-                            .try_into()
-                            .expect("Could not convert u32 to usize"),
-                    );
+                    basic_block_boundaries.insert(new_program_idx);
                 }
                 BranchOffset::Register => {
                     // The next index will be the start of a basic block unless this branch is
@@ -117,6 +114,22 @@ impl<'a> ProgramAnalysis<'a> {
             }
         }
 
+        Self::from_program_with_boundaries(program, isa, basic_block_boundaries)
+    }
+
+    pub fn from_program_split_every_instruction(
+        program: Vec<DecodedInstruction>,
+        isa: &'a ISA,
+    ) -> Self {
+        let basic_block_boundaries = (0..=program.len()).collect();
+        Self::from_program_with_boundaries(program, isa, basic_block_boundaries)
+    }
+
+    fn from_program_with_boundaries(
+        program: Vec<DecodedInstruction>,
+        isa: &'a ISA,
+        basic_block_boundaries: HashSet<usize>,
+    ) -> Self {
         let mut basic_blocks = vec![];
 
         // Get a list of all starts to a basic block in order
@@ -147,24 +160,18 @@ impl<'a> ProgramAnalysis<'a> {
                         BranchOffset::PCRelative(offset_val) => {
                             let collapsed_offset = offset_val.clone().collapse(&instruction);
 
-                            // Offset is a signed value. We will assume the current_pc is also the same
-                            // width as the offset.
+                            // Offset is a signed value. We will assume the current mem_addr is
+                            // also the same width as the offset.
                             let Expr::Const { value, width } = collapsed_offset else {
                                 panic!("PCRelative offset must evaluate to a Const!")
                             };
 
-                            let current_pc: u128 = (isa.instruction_index_to_pc)(
-                                idx.try_into()
-                                    .expect("Could not convert usize index of program to u32"),
-                                &program,
-                            );
-
-                            let new_pc = ((current_pc & bit_mask(width))
+                            let target_mem_addr = ((instruction.mem_addr as u128
+                                & bit_mask(width))
                                 + (value & bit_mask(width)))
                                 & bit_mask(width);
-                            let new_program_idx = (isa.pc_to_instruction_index)(new_pc, &program)
-                                .try_into()
-                                .expect("Could not convert u32 to usize");
+                            let new_program_idx =
+                                instruction_index_by_mem_addr(&program, target_mem_addr);
 
                             next_blocks.push(new_program_idx);
                         }
@@ -266,6 +273,14 @@ impl<'a> ProgramAnalysis<'a> {
             }
         }
     }
+}
+
+fn instruction_index_by_mem_addr(program: &[DecodedInstruction], mem_addr: u128) -> usize {
+    let mem_addr = usize::try_from(mem_addr).expect("branch target address should fit in usize");
+    program
+        .iter()
+        .position(|instruction| instruction.mem_addr == mem_addr)
+        .unwrap_or_else(|| panic!("branch target address {mem_addr} did not match any instruction"))
 }
 
 /// Registers which are read by an instruction. Assumed to happen *before* writes.
@@ -382,7 +397,6 @@ mod tests {
         },
         isa_specification::{
             Instruction, InstructionField, InstructionForm, StackDirection, StackPointer,
-            linear_instruction_index_to_pc, linear_pc_to_instruction_index,
         },
     };
 
@@ -442,8 +456,6 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: test_register(3),
-            pc_to_instruction_index: linear_pc_to_instruction_index,
-            instruction_index_to_pc: linear_instruction_index_to_pc,
         }
     }
 
@@ -528,10 +540,10 @@ mod tests {
 
         let analysis = ProgramAnalysis::from_program(program, &isa);
 
-        assert_eq!(block_starts(&analysis), vec![0, 2, 3]);
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2, 3]);
         assert_eq!(
             block_successors(&analysis),
-            vec![vec![1, 2], vec![2], vec![]]
+            vec![vec![1], vec![2, 3], vec![3], vec![]]
         );
     }
 
@@ -542,10 +554,46 @@ mod tests {
 
         let analysis = ProgramAnalysis::from_program(program, &isa);
 
-        assert_eq!(block_starts(&analysis), vec![0, 1, 2, 4, 5]);
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(
             block_successors(&analysis),
-            vec![vec![1, 2], vec![2], vec![3, 4], vec![4], vec![]]
+            vec![vec![1, 2], vec![2], vec![3], vec![4, 5], vec![5], vec![]]
+        );
+    }
+
+    #[test]
+    fn from_program_splits_static_instruction_into_single_fallthrough_block() {
+        let isa = test_isa();
+        let mut program = decode_program(&["001", "010", "011"], &isa);
+        program[1].static_instruction = true;
+
+        let analysis = ProgramAnalysis::from_program(program, &isa);
+
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2]);
+        assert_eq!(block_successors(&analysis), vec![vec![1], vec![2], vec![]]);
+    }
+
+    #[test]
+    fn from_program_split_every_instruction_computes_single_instruction_live_outs() {
+        let isa = test_isa();
+        let program = decode_program(&["001", "010", "011"], &isa);
+
+        let mut analysis = ProgramAnalysis::from_program_split_every_instruction(program, &isa);
+        analysis.compute_liveliness();
+
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2]);
+        assert_eq!(block_successors(&analysis), vec![vec![1], vec![2], vec![]]);
+        assert!(analysis
+            .program
+            .iter()
+            .all(|block| block.instructions.len() == 1));
+        assert_eq!(
+            block_live_ins(&analysis),
+            vec![register_set(&[1]), register_set(&[0]), register_set(&[1])]
+        );
+        assert_eq!(
+            block_live_outs(&analysis),
+            vec![register_set(&[0]), register_set(&[1]), HashSet::new()]
         );
     }
 
@@ -570,18 +618,28 @@ mod tests {
         let mut analysis = ProgramAnalysis::from_program(program, &isa);
         analysis.compute_liveliness();
 
-        assert_eq!(block_starts(&analysis), vec![0, 2, 3]);
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2, 3]);
         assert_eq!(
             block_successors(&analysis),
-            vec![vec![1, 2], vec![2], vec![]]
+            vec![vec![1], vec![2, 3], vec![3], vec![]]
         );
         assert_eq!(
             block_live_ins(&analysis),
-            vec![register_set(&[1]), register_set(&[0]), register_set(&[1])]
+            vec![
+                register_set(&[1]),
+                register_set(&[0, 1]),
+                register_set(&[0]),
+                register_set(&[1])
+            ]
         );
         assert_eq!(
             block_live_outs(&analysis),
-            vec![register_set(&[0, 1]), register_set(&[1]), HashSet::new()]
+            vec![
+                register_set(&[0, 1]),
+                register_set(&[0, 1]),
+                register_set(&[1]),
+                HashSet::new()
+            ]
         );
     }
 
@@ -593,18 +651,28 @@ mod tests {
         let mut analysis = ProgramAnalysis::from_program(program, &isa);
         analysis.compute_liveliness();
 
-        assert_eq!(block_starts(&analysis), vec![0, 1, 3]);
+        assert_eq!(block_starts(&analysis), vec![0, 1, 2, 3]);
         assert_eq!(
             block_successors(&analysis),
-            vec![vec![1], vec![2, 1], vec![]]
+            vec![vec![1], vec![2], vec![3, 1], vec![]]
         );
         assert_eq!(
             block_live_ins(&analysis),
-            vec![HashSet::new(), register_set(&[0]), register_set(&[1])]
+            vec![
+                HashSet::new(),
+                register_set(&[0]),
+                register_set(&[0, 1]),
+                register_set(&[1])
+            ]
         );
         assert_eq!(
             block_live_outs(&analysis),
-            vec![register_set(&[0]), register_set(&[0, 1]), HashSet::new()]
+            vec![
+                register_set(&[0]),
+                register_set(&[0, 1]),
+                register_set(&[0, 1]),
+                HashSet::new()
+            ]
         );
     }
 }

@@ -1,10 +1,11 @@
-#[path = "../examples/arm32.rs"]
+#[path = "../examples/arm32/isa.rs"]
 mod arm32;
 
 use std::collections::{HashMap, HashSet};
 
+use isa_minimization::bit::BitPattern;
 use isa_minimization::isa_optimization::IsaOptimizationManager;
-use isa_minimization::isa_specification::{DecodedInstruction, ISA, StackDirection, StackPointer};
+use isa_minimization::isa_specification::{DecodedInstruction, FieldUses, ISA, StackDirection, StackPointer};
 use rand::{SeedableRng, rngs::StdRng};
 
 fn arm32_isa() -> ISA {
@@ -17,8 +18,6 @@ fn arm32_isa() -> ISA {
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 
@@ -65,6 +64,25 @@ fn arm32_optimize_arraysum_smoke() {
             "branch_ops_bx".to_string(),
             HashSet::from(["base".to_string()]),
         ),
+        (
+            "branch_ops_block_tfr".to_string(),
+            HashSet::from(["base".to_string()]),
+        ),
+        (
+            "branch_ops_data_tfr".to_string(),
+            HashSet::from([
+                "register_offset".to_string(),
+                "register_offset_pc_base".to_string(),
+                "immediate_offset".to_string(),
+                "immediate_offset_pc_base".to_string(),
+            ]),
+        ),
+        (
+            // Instructions of the form ldr rn, [pc, #imm12] must be unrestricted, because they are
+            // used to access values from literal pools.
+            "load_ops".to_string(),
+            HashSet::from(["immediate_offset_pc_base".to_string()]),
+        ),
     ]);
 
     let mut manager = IsaOptimizationManager::new(
@@ -81,7 +99,15 @@ fn arm32_optimize_arraysum_smoke() {
         0.5,
         0.05,
         0.01,
-    );
+    )
+        .with_fixed_field_uses(HashMap::from([(
+            "op2_shift_type".to_string(),
+            FieldUses::Uses {
+                name: "op2_shift_type".to_string(),
+                patterns: HashSet::from([BitPattern::parse("xx")]),
+                len: 2,
+            },
+        )]));
 
     manager.optimize();
 }

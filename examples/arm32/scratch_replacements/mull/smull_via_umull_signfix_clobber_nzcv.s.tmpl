@@ -1,0 +1,19 @@
+@ scratch-template: v1
+@ family: mull
+@ op: smull
+@ algorithm: umull-plus-sign-fix
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps:
+@ inputs: %rm,%rs
+@ outputs: %rdlo,%rdhi
+@ placeholders: %umull
+@ requires: umull or umull scratch replacement
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: Signed high word = unsigned high word minus sign(rm)*rs minus sign(rs)*rm.
+
+%umull %rdlo, %rdhi, %rm, %rs
+tst %rm, %rm
+submi %rdhi, %rdhi, %rs
+tst %rs, %rs
+submi %rdhi, %rdhi, %rm

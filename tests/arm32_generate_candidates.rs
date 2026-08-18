@@ -1,12 +1,12 @@
 #[allow(dead_code, unused_imports)]
-#[path = "../examples/arm32.rs"]
+#[path = "../examples/arm32/isa.rs"]
 mod arm32;
 
 use std::{collections::HashMap, panic, time::Instant};
 
 use isa_minimization::{
     bit::{Bit, BitPattern},
-    instruction_semantics::FieldName,
+    instruction_semantics::{Expr, FieldName},
     isa_specification::{
         ArchitecturalRegister, BranchOffset, DecodedField, DecodedInstruction, FieldUses, ISA,
         MergeMode, StackDirection, StackPointer, instruction_valid_under_field_uses,
@@ -58,8 +58,6 @@ fn arm32_isa_with_instructions(
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 
@@ -563,15 +561,28 @@ fn arm32_branch_ops_carry_branch_metadata() {
 #[test]
 fn arm32_pc_values_map_to_instruction_addresses_and_prefetched_reads() {
     let isa = arm32_isa();
-    let program = Vec::new();
+    let program = DecodedInstruction::decode_program_str(
+        &[
+            "11100011101000000000000000000001",
+            "11100010100000000001000000000010",
+            "11101010000000000000000000000001",
+        ]
+        .join("\n"),
+        &isa,
+    )
+    .expect("ARM32 program should decode");
 
-    assert_eq!((isa.pc_to_instruction_index)(0, &program), 0);
-    assert_eq!((isa.pc_to_instruction_index)(4, &program), 1);
-    assert_eq!((isa.pc_to_instruction_index)(16, &program), 4);
+    assert_eq!(program[0].mem_addr, 0);
+    assert_eq!(program[1].mem_addr, 4);
+    assert_eq!(program[2].mem_addr, 8);
 
-    assert_eq!((isa.instruction_index_to_pc)(0, &program), 8);
-    assert_eq!((isa.instruction_index_to_pc)(1, &program), 12);
-    assert_eq!((isa.instruction_index_to_pc)(4, &program), 24);
+    let Some(BranchOffset::PCRelative(offset)) = &program[2].branch_instruction else {
+        panic!("expected decoded B to carry PC-relative branch metadata");
+    };
+    let Expr::Const { value, .. } = offset.clone().collapse(&program[2]) else {
+        panic!("ARM32 branch offset should collapse to a constant");
+    };
+    assert_eq!(program[2].mem_addr as u128 + value, 20);
 }
 
 #[test]

@@ -1,0 +1,15 @@
+@ scratch-template: v1
+@ family: dproc_rsr
+@ op: variable_shift_step
+@ algorithm: tst-conditional-power-of-two-step
+@ flags: clobber_nzcv
+@ kind: fragment
+@ temps: t0,t1
+@ inputs: %t0,%t1
+@ outputs: %t0,nzcv
+@ placeholders: %shift,%step_amount
+@ repeats: for step_amount 1,2,4,8,16; ror ignores higher amount bits separately
+@ notes: Uses TST on the shift amount bit, then conditionally shifts t0.
+
+tst %t1, #%step_amount
+movne %t0, %t0, %shift #%step_amount

@@ -1,0 +1,13 @@
+diff --git a/libgloss/arm/crt0.S b/libgloss/arm/crt0.S
+index cad002d2b..f727debb5 100644
+--- a/libgloss/arm/crt0.S
++++ b/libgloss/arm/crt0.S
+@@ -149,7 +149,7 @@
+ 	FN_EH_START
+ 
+ 	/* M profile doesn't have CPSR register.  */
+-#if (__ARM_ARCH_PROFILE != 'M')
++#if (__ARM_ARCH_PROFILE != 'M') && !defined(NO_MODE_STACK_INIT)
+ 	/* Following code is compatible for both ARM and Thumb ISA.  */
+ 	mrs	r4, CPSR
+ 	mov	r3, sp /* Save input SP value.  */

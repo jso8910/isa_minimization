@@ -140,8 +140,7 @@ mod tests {
         isa_optimization::ISACandidate,
         isa_specification::{
             ArchitecturalRegister, FieldUses, ISA, Instruction, InstructionField, InstructionForm,
-            StackDirection, StackPointer, linear_instruction_index_to_pc,
-            linear_pc_to_instruction_index,
+            StackDirection, StackPointer,
         },
     };
 
@@ -185,8 +184,6 @@ mod tests {
                 identifier_width: 1,
                 width: 32,
             },
-            pc_to_instruction_index: linear_pc_to_instruction_index,
-            instruction_index_to_pc: linear_instruction_index_to_pc,
         }
     }
 

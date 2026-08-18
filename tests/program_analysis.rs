@@ -1,5 +1,5 @@
 #[allow(dead_code, unused_imports)]
-#[path = "../examples/arm32.rs"]
+#[path = "../examples/arm32/isa.rs"]
 mod arm32;
 
 use isa_minimization::{
@@ -20,8 +20,6 @@ fn arm32_isa() -> ISA {
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 
@@ -51,6 +49,12 @@ fn arm_register_set(registers: &[u8]) -> HashSet<ArchitecturalRegister> {
         .iter()
         .map(|register| arm32::gpr(*register))
         .collect()
+}
+
+fn arm_register_and_flag_set(registers: &[u8], flags: &[u8]) -> HashSet<ArchitecturalRegister> {
+    let mut set = arm_register_set(registers);
+    set.extend(flags.iter().map(|flag| arm32::flag(*flag)));
+    set
 }
 
 fn block_live_ins(analysis: &ProgramAnalysis<'_>) -> Vec<HashSet<ArchitecturalRegister>> {
@@ -98,10 +102,10 @@ fn arm32_program_analysis_splits_real_program_into_basic_blocks() {
 
     let analysis = ProgramAnalysis::from_program(program, &isa);
 
-    assert_eq!(block_starts(&analysis), vec![0, 3, 5, 6]);
+    assert_eq!(block_starts(&analysis), vec![0, 2, 3, 5, 6]);
     assert_eq!(
         block_successors(&analysis),
-        vec![vec![1, 2], vec![2], vec![3], vec![3]]
+        vec![vec![1], vec![2, 3], vec![3], vec![4], vec![4]]
     );
 }
 
@@ -155,16 +159,18 @@ fn arm32_compute_liveliness_handles_if_else_branching_program() {
     let mut analysis = ProgramAnalysis::from_program(program, &isa);
     analysis.compute_liveliness();
 
-    assert_eq!(block_starts(&analysis), vec![0, 2, 4, 5]);
+    assert_eq!(block_starts(&analysis), vec![0, 1, 2, 3, 4, 5]);
     assert_eq!(
         block_successors(&analysis),
-        vec![vec![1, 2], vec![2, 3], vec![3], vec![]]
+        vec![vec![1], vec![2, 4], vec![3], vec![4, 5], vec![5], vec![]]
     );
     assert_eq!(
         block_live_ins(&analysis),
         vec![
             arm_register_set(&[0, 15]),
+            arm_register_and_flag_set(&[15], &[arm32::REG_Z.0]),
             arm_register_set(&[15]),
+            arm_register_set(&[1, 15]),
             HashSet::new(),
             arm_register_set(&[1])
         ]
@@ -172,7 +178,9 @@ fn arm32_compute_liveliness_handles_if_else_branching_program() {
     assert_eq!(
         block_live_outs(&analysis),
         vec![
+            arm_register_and_flag_set(&[15], &[arm32::REG_Z.0]),
             arm_register_set(&[15]),
+            arm_register_set(&[1, 15]),
             arm_register_set(&[1]),
             arm_register_set(&[1]),
             HashSet::new()
@@ -205,16 +213,17 @@ fn arm32_compute_liveliness_handles_loop_program() {
     let mut analysis = ProgramAnalysis::from_program(program, &isa);
     analysis.compute_liveliness();
 
-    assert_eq!(block_starts(&analysis), vec![0, 1, 4]);
+    assert_eq!(block_starts(&analysis), vec![0, 1, 3, 4]);
     assert_eq!(
         block_successors(&analysis),
-        vec![vec![1], vec![2, 1], vec![]]
+        vec![vec![1], vec![2], vec![3, 1], vec![]]
     );
     assert_eq!(
         block_live_ins(&analysis),
         vec![
             arm_register_set(&[1, 15]),
             arm_register_set(&[0, 1, 15]),
+            arm_register_and_flag_set(&[0, 1, 15], &[arm32::REG_Z.0]),
             arm_register_set(&[0])
         ]
     );
@@ -222,6 +231,7 @@ fn arm32_compute_liveliness_handles_loop_program() {
         block_live_outs(&analysis),
         vec![
             arm_register_set(&[0, 1, 15]),
+            arm_register_and_flag_set(&[0, 1, 15], &[arm32::REG_Z.0]),
             arm_register_set(&[0, 1, 15]),
             HashSet::new()
         ]

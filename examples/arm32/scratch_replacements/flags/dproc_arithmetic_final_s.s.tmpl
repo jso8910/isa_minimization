@@ -1,0 +1,14 @@
+@ scratch-template: v1
+@ family: flags
+@ op: dproc_arithmetic
+@ algorithm: final-s-op
+@ flags: exact_dproc_arithmetic_s
+@ kind: fragment
+@ temps:
+@ inputs: %rn,%t0
+@ outputs: %rd,nzcv
+@ placeholders: %op_s,%rd,%rn,%t0
+@ requires: arithmetic flag-setting register operand2 form
+@ notes: %t0 is the already-materialized operand2 value.
+
+%op_s %rd, %rn, %t0

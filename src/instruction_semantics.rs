@@ -2408,6 +2408,9 @@ mod tests {
             bits: Vec::new(),
             fields: Vec::new(),
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         }
     }
 

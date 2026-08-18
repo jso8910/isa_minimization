@@ -9,6 +9,7 @@ pub mod isa_optimization;
 pub mod isa_specification;
 pub mod parser;
 pub mod program_analysis;
+pub mod program_rewrite;
 pub mod semantic_matching;
 pub mod simulator;
 pub mod stdcell_library;

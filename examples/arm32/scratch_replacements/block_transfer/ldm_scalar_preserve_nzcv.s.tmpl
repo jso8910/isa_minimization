@@ -1,0 +1,17 @@
+@ scratch-template: v1
+@ family: block_transfer
+@ op: ldm
+@ algorithm: scalar-loads
+@ flags: preserve_nzcv
+@ kind: whole
+@ temps:
+@ inputs: %base
+@ outputs: loaded registers and optional %base
+@ placeholders: %block_transfer_steps,%block_writeback
+@ line-placeholders: %block_transfer_steps,%block_writeback
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ reject-if: base register is in reglist; live PC load; later uncompensated PC read
+@ notes: Rust computes per-register offsets using ARM block-transfer addressing rules.
+
+%block_transfer_steps
+%block_writeback

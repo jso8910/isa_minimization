@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-#[path = "../examples/arm32.rs"]
+#[path = "../examples/arm32/isa.rs"]
 mod arm32;
 
 use std::{
@@ -15,11 +15,11 @@ use std::{
 use isa_minimization::{
     bit::{Bit, BitPattern},
     isa_specification::{
-        DecodedField, DecodedInstruction, FieldUses, Instruction, InstructionField,
-        InstructionForm, MergeMode, StackDirection, StackPointer, ISA,
+        DecodedField, DecodedInstruction, FieldUses, ISA, Instruction, InstructionField,
+        InstructionForm, MergeMode, StackDirection, StackPointer,
     },
 };
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 const DEFAULT_RANDOM_PER_FORM: usize = 256;
 const DEFAULT_SEED: u64 = 0;
@@ -451,8 +451,6 @@ fn arm32_isa() -> ISA {
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 
@@ -598,8 +596,14 @@ fn constructive_form_bits(
     for pattern in constrained_patterns {
         out.push(concretize_pattern_with_counter(pattern, 0));
         out.push(concretize_pattern_with_counter(pattern, u128::MAX));
-        out.push(concretize_pattern_with_counter(pattern, 0xaaaa_aaaa_aaaa_aaaa));
-        out.push(concretize_pattern_with_counter(pattern, 0x5555_5555_5555_5555));
+        out.push(concretize_pattern_with_counter(
+            pattern,
+            0xaaaa_aaaa_aaaa_aaaa,
+        ));
+        out.push(concretize_pattern_with_counter(
+            pattern,
+            0x5555_5555_5555_5555,
+        ));
     }
 
     for values in targeted_form_values(form) {
@@ -1515,11 +1519,7 @@ impl ArmTools {
 
         Ok(bytes
             .chunks_exact(4)
-            .map(|chunk| {
-                u32::from_le_bytes(
-                    chunk.try_into().expect("chunk size checked above"),
-                )
-            })
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunk size checked above")))
             .collect())
     }
 

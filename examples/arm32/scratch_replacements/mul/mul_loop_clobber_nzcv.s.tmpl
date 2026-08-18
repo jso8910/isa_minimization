@@ -1,0 +1,22 @@
+@ scratch-template: v1
+@ family: mul
+@ op: mul
+@ algorithm: shift-add-loop
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps: t0,t1
+@ inputs: %rm,%rs
+@ outputs: %rd
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ placeholders: %Lloop
+@ notes: Copies operands before writing rd, so rd may alias rs.
+
+mov %t0, %rm
+mov %t1, %rs
+mov %rd, #0
+%Lloop:
+tst %t1, #1
+addne %rd, %rd, %t0
+movs %t1, %t1, lsr #1
+mov %t0, %t0, lsl #1
+bne %Lloop

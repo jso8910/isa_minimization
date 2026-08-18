@@ -5,3 +5,6 @@
 /greenthumb/arm/restriction-superopt/output/
 /greenthumb/arm/restriction-superopt/generated/*/out/
 /tmp
+/examples/arm32/build-newlib
+/examples/arm32/newlib-install
+/examples/arm32/out

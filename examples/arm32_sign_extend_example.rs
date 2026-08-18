@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-#[path = "arm32.rs"]
+#[path = "arm32/isa.rs"]
 mod arm32;
 
 use std::time::{Duration, Instant};
@@ -27,8 +27,6 @@ fn arm32_isa() -> ISA {
             direction: StackDirection::Downwards,
         },
         pc: arm32::gpr(15),
-        pc_to_instruction_index: arm32::pc_to_instruction_index,
-        instruction_index_to_pc: arm32::instruction_index_to_pc,
     }
 }
 

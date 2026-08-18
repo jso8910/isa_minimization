@@ -1,0 +1,17 @@
+@ scratch-template: v1
+@ family: dproc_rsr
+@ op: register_shifted_register
+@ algorithm: movs-materialize-then-final-op
+@ flags: clobber_nzcv
+@ kind: whole
+@ temps: t0
+@ inputs: %rm,%rs,%rn
+@ outputs: %rd
+@ placeholders: %shift,%dproc_result_line
+@ line-placeholders: %dproc_result_line
+@ requires: register-shifted movs and final unshifted data-processing form
+@ predication: wrap guards/predicated_branch_guard.s.tmpl
+@ notes: %dproc_result_line is a full line that consumes materialized operand2 in %t0.
+
+movs %t0, %rm, %shift %rs
+%dproc_result_line

@@ -1,0 +1,21 @@
+@ scratch-template: v1
+@ family: dproc_rsr
+@ op: variable_shift_step
+@ algorithm: branchless-power-of-two-step
+@ flags: preserve_nzcv
+@ kind: fragment
+@ temps: t0,t1,t2,t3
+@ inputs: %t0,%t1
+@ outputs: %t0,%t2,%t3
+@ placeholders: %shift,%step_log2,%step_amount
+@ repeats: for step_amount 1,2,4,8,16; ror ignores higher amount bits separately
+@ notes: Builds a 0/-1 mask from the selected bit of t1, then selects shifted candidate.
+
+mov %t2, %t1, lsr #%step_log2
+and %t2, %t2, #1
+rsb %t2, %t2, #0
+mov %t3, %t0, %shift #%step_amount
+and %t3, %t3, %t2
+mvn %t2, %t2
+and %t0, %t0, %t2
+orr %t0, %t0, %t3

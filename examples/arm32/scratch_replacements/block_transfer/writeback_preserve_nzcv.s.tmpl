@@ -1,0 +1,13 @@
+@ scratch-template: v1
+@ family: block_transfer
+@ op: writeback
+@ algorithm: add-or-sub-byte-count
+@ flags: preserve_nzcv
+@ kind: fragment
+@ temps:
+@ inputs: %base,%byte_count
+@ outputs: %base
+@ placeholders: %wb_op,%base,%byte_count
+@ notes: %wb_op is add or sub, chosen from U bit; omitted when original W bit is clear.
+
+%wb_op %base, %base, #%byte_count

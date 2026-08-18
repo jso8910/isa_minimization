@@ -6,9 +6,9 @@ use std::{
 
 use itertools::Itertools;
 use rand::{
-    Rng, RngExt,
-    distr::{Distribution, weighted::WeightedIndex},
+    distr::{weighted::WeightedIndex, Distribution},
     seq::{IndexedRandom, IteratorRandom},
+    Rng, RngExt,
 };
 use rayon::prelude::*;
 
@@ -19,7 +19,7 @@ use crate::{
     },
     instruction_semantics::FieldName,
     isa_specification::{
-        DecodedInstruction, FieldUses, ISA, MergeMode, instruction_valid_under_field_uses,
+        instruction_valid_under_field_uses, DecodedInstruction, FieldUses, MergeMode, ISA,
     },
     simulator::{GateOutputAssignment, OptimizationWorkspace, Simulator},
 };
@@ -41,6 +41,9 @@ pub struct IsaOptimizationManager<'a, R: Rng> {
     /// not impossible to replace with a superoptimizer, as well as the fact that their encoding may
     /// change after superoptimization.
     unrestricted_forms: HashMap<String, HashSet<String>>,
+    /// Field uses which candidates must preserve exactly. Used for field-level requirements that
+    /// should not force entire forms to be unrestricted.
+    fixed_field_uses: HashMap<FieldName, FieldUses>,
 
     /// Copy of maximal ISA candidate
     max_isa_candidate: ISACandidate,
@@ -91,6 +94,7 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
             rng,
             mandatory_forms,
             unrestricted_forms,
+            fixed_field_uses: HashMap::new(),
             max_isa_candidate,
             netlist_file: netlist_file.to_string(),
             simulator,
@@ -103,6 +107,14 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
             mutate_field_rate,
             mutate_form_rate,
         }
+    }
+
+    pub fn with_fixed_field_uses(
+        mut self,
+        fixed_field_uses: HashMap<FieldName, FieldUses>,
+    ) -> Self {
+        self.fixed_field_uses = fixed_field_uses;
+        self
     }
 
     pub fn optimize(&mut self) {
@@ -137,13 +149,7 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
             println!("{i} {:?}", self.gate_removal_count(&candidate).unwrap());
             println!("{:?}", self.instruction_conflict_count(&candidate));
             for instruction in self.program.iter() {
-                let instruction_form_in_candidate = candidate
-                    .active_forms
-                    .get(&instruction.name)
-                    .is_some_and(|forms| forms.contains(&instruction.form.name));
-                if !(instruction_form_in_candidate
-                    && instruction_valid_under_field_uses(instruction, &candidate.valid_field_uses))
-                {
+                if !candidate.supports_instruction(instruction) {
                     // println!(
                     //     "{} {:?} {}",
                     //     instruction.name,
@@ -345,13 +351,7 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
     fn instruction_conflict_count(&self, candidate: &ISACandidate) -> usize {
         let mut count = 0;
         for instruction in self.program.iter() {
-            let instruction_form_in_candidate = candidate
-                .active_forms
-                .get(&instruction.name)
-                .is_some_and(|forms| forms.contains(&instruction.form.name));
-            if !(instruction_form_in_candidate
-                && instruction_valid_under_field_uses(instruction, &candidate.valid_field_uses))
-            {
+            if !candidate.supports_instruction(instruction) {
                 count += 1;
             }
         }
@@ -415,6 +415,9 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
         &self,
         candidate: &ISACandidate,
     ) -> Result<HashSet<BitPattern>, ISACandidateError> {
+        self.validate_static_instructions(candidate)?;
+        self.validate_fixed_field_uses(candidate)?;
+
         let mut valid_encodings = HashSet::new();
 
         // for each instruction, collect all valid encodings
@@ -470,6 +473,36 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
             }
         }
         Ok(valid_encodings)
+    }
+
+    fn validate_fixed_field_uses(&self, candidate: &ISACandidate) -> Result<(), ISACandidateError> {
+        for (field_name, fixed_uses) in &self.fixed_field_uses {
+            let Some(candidate_uses) = candidate.valid_field_uses.get(field_name) else {
+                return Err(ISACandidateError::FixedFieldUsesError);
+            };
+
+            if candidate_uses.merge() != fixed_uses.merge() {
+                return Err(ISACandidateError::FixedFieldUsesError);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_static_instructions(
+        &self,
+        candidate: &ISACandidate,
+    ) -> Result<(), ISACandidateError> {
+        for instruction in self
+            .program
+            .iter()
+            .filter(|instruction| instruction.static_instruction)
+        {
+            if !candidate.supports_instruction(instruction) {
+                return Err(ISACandidateError::StaticInstructionError);
+            }
+        }
+        Ok(())
     }
 
     fn normalize_encoding_patterns(
@@ -752,12 +785,12 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
     /// Finds fields which are not field_selectable_for_ga_restriction in a candidate, and ensures
     /// they have the maximal allowed encodings
     fn restore_unmutatable_fields(&self, candidate: &mut ISACandidate) {
-        for (field_name, uses) in candidate.valid_field_uses.iter() {
+        for (field_name, uses) in candidate.valid_field_uses.iter_mut() {
             if self.field_selectable_for_ga_restriction(field_name) {
                 continue;
             }
 
-            let new_uses = match uses {
+            *uses = match uses {
                 FieldUses::Uses { name, len, .. } => FieldUses::Uses {
                     name: name.clone(),
                     patterns: HashSet::from([BitPattern::variable(*len)]),
@@ -1158,6 +1191,8 @@ impl<'a, R: Rng + Sync> IsaOptimizationManager<'a, R> {
 pub enum ISACandidateError {
     MandatoryFormsError,
     UnrestrictedFormsError,
+    FixedFieldUsesError,
+    StaticInstructionError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1168,6 +1203,13 @@ pub struct ISACandidate {
 }
 
 impl ISACandidate {
+    pub fn supports_instruction(&self, instruction: &DecodedInstruction) -> bool {
+        self.active_forms
+            .get(&instruction.name)
+            .is_some_and(|forms| forms.contains(&instruction.form.name))
+            && instruction_valid_under_field_uses(instruction, &self.valid_field_uses)
+    }
+
     pub fn from_program(isa: &ISA, program: &[DecodedInstruction]) -> Self {
         let mut observed_field_uses = HashMap::new();
         let mut active_forms = isa
@@ -1435,7 +1477,11 @@ impl ISACandidate {
 
 fn choose_random_bit<R: Rng>(rng: &mut R) -> Bit {
     let bit = rng.random_range(0..=1);
-    if bit == 0 { Bit::Low } else { Bit::High }
+    if bit == 0 {
+        Bit::Low
+    } else {
+        Bit::High
+    }
 }
 
 fn instance_name_on_line(line: &str) -> Option<&str> {
@@ -1453,7 +1499,14 @@ fn bit_to_verilog_const(bit: Bit) -> &'static str {
     }
 }
 
-fn write_commented_gatelist(
+/// Writes a copy of `source_path` with unused gate instances commented out and
+/// constant output assignments inserted before `endmodule`.
+///
+/// # Errors
+///
+/// Returns any I/O error from reading the source netlist, creating the output
+/// directory, or writing the output netlist.
+pub fn write_commented_gatelist(
     source_path: &str,
     output_path: &str,
     gates_to_comment: &HashSet<String>,
@@ -1519,7 +1572,7 @@ mod tests {
         ArchitecturalRegister, Instruction, InstructionField, InstructionForm, StackDirection,
         StackPointer,
     };
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, SeedableRng};
     use std::{
         fs,
         path::PathBuf,
@@ -1566,8 +1619,6 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: register,
-            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
-            instruction_index_to_pc: crate::isa_specification::linear_instruction_index_to_pc,
         }
     }
 
@@ -1649,6 +1700,12 @@ mod tests {
             DecodedInstruction::decode_program_str(bits, isa).expect("test instruction decodes");
         assert_eq!(decoded.len(), 1);
         decoded.into_iter().next().unwrap()
+    }
+
+    fn static_decode_one(isa: &ISA, bits: &str) -> DecodedInstruction {
+        let mut decoded = decode_one(isa, bits);
+        decoded.static_instruction = true;
+        decoded
     }
 
     fn manager(rng: StdRng) -> IsaOptimizationManager<'static, StdRng> {
@@ -1836,6 +1893,12 @@ mod tests {
             Err(ISACandidateError::UnrestrictedFormsError) => {
                 panic!("valid_encodings unexpectedly rejected unrestricted forms")
             }
+            Err(ISACandidateError::FixedFieldUsesError) => {
+                panic!("valid_encodings unexpectedly rejected fixed field uses")
+            }
+            Err(ISACandidateError::StaticInstructionError) => {
+                panic!("valid_encodings unexpectedly rejected static instructions")
+            }
         }
     }
 
@@ -1865,13 +1928,11 @@ mod tests {
 
     #[test]
     fn random_isa_preserves_instruction_keys_field_modes_and_widths() {
-        let isa = isa_with_instructions(vec![
-            Instruction::new("INST", 4).form(
-                InstructionForm::new("base")
-                    .field(InstructionField::variable("var", 2))
-                    .field(InstructionField::variable("uses", 2).merge_mode_uses()),
-            ),
-        ]);
+        let isa = isa_with_instructions(vec![Instruction::new("INST", 4).form(
+            InstructionForm::new("base")
+                .field(InstructionField::variable("var", 2))
+                .field(InstructionField::variable("uses", 2).merge_mode_uses()),
+        )]);
         let mut rng = StdRng::seed_from_u64(0x5100);
 
         let candidate = ISACandidate::random_isa(&isa, &mut rng);
@@ -2035,19 +2096,17 @@ mod tests {
 
     #[test]
     fn minimum_isa_mandatory_repair_merges_with_program_fields() {
-        let isa = isa_with_instructions(vec![
-            Instruction::new("INST", 2)
-                .form(
-                    InstructionForm::new("program")
-                        .field(InstructionField::constant("1"))
-                        .field(InstructionField::variable("mode", 1)),
-                )
-                .form(
-                    InstructionForm::new("mandatory")
-                        .field(InstructionField::constant("0"))
-                        .field(InstructionField::variable("mode", 1)),
-                ),
-        ]);
+        let isa = isa_with_instructions(vec![Instruction::new("INST", 2)
+            .form(
+                InstructionForm::new("program")
+                    .field(InstructionField::constant("1"))
+                    .field(InstructionField::variable("mode", 1)),
+            )
+            .form(
+                InstructionForm::new("mandatory")
+                    .field(InstructionField::constant("0"))
+                    .field(InstructionField::variable("mode", 1)),
+            )]);
         let program = vec![decode_one(&isa, "11")];
         let mandatory_forms =
             HashMap::from([("INST".to_string(), HashSet::from(["mandatory".to_string()]))]);
@@ -2387,13 +2446,11 @@ mod tests {
         assert_eq!(manager.crossover_gene_rate, 0.5);
         assert_eq!(manager.mutate_field_rate, 0.75);
         assert_eq!(manager.mutate_form_rate, 0.125);
-        assert!(
-            manager
-                .simulator
-                .input_wire_names()
-                .iter()
-                .any(|name| name == "inst[0]")
-        );
+        assert!(manager
+            .simulator
+            .input_wire_names()
+            .iter()
+            .any(|name| name == "inst[0]"));
     }
 
     #[test]
@@ -2520,6 +2577,44 @@ mod tests {
     }
 
     #[test]
+    fn valid_encodings_accepts_candidate_matching_fixed_field_uses() {
+        let manager = manager_with(
+            isa_with_instructions(vec![uses_field_instruction()]),
+            StdRng::seed_from_u64(0x710A),
+            HashMap::new(),
+            vec![],
+        )
+        .with_fixed_field_uses(HashMap::from([("opcode".to_string(), uses_field(&["xx"]))]));
+        let candidate = candidate_with_active_forms(
+            &[("opcode", uses_field(&["00", "01", "10", "11"]))],
+            &[("USES", &["base"])],
+        );
+
+        assert_eq!(
+            valid_encodings_ok(&manager, &candidate),
+            patterns(&["100", "101", "110", "111"])
+        );
+    }
+
+    #[test]
+    fn valid_encodings_errors_when_candidate_violates_fixed_field_uses() {
+        let manager = manager_with(
+            isa_with_instructions(vec![uses_field_instruction()]),
+            StdRng::seed_from_u64(0x710B),
+            HashMap::new(),
+            vec![],
+        )
+        .with_fixed_field_uses(HashMap::from([("opcode".to_string(), uses_field(&["xx"]))]));
+        let candidate =
+            candidate_with_active_forms(&[("opcode", uses_field(&["00"]))], &[("USES", &["base"])]);
+
+        assert!(matches!(
+            manager.valid_encodings(&candidate),
+            Err(ISACandidateError::FixedFieldUsesError)
+        ));
+    }
+
+    #[test]
     fn valid_encodings_errors_when_mandatory_form_is_inactive() {
         let mandatory_forms =
             HashMap::from([("INST".to_string(), HashSet::from(["base".to_string()]))]);
@@ -2631,6 +2726,35 @@ mod tests {
         assert!(matches!(
             manager.valid_encodings(&candidate),
             Err(ISACandidateError::UnrestrictedFormsError)
+        ));
+    }
+
+    #[test]
+    fn valid_encodings_errors_when_static_instruction_form_is_inactive() {
+        let isa = isa_with_instructions(vec![one_field_instruction()]);
+        let program = vec![static_decode_one(&isa, "10")];
+        let manager = manager_with(isa, StdRng::seed_from_u64(0x7109), HashMap::new(), program);
+        let candidate = candidate_with_active_forms(&[("bit", variable_bits_field("x"))], &[]);
+
+        assert!(matches!(
+            manager.valid_encodings(&candidate),
+            Err(ISACandidateError::StaticInstructionError)
+        ));
+    }
+
+    #[test]
+    fn valid_encodings_errors_when_static_instruction_field_is_restricted() {
+        let isa = isa_with_instructions(vec![one_field_instruction()]);
+        let program = vec![static_decode_one(&isa, "10")];
+        let manager = manager_with(isa, StdRng::seed_from_u64(0x7110), HashMap::new(), program);
+        let candidate = candidate_with_active_forms(
+            &[("bit", variable_bits_field("1"))],
+            &[("INST", &["base"])],
+        );
+
+        assert!(matches!(
+            manager.valid_encodings(&candidate),
+            Err(ISACandidateError::StaticInstructionError)
         ));
     }
 
@@ -2819,20 +2943,16 @@ mod tests {
         assert_eq!(manager.candidate_fitnesses.len(), 4);
         assert_eq!(manager.candidates.first(), Some(&max_candidate));
         assert_eq!(manager.candidates.get(1), Some(&min_candidate));
-        assert!(
-            manager
-                .candidate_fitnesses
-                .iter()
-                .all(|fitness| *fitness != 999.0)
-        );
+        assert!(manager
+            .candidate_fitnesses
+            .iter()
+            .all(|fitness| *fitness != 999.0));
         let candidates = manager.candidates.clone();
         let fitnesses = manager.candidate_fitnesses.clone();
-        assert!(
-            candidates
-                .iter()
-                .zip(fitnesses)
-                .all(|(candidate, fitness)| manager.candidate_fitness(candidate) == Ok(fitness))
-        );
+        assert!(candidates
+            .iter()
+            .zip(fitnesses)
+            .all(|(candidate, fitness)| manager.candidate_fitness(candidate) == Ok(fitness)));
     }
 
     #[test]
@@ -2858,12 +2978,10 @@ mod tests {
 
         assert_eq!(manager.candidates.len(), 3);
         assert_eq!(manager.candidate_fitnesses.len(), 3);
-        assert!(
-            manager
-                .candidates
-                .iter()
-                .all(|candidate| candidate == &parent)
-        );
+        assert!(manager
+            .candidates
+            .iter()
+            .all(|candidate| candidate == &parent));
     }
 
     #[test]
@@ -2996,12 +3114,10 @@ mod tests {
         manager.new_generation();
 
         assert_eq!(manager.candidates.len(), 4);
-        assert!(
-            manager
-                .candidates
-                .iter()
-                .all(|candidate| candidate == &selected_parent)
-        );
+        assert!(manager
+            .candidates
+            .iter()
+            .all(|candidate| candidate == &selected_parent));
     }
 
     #[test]

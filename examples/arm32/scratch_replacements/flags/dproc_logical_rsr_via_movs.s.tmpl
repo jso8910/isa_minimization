@@ -1,0 +1,15 @@
+@ scratch-template: v1
+@ family: flags
+@ op: dproc_logical_or_test
+@ algorithm: movs-carry-then-unshifted-s-op
+@ flags: exact_dproc_logical_s
+@ kind: fragment
+@ temps: t0
+@ inputs: %rm,%rs,%rn
+@ outputs: %rd,nzcv
+@ placeholders: %shift,%logical_s_line
+@ requires: register-shifted movs and unshifted logical/move/test S form
+@ notes: MOVS captures the register-shift shifter carry; %logical_s_line must use unshifted %t0.
+
+movs %t0, %rm, %shift %rs
+%logical_s_line

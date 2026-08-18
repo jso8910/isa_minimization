@@ -3907,6 +3907,9 @@ mod tests {
             bits: Vec::new(),
             fields: Vec::new(),
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         }
     }
 
@@ -3965,8 +3968,6 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: test_arch_register(253, 8, 32),
-            pc_to_instruction_index: crate::isa_specification::linear_pc_to_instruction_index,
-            instruction_index_to_pc: crate::isa_specification::linear_instruction_index_to_pc,
         }
     }
 

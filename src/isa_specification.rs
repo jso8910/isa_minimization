@@ -17,26 +17,6 @@ pub struct ISA {
     /// does not literally use a GPR as the PC, it should be
     /// defined as an ArchitecturalRegister)
     pub pc: ArchitecturalRegister,
-    /// A function which converts a PC value into an index within a program, given the PC value
-    /// (u128) and the program (Vec<DecodedInstruction>). For ARM32, this is as simple as taking the
-    /// PC value and dividing by 4.
-    pub pc_to_instruction_index: fn(u128, &Vec<DecodedInstruction>) -> u32,
-    /// A function which converts an index within a program into its corresponding PC value. This
-    /// function should return the value that would be architecturally (ie the value used in
-    /// calculations when doing branch operations with offsets) visible inside the PC. For example,
-    /// in ARM32, the value is index * 4 + 8
-    pub instruction_index_to_pc: fn(u32, &Vec<DecodedInstruction>) -> u128,
-}
-
-pub fn linear_pc_to_instruction_index(pc_value: u128, _program: &Vec<DecodedInstruction>) -> u32 {
-    pc_value as u32
-}
-
-pub fn linear_instruction_index_to_pc(
-    instruction_index: u32,
-    _program: &Vec<DecodedInstruction>,
-) -> u128 {
-    instruction_index as u128
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +80,10 @@ pub struct ArchitecturalRegister {
 /// - ie able to take any values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchOffset {
-    /// Adds the value in the Expr to the current PC (the add(pc, ...) need not be included, it is implied)
-    /// It is assumed that the PC should be the same width as the Expr. As such, if there is a
-    /// negative offset, Expr merely needs to be correctly sign extended.
+    /// Adds the value in the Expr to the decoded instruction's memory address (the add(mem_addr,
+    /// ...) need not be included, it is implied). It is assumed that the address should be the same
+    /// width as the Expr. As such, if there is a negative offset, Expr merely needs to be correctly
+    /// sign extended.
     /// The Expr must evaluate to a Const when collapsed with a decoded instruction
     PCRelative(Expr),
     /// Indicates a register branch. It is assumed that all registers are live-out if there is a
@@ -188,6 +169,9 @@ impl Instruction {
                 bits: bits.to_vec(),
                 fields: Vec::new(),
                 branch_instruction: self.branch_instruction.clone(),
+                mem_addr: 0,
+                static_instruction: self.branch_instruction.is_some(),
+                assembly_line: 0,
             };
             let mut matches = true;
 
@@ -235,6 +219,15 @@ pub struct DecodedInstruction {
     pub bits: Vec<Bit>,
     pub fields: Vec<DecodedField>,
     pub branch_instruction: Option<BranchOffset>,
+    pub mem_addr: usize,
+    /// Instruction must not be included in any rewrites. Usually because it includes some symbolic
+    /// element (eg b label, eg ldr r0, label). We also consider a basic block boundary to occur at
+    /// these instructions.
+    pub static_instruction: bool,
+    /// The line number in the assembly file which corresponds with this instruction. If the
+    /// instruction is not set as `static_instruction`, this should be a valid input to greenthumb
+    /// (ie without references to labels, etc)
+    pub assembly_line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,15 +322,23 @@ impl DecodedInstruction {
                 }
             }
 
-            if let Some(_) = &decoded {
-            } else {
+            let Some(mut decoded) = decoded else {
                 panic!("Instruction {}: Failed to decode", i);
-            }
+            };
 
-            decoded_program.push(decoded.clone().unwrap());
+            decoded.mem_addr = decoded_program
+                .last()
+                .map(|prev| prev.mem_addr + instruction_addr_stride(prev.bits.len()))
+                .unwrap_or(0);
+            decoded.assembly_line = i;
+            decoded_program.push(decoded);
         }
         Ok(decoded_program)
     }
+}
+
+fn instruction_addr_stride(bit_width: usize) -> usize {
+    bit_width.div_ceil(8).max(1)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -964,8 +965,6 @@ mod tests {
                 direction: StackDirection::Downwards,
             },
             pc: reg,
-            pc_to_instruction_index: linear_pc_to_instruction_index,
-            instruction_index_to_pc: linear_instruction_index_to_pc,
         }
     }
 
@@ -980,6 +979,8 @@ mod tests {
 
         assert_eq!(decoded.len(), 2);
         assert!(decoded.iter().all(|instr| instr.name == "NOP"));
+        assert_eq!(decoded[0].assembly_line, 0);
+        assert_eq!(decoded[1].assembly_line, 1);
     }
 
     #[test]
@@ -1012,6 +1013,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn find_match_marks_branch_instructions_static() {
+        let instruction = Instruction::new("BRANCH", 2)
+            .branch_instruction(BranchOffset::PCRelative(Expr::Const { value: 0, width: 8 }))
+            .form(InstructionForm::new("branch_form").field(InstructionField::constant("11")));
+
+        let decoded = instruction
+            .find_match(&BitPattern::parse("11").bits)
+            .expect("branch instruction should decode");
+
+        assert!(decoded.branch_instruction.is_some());
+        assert!(decoded.static_instruction);
+    }
+
     fn decoded_with_form(form: InstructionForm, fields: Vec<DecodedField>) -> DecodedInstruction {
         DecodedInstruction {
             name: "TEST".to_string(),
@@ -1019,6 +1034,9 @@ mod tests {
             bits: BitPattern::parse("101011").bits,
             fields,
             branch_instruction: None,
+            mem_addr: 0,
+            static_instruction: false,
+            assembly_line: 0,
         }
     }
 

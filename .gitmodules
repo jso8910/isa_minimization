@@ -1,3 +1,6 @@
 [submodule "greenthumb"]
 	path = greenthumb
 	url = https://github.com/jso8910/greenthumb
+[submodule "newlib"]
+	path = examples/arm32/newlib
+	url = https://github.com/cygwin/cygwin

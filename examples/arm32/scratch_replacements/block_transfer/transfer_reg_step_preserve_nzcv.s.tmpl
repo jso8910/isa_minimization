@@ -1,0 +1,14 @@
+@ scratch-template: v1
+@ family: block_transfer
+@ op: transfer_reg_step
+@ algorithm: scalar-transfer-step
+@ flags: preserve_nzcv
+@ kind: fragment
+@ temps:
+@ inputs: %base,%offset,%reg
+@ outputs: %reg or memory
+@ placeholders: %xfer_op,%reg,%base,%offset
+@ repeats: once per register in increasing register-number order
+@ notes: %xfer_op is a complete load/store mnemonic such as ldr, str, ldreq, or streq.
+
+%xfer_op %reg, [%base, #%offset]
